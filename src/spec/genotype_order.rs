@@ -35,8 +35,18 @@ mod tests {
     }
 
     #[test]
-    fn count_matches_binomial() {
-        // ploidy 2, 3 alleles => 6 genotypes
-        assert_eq!(genotype_ordering(2, 3).len(), 6);
+    fn triallelic_order() {
+        // ploidy 2, 3 alleles => 6 genotypes in canonical Number=G order
+        assert_eq!(
+            genotype_ordering(2, 3),
+            vec![
+                vec![0, 0],
+                vec![0, 1],
+                vec![1, 1],
+                vec![0, 2],
+                vec![1, 2],
+                vec![2, 2]
+            ]
+        );
     }
 }
