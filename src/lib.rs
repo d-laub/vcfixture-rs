@@ -2,10 +2,12 @@
 
 pub mod allele;
 pub mod error;
+pub mod genotype;
 pub mod spec;
 
 pub use allele::{Allele, SvType};
 pub use error::BuildError;
+pub use genotype::Genotype;
 pub use spec::field::{FieldDef, FieldKind};
 pub use spec::number::{Number, NumberKind};
 pub use spec::types::Type;
