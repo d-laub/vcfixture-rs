@@ -1,8 +1,10 @@
 //! vcfixture — generate small VCF test data with decoded ground truth.
 
+pub mod allele;
 pub mod error;
 pub mod spec;
 
+pub use allele::{Allele, SvType};
 pub use error::BuildError;
 pub use spec::field::{FieldDef, FieldKind};
 pub use spec::number::{Number, NumberKind};
