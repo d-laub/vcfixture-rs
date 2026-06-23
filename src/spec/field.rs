@@ -106,9 +106,18 @@ mod tests {
 
     #[test]
     fn flag_must_be_info_with_number_zero() {
-        assert!(FieldDef::new("DB", Number::FLAG, Type::Flag, "x", FieldKind::Format).is_err());
-        assert!(FieldDef::new("DB", Number::ONE, Type::Flag, "x", FieldKind::Info).is_err());
-        assert!(FieldDef::new("X", Number::FLAG, Type::Integer, "x", FieldKind::Info).is_err());
+        assert!(matches!(
+            FieldDef::new("DB", Number::FLAG, Type::Flag, "x", FieldKind::Format),
+            Err(crate::error::BuildError::FlagNotInfo)
+        ));
+        assert!(matches!(
+            FieldDef::new("DB", Number::ONE, Type::Flag, "x", FieldKind::Info),
+            Err(crate::error::BuildError::FlagNumberNotZero)
+        ));
+        assert!(matches!(
+            FieldDef::new("X", Number::FLAG, Type::Integer, "x", FieldKind::Info),
+            Err(crate::error::BuildError::ZeroNumberNotFlag)
+        ));
         assert!(FieldDef::new("DB", Number::FLAG, Type::Flag, "x", FieldKind::Info).is_ok());
     }
 
