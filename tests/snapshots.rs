@@ -4,10 +4,8 @@ use vcfixture::{Allele, FieldValue, RecordSpec, VcfBuilder};
 #[test]
 fn renders_minimal_vcf() {
     let text = VcfBuilder::new(["s1", "s2"], [("chr1", Some(100_000u64))], LATEST)
-        .info("AF", None, None, None)
-        .unwrap()
-        .format("GT", None, None, None)
-        .unwrap()
+        .info("AF")
+        .format("GT")
         .record(
             RecordSpec::at("chr1", 1000)
                 .ref_("A")
@@ -15,7 +13,6 @@ fn renders_minimal_vcf() {
                 .gt(["0|1", "1|1"])
                 .info("AF", FieldValue::floats([0.25])),
         )
-        .unwrap()
         .build()
         .unwrap()
         .render();
@@ -28,15 +25,13 @@ fn writes_bgzipped_file() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("x.vcf.gz");
     let written = VcfBuilder::new(["s1"], [("chr1", Some(1000u64))], LATEST)
-        .format("GT", None, None, None)
-        .unwrap()
+        .format("GT")
         .record(
             RecordSpec::at("chr1", 10)
                 .ref_("A")
                 .alt([Allele::seq("T").unwrap()])
                 .gt(["0|1"]),
         )
-        .unwrap()
         .write(&path, vcfixture::WriteOpts::bgzipped_indexed())
         .unwrap();
     assert!(written.exists(), "bgzipped file must exist");

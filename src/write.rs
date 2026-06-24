@@ -331,8 +331,6 @@ fn write_csi(doc: &Document, bgzf_path: &Path) -> Result<(), BuildError> {
 mod tests {
     use crate::allele::Allele;
     use crate::build::{RecordSpec, VcfBuilder};
-    use crate::spec::number::Number;
-    use crate::spec::types::Type;
     use crate::spec::version::LATEST;
     use crate::value::FieldValue;
 
@@ -343,8 +341,7 @@ mod tests {
     /// Returns the single data line (the last non-empty line) of a rendered doc.
     fn data_line(text: &str) -> &str {
         text.lines()
-            .filter(|l| !l.starts_with('#') && !l.is_empty())
-            .next_back()
+            .rfind(|l| !l.starts_with('#') && !l.is_empty())
             .expect("expected at least one data line")
     }
 
@@ -358,8 +355,7 @@ mod tests {
     #[test]
     fn filter_empty_renders_pass() {
         let text = base()
-            .format("GT", None, None, None)
-            .unwrap()
+            .format("GT")
             .record(
                 RecordSpec::at("chr1", 100)
                     .ref_("A")
@@ -367,7 +363,6 @@ mod tests {
                     .gt(["0|1"])
                     .filter(Vec::<&str>::new()),
             )
-            .unwrap()
             .render()
             .unwrap();
         // FILTER is column index 6 (CHROM POS ID REF ALT QUAL FILTER ...)
@@ -377,15 +372,13 @@ mod tests {
     #[test]
     fn filter_unset_renders_dot() {
         let text = base()
-            .format("GT", None, None, None)
-            .unwrap()
+            .format("GT")
             .record(
                 RecordSpec::at("chr1", 100)
                     .ref_("A")
                     .alt([Allele::seq("T").unwrap()])
                     .gt(["0|1"]),
             )
-            .unwrap()
             .render()
             .unwrap();
         assert_eq!(data_col(&text, 6), ".");
@@ -395,8 +388,7 @@ mod tests {
     fn filter_named_renders_value() {
         let text = base()
             .filter("q10", "Quality below 10")
-            .format("GT", None, None, None)
-            .unwrap()
+            .format("GT")
             .record(
                 RecordSpec::at("chr1", 100)
                     .ref_("A")
@@ -404,7 +396,6 @@ mod tests {
                     .gt(["0|1"])
                     .filter(["q10"]),
             )
-            .unwrap()
             .render()
             .unwrap();
         assert_eq!(data_col(&text, 6), "q10");
@@ -417,10 +408,8 @@ mod tests {
     #[test]
     fn flag_info_renders_bare_key() {
         let text = base()
-            .info("DB", None, None, None) // reserved DB = Flag
-            .unwrap()
-            .format("GT", None, None, None)
-            .unwrap()
+            .info("DB") // reserved DB = Flag
+            .format("GT")
             .record(
                 RecordSpec::at("chr1", 100)
                     .ref_("A")
@@ -428,7 +417,6 @@ mod tests {
                     .gt(["0|1"])
                     .info("DB", FieldValue::Flag),
             )
-            .unwrap()
             .render()
             .unwrap();
         // INFO is column index 7.
@@ -440,12 +428,13 @@ mod tests {
 
     #[test]
     fn string_info_percent_encodes_semicolon() {
+        use crate::build::Field;
+        use crate::spec::number::Number;
+        use crate::spec::types::Type;
         // A String INFO value containing ';' must render as '%3B'.
         let text = base()
-            .info("NOTE", Some(Number::ONE), Some(Type::String), None)
-            .unwrap()
-            .format("GT", None, None, None)
-            .unwrap()
+            .info(Field::typed("NOTE", Number::ONE, Type::String))
+            .format("GT")
             .record(
                 RecordSpec::at("chr1", 100)
                     .ref_("A")
@@ -453,7 +442,6 @@ mod tests {
                     .gt(["0|1"])
                     .info("NOTE", FieldValue::strings(["a;b"])),
             )
-            .unwrap()
             .render()
             .unwrap();
         let info = data_col(&text, 7);
@@ -468,12 +456,9 @@ mod tests {
     fn symbolic_deletion_renders_angle_del() {
         // DEL at LATEST (>= 4.4) needs single-base REF + SVLEN + SVCLAIM.
         let text = base()
-            .info("SVLEN", None, None, None)
-            .unwrap()
-            .info("SVCLAIM", None, None, None)
-            .unwrap()
-            .format("GT", None, None, None)
-            .unwrap()
+            .info("SVLEN")
+            .info("SVCLAIM")
+            .format("GT")
             .record(
                 RecordSpec::at("chr1", 100)
                     .ref_("A")
@@ -482,7 +467,6 @@ mod tests {
                     .info("SVLEN", FieldValue::ints([100]))
                     .info("SVCLAIM", FieldValue::strings(["D"])),
             )
-            .unwrap()
             .render()
             .unwrap();
         // ALT is column index 4.
