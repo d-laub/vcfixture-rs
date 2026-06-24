@@ -211,31 +211,37 @@ INFO/FORMAT for deterministic rendering (add `indexmap` to deps).
 
 ## Builder (`build.rs`)
 
-Owned-`self` chaining returning `Result<Self, BuildError>`, composing with `?`:
+Infallible-accumulator design: `info`/`format`/`record` return `Self` (no
+`Result`), accumulating declarations without any validation. All validation is
+deferred to the single fallible terminal `build() -> Result<Document, BuildError>`.
+Field declarations use the typed `Field` sub-spec (`Field::reserved(id)`,
+`Field::typed(id, number, type_)`, `Field::flag(id)`); a bare `&str` or `String`
+converts via `From<&str> for Field` (resolves as reserved).
 
 ```rust
 let doc = VcfBuilder::new(["s1", "s2"], [("chr1", Some(100_000))], VcfVersion::LATEST)
-    .info("AF", None, None, None)?          // reserved → Number/Type resolved
-    .format("DS", Some(Number::A), Some(Type::Float), None)?
-    .format("GT", None, None, None)?
+    .info("AF")                                      // reserved → Number/Type resolved at build()
+    .format("GT")
+    .format(Field::typed("DS", Number::A, Type::Float))
     .record(
-        Record::at("chr1", 1000)
+        RecordSpec::at("chr1", 1000)
             .ref_("A")
-            .alt([Allele::seq("T")?])
+            .alt([Allele::seq("T").unwrap()])
             .gt(["0|1", "1|1"])
-            .info("AF", [Scalar::Float(0.25)])
-            .format("DS", [[Scalar::Float(0.4)], [Scalar::Float(1.9)]]),
-    )?
-    .build()?;
+            .info("AF", FieldValue::floats([0.25])),
+    )
+    .build().unwrap();
 
 let text  = doc.render();
 let truth = doc.truth();
 doc.write("x.vcf.gz", WriteOpts { bgzip: true, index: true })?;
 ```
 
-- `info(id, number, type, description)` / `format(...)`: when `number`/`type` are
-  `None`, resolve from the reserved registry for the builder's version; otherwise
-  take the supplied pair verbatim. `filter(id, desc)`, `alt(id, desc)`.
+- `info(impl Into<Field>)` / `format(impl Into<Field>)`: accept a `Field` or
+  any `Into<Field>` (bare `&str`/`String` → `Field::reserved`). `filter(id, desc)`,
+  `alt(id, desc)`.
+- Declaration order is independent of record order: `record()` may appear before
+  the `format("GT")` it depends on; `build()` resolves everything in one pass.
 - A small **`Record` sub-builder** stands in for Python's keyword arguments
   (Rust has no kwargs). `Record::at(chrom, pos)` then chained setters
   `.ref_()/.alt()/.ids()/.qual()/.filter()/.gt()/.info()/.format()/.labels()`.

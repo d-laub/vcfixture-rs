@@ -820,7 +820,40 @@ mod tests {
         assert_in_record!(r, BuildError::CnSvlenMismatch);
     }
 
-    // --- New guarantees (Task 3 adds more below) ---
+    // --- New guarantees (Task 3) ---
+
+    #[test]
+    fn flag_on_format_errs() {
+        // Field::flag is INFO-only; using it on FORMAT must fail at build().
+        let r = base().format(Field::flag("SOMATIC")).build();
+        assert!(matches!(r, Err(BuildError::FlagNotInfo)));
+    }
+
+    #[test]
+    fn declaration_order_independent() {
+        // record() appears before the .format("GT") that it depends on.
+        let doc = base()
+            .record(
+                RecordSpec::at("chr1", 1)
+                    .ref_("A")
+                    .alt([Allele::seq("T").unwrap()])
+                    .gt(["0|1", "1|1"]),
+            )
+            .format("GT")
+            .build()
+            .unwrap();
+        assert_eq!(doc.records.len(), 1);
+    }
+
+    #[test]
+    fn info_str_shorthand_matches_reserved() {
+        // .info("AF") and .info(Field::reserved("AF")) produce the same header.
+        let a = base().info("AF").build().unwrap();
+        let b = base().info(Field::reserved("AF")).build().unwrap();
+        assert_eq!(a.info_defs, b.info_defs);
+    }
+
+    // --- Record index tagging ---
 
     #[test]
     fn record_index_in_error() {
