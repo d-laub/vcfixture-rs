@@ -9,6 +9,7 @@ pub mod spec;
 pub mod truth;
 pub mod value;
 pub mod variants;
+pub mod write;
 
 pub use allele::{Allele, SvType};
 pub use build::{RecordSpec, VcfBuilder};
@@ -22,3 +23,4 @@ pub use spec::version::{VcfVersion, LATEST};
 pub use truth::{AlleleKind, AlleleTruth, GroundTruth};
 pub use value::{FieldValue, Scalar};
 pub use variants::VariantClass;
+pub use write::WriteOpts;

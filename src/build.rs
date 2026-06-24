@@ -330,6 +330,18 @@ impl VcfBuilder {
         Ok(())
     }
 
+    pub fn render(self) -> Result<String, BuildError> {
+        Ok(self.build()?.render())
+    }
+
+    pub fn write(
+        self,
+        path: impl AsRef<std::path::Path>,
+        opts: crate::write::WriteOpts,
+    ) -> Result<std::path::PathBuf, BuildError> {
+        self.build()?.write(path, opts)
+    }
+
     pub fn truth(self) -> Result<crate::truth::GroundTruth, BuildError> {
         Ok(self.build()?.truth())
     }

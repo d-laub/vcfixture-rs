@@ -78,6 +78,18 @@ pub struct Document {
 }
 
 impl Document {
+    pub fn render(&self) -> String {
+        crate::write::render(self)
+    }
+
+    pub fn write(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        opts: crate::write::WriteOpts,
+    ) -> Result<std::path::PathBuf, crate::error::BuildError> {
+        crate::write::write(self, path, opts)
+    }
+
     pub fn truth(&self) -> crate::truth::GroundTruth {
         crate::truth::derive(self)
     }
