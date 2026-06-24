@@ -6,6 +6,7 @@ pub mod error;
 pub mod genotype;
 pub mod model;
 pub mod spec;
+pub mod truth;
 pub mod value;
 pub mod variants;
 
@@ -18,5 +19,6 @@ pub use spec::field::{FieldDef, FieldKind};
 pub use spec::number::{Number, NumberKind};
 pub use spec::types::Type;
 pub use spec::version::{VcfVersion, LATEST};
+pub use truth::{AlleleKind, AlleleTruth, GroundTruth};
 pub use value::{FieldValue, Scalar};
 pub use variants::VariantClass;

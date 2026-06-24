@@ -330,6 +330,10 @@ impl VcfBuilder {
         Ok(())
     }
 
+    pub fn truth(self) -> Result<crate::truth::GroundTruth, BuildError> {
+        Ok(self.build()?.truth())
+    }
+
     pub fn build(self) -> Result<Document, BuildError> {
         // Auto-describe symbolic ALT types; explicit .alt() descriptions win.
         let mut alt_ids: IndexMap<String, String> = IndexMap::new();

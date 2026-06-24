@@ -78,6 +78,10 @@ pub struct Document {
 }
 
 impl Document {
+    pub fn truth(&self) -> crate::truth::GroundTruth {
+        crate::truth::derive(self)
+    }
+
     pub fn max_ploidy(&self) -> usize {
         let mut p = 1;
         for rec in &self.records {
