@@ -1,5 +1,8 @@
 //! vcfixture — generate small VCF test data with decoded ground truth.
 
+#[cfg(feature = "proptest")]
+pub mod strategies;
+
 pub mod allele;
 pub mod build;
 pub mod error;
