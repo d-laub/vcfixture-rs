@@ -79,11 +79,29 @@ impl ReferenceSpec {
     }
 
     pub fn base(&self, contig: &str, pos0: usize) -> Result<String, BuildError> {
-        Ok(self.seq_for(contig)?[pos0..pos0 + 1].to_string())
+        let s = self.seq_for(contig)?;
+        if pos0 + 1 > s.len() {
+            return Err(BuildError::OutOfBounds {
+                contig: contig.to_string(),
+                pos0,
+                len: 1,
+                clen: s.len(),
+            });
+        }
+        Ok(s[pos0..pos0 + 1].to_string())
     }
 
     pub fn seq(&self, contig: &str, start0: usize, length: usize) -> Result<String, BuildError> {
-        Ok(self.seq_for(contig)?[start0..start0 + length].to_string())
+        let s = self.seq_for(contig)?;
+        if start0 + length > s.len() {
+            return Err(BuildError::OutOfBounds {
+                contig: contig.to_string(),
+                pos0: start0,
+                len: length,
+                clen: s.len(),
+            });
+        }
+        Ok(s[start0..start0 + length].to_string())
     }
 
     pub fn draw_ref_alt(
@@ -146,7 +164,7 @@ impl ReferenceSpec {
             let file = fs::File::create(&path)?;
             let mut w = noodles_bgzf::io::Writer::new(file);
             w.write_all(text.as_bytes())?;
-            w.flush()?;
+            w.finish()?;
         } else {
             fs::write(&path, &text)?;
         }
@@ -203,6 +221,14 @@ impl ReferenceBuilder {
             .seqs
             .get_mut(contig)
             .ok_or_else(|| BuildError::ContigNotFound(contig.to_string()))?;
+        if pos0 + 1 > arr.len() {
+            return Err(BuildError::OutOfBounds {
+                contig: contig.to_string(),
+                pos0,
+                len: 1,
+                clen: arr.len(),
+            });
+        }
         arr[pos0] = b[0];
         Ok(self)
     }
@@ -303,5 +329,20 @@ mod tests {
         let spec = rb.build();
         assert_eq!(spec.repeats.len(), 1);
         assert_eq!(spec.seq("chr1", 10, 12).unwrap(), "CAGCAGCAGCAG");
+    }
+
+    #[test]
+    fn out_of_bounds_does_not_panic() {
+        let mut rb = ReferenceBuilder::new(1);
+        rb.add_contig("chr1", 100).unwrap();
+        let spec = rb.build();
+        assert!(matches!(
+            spec.seq("chr1", 95, 10),
+            Err(BuildError::OutOfBounds { .. })
+        ));
+        assert!(matches!(
+            spec.base("chr1", 200),
+            Err(BuildError::OutOfBounds { .. })
+        ));
     }
 }
