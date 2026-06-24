@@ -199,6 +199,13 @@ impl VcfBuilder {
             if !self.format_defs.contains_key("GT") {
                 return Err(BuildError::GtNotDeclared);
             }
+            if gts.len() != self.samples.len() {
+                return Err(BuildError::SampleCountMismatch {
+                    kind: "GT".into(),
+                    expected: self.samples.len(),
+                    got: gts.len(),
+                });
+            }
             fmt_keys.push("GT".to_string());
             for (si, s) in gts.iter().enumerate() {
                 let geno = Genotype::parse(s);
@@ -226,6 +233,13 @@ impl VcfBuilder {
                     kind: "FORMAT".into(),
                     id: key.clone(),
                 })?;
+            if per_sample.len() != self.samples.len() {
+                return Err(BuildError::SampleCountMismatch {
+                    kind: key.clone(),
+                    expected: self.samples.len(),
+                    got: per_sample.len(),
+                });
+            }
             fmt_keys.push(key.clone());
             let card = fdef.number.cardinality(n_alt, ploidy);
             for (si, val) in per_sample.iter().enumerate() {
@@ -619,6 +633,49 @@ mod tests {
         assert!(matches!(
             r,
             Err(crate::error::BuildError::SvclaimRequired(_))
+        ));
+    }
+
+    #[test]
+    fn too_many_genotypes_errs() {
+        // 2 declared samples but 3 GTs.
+        let r = base().format("GT", None, None, None).unwrap().record(
+            RecordSpec::at("chr1", 1)
+                .ref_("A")
+                .alt([Allele::seq("T").unwrap()])
+                .gt(["0|1", "1|1", "0|0"]),
+        );
+        assert!(matches!(
+            r,
+            Err(crate::error::BuildError::SampleCountMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn too_many_format_values_errs() {
+        // 2 declared samples but a FORMAT field with 3 per-sample values.
+        let r = base()
+            .format("GT", None, None, None)
+            .unwrap()
+            .format("DS", Some(Number::A), Some(Type::Float), None)
+            .unwrap()
+            .record(
+                RecordSpec::at("chr1", 1)
+                    .ref_("A")
+                    .alt([Allele::seq("T").unwrap()])
+                    .gt(["0|1", "1|1"])
+                    .format(
+                        "DS",
+                        [
+                            FieldValue::floats([0.1]),
+                            FieldValue::floats([0.2]),
+                            FieldValue::floats([0.3]),
+                        ],
+                    ),
+            );
+        assert!(matches!(
+            r,
+            Err(crate::error::BuildError::SampleCountMismatch { .. })
         ));
     }
 

@@ -73,6 +73,13 @@ pub enum BuildError {
     #[error("allele index {index} out of range (n_alt={n_alt})")]
     AlleleIndexOutOfRange { index: u32, n_alt: usize },
 
+    #[error("{kind} provides {got} per-sample values but {expected} samples are declared")]
+    SampleCountMismatch {
+        kind: String,
+        expected: usize,
+        got: usize,
+    },
+
     #[error("GT not declared; declare it with .format(\"GT\", ...)")]
     GtNotDeclared,
 
