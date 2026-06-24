@@ -1,0 +1,28 @@
+[package]
+name = "vcfixture"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Generate small VCF test data with decoded ground truth, for property-based testing."
+
+[dependencies]
+ndarray = "0.16"
+indexmap = "2"
+thiserror = "2"
+rand = "0.8"
+rand_chacha = "0.3"
+noodles-core = "0.17"
+noodles-vcf = "0.79"
+noodles-bgzf = "0.41"
+noodles-csi = "0.49"
+noodles-tabix = "0.55"
+noodles-fasta = "0.51"
+proptest = { version = "1", optional = true }
+
+[dev-dependencies]
+insta = "1"
+proptest = "1"
+
+[features]
+default = []
+proptest = ["dep:proptest"]

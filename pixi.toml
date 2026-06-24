@@ -1,0 +1,19 @@
+[workspace]
+name = "vcfixture-rs"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64"]
+
+[dependencies]
+rust = "*"
+prek = "*"
+commitizen = "*"
+
+[tasks]
+build        = "cargo build"
+test         = "cargo test --all-features"
+check        = "cargo check --all-features"
+fmt          = "cargo fmt"
+fmt-check    = "cargo fmt --check"
+clippy       = "cargo clippy --all-features -- -D warnings"
+prek-install = "prek install -t pre-commit -t commit-msg"
+bump-dry     = "cz bump --dry-run"
