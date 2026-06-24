@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Generate small VCF test data with decoded ground truth, for property-based testing."
+repository = "https://github.com/d-laub/vcfixture-rs"
+readme = "README.md"
+keywords = ["vcf", "testing", "fixtures", "bioinformatics", "proptest"]
+categories = ["development-tools::testing", "science"]
+rust-version = "1.86"
 
 [dependencies]
 ndarray = "0.16"
