@@ -16,7 +16,9 @@ use crate::value::{FieldValue, Scalar};
 /// Options controlling how a VCF document is written to disk.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WriteOpts {
+    /// Compress the output with bgzip (adds `.gz` suffix if not already present).
     pub bgzip: bool,
+    /// Write a CSI index alongside the bgzipped output (requires `bgzip = true`).
     pub index: bool,
 }
 

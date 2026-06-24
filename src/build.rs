@@ -275,6 +275,7 @@ impl VcfBuilder {
         Ok(self.build()?.truth())
     }
 
+    /// Validate all accumulated declarations and records, returning a [`Document`] or a [`BuildError`].
     pub fn build(self) -> Result<Document, BuildError> {
         // 1. Resolve field declarations to concrete defs (reserved lookup,
         //    explicit FieldDef::new). Last declaration of an id wins.

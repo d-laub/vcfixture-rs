@@ -79,7 +79,7 @@ fn is_seq_or_empty(s: &str) -> bool {
 }
 
 impl Allele {
-    /// Construct a sequence allele, returning an error if `bases` contains non-IUPAC characters.
+    /// Construct a sequence allele, returning an error if `bases` contains characters other than A, C, G, T, N (case-insensitive).
     pub fn seq(bases: impl Into<String>) -> Result<Allele, BuildError> {
         let bases = bases.into();
         if !is_seq(&bases) {
