@@ -158,36 +158,37 @@ impl Allele {
         }
     }
 
-    /// Syntactic dispatch from a raw ALT string (never fails: junk falls back
-    /// to a sequence allele, matching the Python `classify_allele`).
-    pub fn parse(alt: &str) -> Allele {
+    /// Syntactic dispatch from a raw ALT string.
+    ///
+    /// Returns `Ok(Allele)` for well-formed inputs and `Err(BuildError)` for:
+    /// - unknown symbolic SV types (e.g. `<UNKNOWN>`) → `BadSvType`
+    /// - malformed breakend strings → `BadBreakend`
+    /// - invalid sequence bases (including empty string) → `BadAlleleBases`
+    pub fn parse(alt: &str) -> Result<Allele, BuildError> {
         if alt == "*" {
-            return Allele::Star;
+            return Ok(Allele::Star);
         }
         if alt == "<*>" {
-            return Allele::Unspecified;
+            return Ok(Allele::Unspecified);
         }
         if alt.starts_with('<') && alt.ends_with('>') {
             let inner = &alt[1..alt.len() - 1];
             let mut parts = inner.split(':');
             let first = parts.next().unwrap_or("");
-            let first_type = first.parse::<SvType>().unwrap_or(SvType::Del);
-            return Allele::Symbolic {
+            let first_type = first.parse::<SvType>()?;
+            let subtypes: Vec<String> = parts.map(|s| s.to_string()).collect();
+            return Ok(Allele::Symbolic {
                 first_type,
-                subtypes: parts.map(|s| s.to_string()).collect(),
-            };
+                subtypes,
+            });
         }
         if alt.contains('[') || alt.contains(']') {
-            if let Ok(b) = Allele::breakend_parse(alt) {
-                return b;
-            }
+            return Allele::breakend_parse(alt);
         }
         if alt.len() > 1 && (alt.starts_with('.') || alt.ends_with('.')) {
-            if let Ok(b) = Allele::breakend_parse(alt) {
-                return b;
-            }
+            return Allele::breakend_parse(alt);
         }
-        Allele::Seq(alt.to_string())
+        Allele::seq(alt)
     }
 }
 
@@ -264,18 +265,21 @@ mod tests {
 
     #[test]
     fn parse_dispatch() {
-        assert!(matches!(Allele::parse("*"), Allele::Star));
-        assert!(matches!(Allele::parse("<*>"), Allele::Unspecified));
-        assert!(matches!(Allele::parse("<DEL>"), Allele::Symbolic { .. }));
+        assert!(matches!(Allele::parse("*").unwrap(), Allele::Star));
+        assert!(matches!(Allele::parse("<*>").unwrap(), Allele::Unspecified));
         assert!(matches!(
-            Allele::parse("T[chr2:5["),
+            Allele::parse("<DEL>").unwrap(),
+            Allele::Symbolic { .. }
+        ));
+        assert!(matches!(
+            Allele::parse("T[chr2:5[").unwrap(),
             Allele::Breakend { single: false, .. }
         ));
         assert!(matches!(
-            Allele::parse(".A"),
+            Allele::parse(".A").unwrap(),
             Allele::Breakend { single: true, .. }
         ));
-        assert!(matches!(Allele::parse("ACGT"), Allele::Seq(_)));
+        assert!(matches!(Allele::parse("ACGT").unwrap(), Allele::Seq(_)));
     }
 
     #[test]
@@ -283,5 +287,30 @@ mod tests {
         assert!(Allele::breakend_parse("not-a-breakend").is_err());
         assert!(Allele::breakend_parse("G[chr2:321[").is_ok());
         assert!(Allele::breakend_parse("A.").is_ok());
+    }
+
+    #[test]
+    fn parse_rejects_unsupported() {
+        assert!(matches!(
+            Allele::parse("<UNKNOWN>"),
+            Err(crate::error::BuildError::BadSvType(_))
+        ));
+        assert!(matches!(
+            Allele::parse("xyz"),
+            Err(crate::error::BuildError::BadAlleleBases(_))
+        ));
+        assert!(Allele::parse("").is_err());
+        // valid cases still pass:
+        assert!(matches!(Allele::parse("*").unwrap(), Allele::Star));
+        assert!(matches!(Allele::parse("<*>").unwrap(), Allele::Unspecified));
+        assert!(matches!(
+            Allele::parse("<DEL>").unwrap(),
+            Allele::Symbolic { .. }
+        ));
+        assert!(matches!(
+            Allele::parse("T[chr2:5[").unwrap(),
+            Allele::Breakend { .. }
+        ));
+        assert!(matches!(Allele::parse("ACGT").unwrap(), Allele::Seq(_)));
     }
 }

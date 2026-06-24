@@ -1,3 +1,5 @@
+use crate::error::BuildError;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Genotype {
     /// Allele indices in call order; `None` is a missing allele (`.`).
@@ -7,21 +9,21 @@ pub struct Genotype {
 }
 
 impl Genotype {
-    pub fn parse(s: &str) -> Genotype {
+    pub fn parse(s: &str) -> Result<Genotype, BuildError> {
         let mut alleles = Vec::new();
         let mut phased = Vec::new();
         let mut token = String::new();
         for ch in s.chars() {
             if ch == '|' || ch == '/' {
-                alleles.push(parse_allele(&token));
+                alleles.push(parse_allele(&token, s)?);
                 token.clear();
                 phased.push(ch == '|');
             } else {
                 token.push(ch);
             }
         }
-        alleles.push(parse_allele(&token));
-        Genotype { alleles, phased }
+        alleles.push(parse_allele(&token, s)?);
+        Ok(Genotype { alleles, phased })
     }
 
     pub fn ploidy(&self) -> usize {
@@ -47,14 +49,13 @@ impl Genotype {
     }
 }
 
-fn parse_allele(tok: &str) -> Option<u32> {
+fn parse_allele(tok: &str, full_gt: &str) -> Result<Option<u32>, BuildError> {
     if tok == "." {
-        None
+        Ok(None)
     } else {
-        Some(
-            tok.parse()
-                .expect("genotype allele index must be an integer or '.'"),
-        )
+        tok.parse::<u32>()
+            .map(Some)
+            .map_err(|_| BuildError::BadGenotype(full_gt.to_string()))
     }
 }
 
@@ -65,16 +66,30 @@ mod tests {
     #[test]
     fn parse_render_roundtrip() {
         for s in ["0|1", "1/1", "./.", "0", ".|1"] {
-            assert_eq!(Genotype::parse(s).render(), s);
+            assert_eq!(Genotype::parse(s).unwrap().render(), s);
         }
     }
 
     #[test]
     fn phasing_and_ploidy() {
-        assert!(Genotype::parse("0|1").is_phased());
-        assert!(!Genotype::parse("0/1").is_phased());
-        assert!(!Genotype::parse("0").is_phased());
-        assert_eq!(Genotype::parse("0|1|1").ploidy(), 3);
-        assert_eq!(Genotype::parse("./.").alleles, vec![None, None]);
+        assert!(Genotype::parse("0|1").unwrap().is_phased());
+        assert!(!Genotype::parse("0/1").unwrap().is_phased());
+        assert!(!Genotype::parse("0").unwrap().is_phased());
+        assert_eq!(Genotype::parse("0|1|1").unwrap().ploidy(), 3);
+        assert_eq!(Genotype::parse("./.").unwrap().alleles, vec![None, None]);
+    }
+
+    #[test]
+    fn bad_genotype_errors() {
+        assert!(matches!(
+            Genotype::parse("0|x"),
+            Err(crate::error::BuildError::BadGenotype(_))
+        ));
+        assert!(matches!(
+            Genotype::parse("A/A"),
+            Err(crate::error::BuildError::BadGenotype(_))
+        ));
+        // valid: "./." is Ok with [None, None]
+        assert!(Genotype::parse("./.").is_ok());
     }
 }

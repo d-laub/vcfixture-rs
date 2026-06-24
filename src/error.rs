@@ -9,6 +9,9 @@ pub enum BuildError {
     #[error("sequence allele bases must be [ACGTN]+, got {0:?}")]
     BadAlleleBases(String),
 
+    #[error("not a valid genotype string: {0:?}")]
+    BadGenotype(String),
+
     #[error("not a valid breakend replacement string: {0:?}")]
     BadBreakend(String),
 

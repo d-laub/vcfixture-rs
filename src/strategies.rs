@@ -206,7 +206,10 @@ fn build_ref_alts(
 ) -> (String, Vec<Allele>) {
     let final_ref = ref_alts[0].0.clone();
     if n_alt == 1 {
-        return (final_ref, vec![Allele::parse(&ref_alts[0].1)]);
+        return (
+            final_ref,
+            vec![Allele::parse(&ref_alts[0].1).expect("strategy generates a valid allele")],
+        );
     }
     let refbase = &final_ref[..1]; // single-char anchor
     let mut alts: Vec<Allele> = Vec::with_capacity(n_alt);
@@ -220,7 +223,7 @@ fn build_ref_alts(
             VariantKlass::Del | VariantKlass::Delins => ref_alts[i].1.clone(),
             VariantKlass::SpanningDel => "*".to_string(),
         };
-        alts.push(Allele::parse(&alt_str));
+        alts.push(Allele::parse(&alt_str).expect("strategy generates a valid allele"));
     }
     (final_ref, alts)
 }
@@ -642,7 +645,10 @@ pub fn reference_and_documents(
                 let (ref_seq, alt_seqs) = ref_spec
                     .draw_ref_alt(contig_id, pos0, klass, &DrawOpts::default())
                     .expect("reference draw in bounds");
-                let alts: Vec<Allele> = alt_seqs.iter().map(|a| Allele::parse(a)).collect();
+                let alts: Vec<Allele> = alt_seqs
+                    .iter()
+                    .map(|a| Allele::parse(a).expect("strategy generates a valid allele"))
+                    .collect();
                 // Simple valid phased GT: (ploidy-1) ref slots then one alt slot.
                 // Allele index 1 is always <= n_alt (>= 1 here).
                 let gt = {

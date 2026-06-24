@@ -208,7 +208,7 @@ impl VcfBuilder {
             }
             fmt_keys.push("GT".to_string());
             for (si, s) in gts.iter().enumerate() {
-                let geno = Genotype::parse(s);
+                let geno = Genotype::parse(s)?;
                 for a in geno.alleles.iter().flatten() {
                     if *a as usize > n_alt {
                         return Err(BuildError::AlleleIndexOutOfRange { index: *a, n_alt });
@@ -677,6 +677,18 @@ mod tests {
             r,
             Err(crate::error::BuildError::SampleCountMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn malformed_gt_errors() {
+        // "0|x" is not a valid genotype token; should return BadGenotype.
+        let r = base().format("GT", None, None, None).unwrap().record(
+            RecordSpec::at("chr1", 1)
+                .ref_("A")
+                .alt([Allele::seq("T").unwrap()])
+                .gt(["0|x", "0|0"]),
+        );
+        assert!(matches!(r, Err(crate::error::BuildError::BadGenotype(_))));
     }
 
     #[test]
