@@ -1,4 +1,26 @@
 //! vcfixture — generate small VCF test data with decoded ground truth.
+//!
+//! ```
+//! use vcfixture::{Allele, RecordSpec, VcfBuilder, FieldValue};
+//! use vcfixture::spec::version::LATEST;
+//!
+//! let doc = VcfBuilder::new(["s1", "s2"], [("chr1", Some(100_000u64))], LATEST)
+//!     .info("AF", None, None, None).unwrap()
+//!     .format("GT", None, None, None).unwrap()
+//!     .record(
+//!         RecordSpec::at("chr1", 1000)
+//!             .ref_("A")
+//!             .alt([Allele::seq("T").unwrap()])
+//!             .gt(["0|1", "1|1"])
+//!             .info("AF", FieldValue::floats([0.25])),
+//!     ).unwrap()
+//!     .build().unwrap();
+//!
+//! let truth = doc.truth();
+//! assert_eq!(truth.genotypes[[0, 0, 1]], 1);
+//! assert_eq!(truth.pos[0], 1000);
+//! let _text = doc.render();
+//! ```
 
 #[cfg(feature = "proptest")]
 pub mod strategies;
