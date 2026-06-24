@@ -530,4 +530,103 @@ mod tests {
             Err(crate::error::BuildError::AlleleIndexOutOfRange { .. })
         ));
     }
+
+    #[test]
+    fn gt_not_declared_errs() {
+        // .gt(...) used but the builder never declared FORMAT "GT".
+        let r = base().record(
+            RecordSpec::at("chr1", 1)
+                .ref_("A")
+                .alt([Allele::seq("T").unwrap()])
+                .gt(["0|1", "1|1"]),
+        );
+        assert!(matches!(r, Err(crate::error::BuildError::GtNotDeclared)));
+    }
+
+    #[test]
+    fn svlen_must_be_missing_for_unspecified() {
+        // <*> (Unspecified) ALT with single-base REF padding but SVLEN set.
+        let r = base()
+            .format("GT", None, None, None)
+            .unwrap()
+            .info("SVLEN", None, None, None)
+            .unwrap()
+            .record(
+                RecordSpec::at("chr1", 1)
+                    .ref_("A")
+                    .alt([Allele::unspecified()])
+                    .info("SVLEN", FieldValue::ints([100])),
+            );
+        assert!(matches!(
+            r,
+            Err(crate::error::BuildError::SvlenMustBeMissing(_))
+        ));
+    }
+
+    #[test]
+    fn bad_svclaim_errs() {
+        // DEL allows SVCLAIM D/J/DJ; "Z" is invalid.
+        let r = base()
+            .format("GT", None, None, None)
+            .unwrap()
+            .info("SVLEN", None, None, None)
+            .unwrap()
+            .info("SVCLAIM", None, None, None)
+            .unwrap()
+            .record(
+                RecordSpec::at("chr1", 1)
+                    .ref_("A")
+                    .alt([Allele::deletion(Vec::<&str>::new())])
+                    .info("SVLEN", FieldValue::ints([100]))
+                    .info("SVCLAIM", FieldValue::strings(["Z"])),
+            );
+        assert!(matches!(
+            r,
+            Err(crate::error::BuildError::BadSvclaim { .. })
+        ));
+    }
+
+    #[test]
+    fn svclaim_required_for_del_at_4_5() {
+        // At LATEST (V4_5 >= 4.4), DEL requires SVCLAIM; SVLEN present but no SVCLAIM.
+        let r = base()
+            .format("GT", None, None, None)
+            .unwrap()
+            .info("SVLEN", None, None, None)
+            .unwrap()
+            .record(
+                RecordSpec::at("chr1", 1)
+                    .ref_("A")
+                    .alt([Allele::deletion(Vec::<&str>::new())])
+                    .info("SVLEN", FieldValue::ints([100])),
+            );
+        assert!(matches!(
+            r,
+            Err(crate::error::BuildError::SvclaimRequired(_))
+        ));
+    }
+
+    #[test]
+    fn cn_svlen_mismatch_errs() {
+        // Two CNV alleles (CN-relevant, no SVCLAIM-required rule) with differing
+        // SVLEN, plus a per-sample CN FORMAT value -> CnSvlenMismatch.
+        let r = base()
+            .format("GT", None, None, None)
+            .unwrap()
+            .format("CN", None, None, None)
+            .unwrap()
+            .info("SVLEN", None, None, None)
+            .unwrap()
+            .record(
+                RecordSpec::at("chr1", 1)
+                    .ref_("A")
+                    .alt([
+                        Allele::cnv(Vec::<&str>::new()),
+                        Allele::cnv(Vec::<&str>::new()),
+                    ])
+                    .info("SVLEN", FieldValue::ints([100, 200]))
+                    .format("CN", [FieldValue::floats([2.0]), FieldValue::floats([3.0])]),
+            );
+        assert!(matches!(r, Err(crate::error::BuildError::CnSvlenMismatch)));
+    }
 }
