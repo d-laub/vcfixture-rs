@@ -1,7 +1,9 @@
 #![cfg(feature = "proptest")]
 
 use proptest::prelude::*;
-use vcfixture::strategies::{documents, DocumentOpts};
+use vcfixture::strategies::{
+    documents, documents_with_fields, reference_and_documents, DocumentOpts,
+};
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
@@ -96,6 +98,41 @@ proptest! {
                     );
                 }
             }
+        }
+    }
+
+    /// `documents_with_fields` must be valid-by-construction: build/truth/render
+    /// never panic and the rendered data-line count equals truth.pos.len().
+    #[test]
+    fn documents_with_fields_valid(doc in documents_with_fields(DocumentOpts::default())) {
+        let truth = doc.truth();
+        let text = doc.render();
+        let data_lines = text.lines().filter(|l| !l.starts_with('#') && !l.is_empty()).count();
+        prop_assert_eq!(data_lines, truth.pos.len());
+        // The curated extra fields should be present in the rendered header.
+        prop_assert!(text.contains("##INFO=<ID=AF,"));
+        prop_assert!(text.contains("##FORMAT=<ID=GQ,"));
+    }
+
+    /// `reference_and_documents` must be valid-by-construction and the returned
+    /// truth must match the document.
+    #[test]
+    fn reference_and_documents_valid(triple in reference_and_documents(DocumentOpts::default())) {
+        let (ref_spec, doc, truth) = triple;
+        prop_assert!(!ref_spec.contigs.is_empty());
+        let text = doc.render();
+        let data_lines = text.lines().filter(|l| !l.starts_with('#') && !l.is_empty()).count();
+        prop_assert_eq!(data_lines, truth.pos.len());
+        prop_assert_eq!(truth.genotypes.shape()[0], truth.pos.len());
+
+        // Each record's REF must match the reference sequence at its position.
+        for (ri, rec) in doc.records.iter().enumerate() {
+            let pos0 = (truth.pos[ri] - 1) as usize;
+            let ref_len = rec.ref_.len();
+            let ref_from_spec = ref_spec
+                .seq(&rec.chrom, pos0, ref_len)
+                .expect("ref position in bounds");
+            prop_assert_eq!(&rec.ref_, &ref_from_spec);
         }
     }
 }

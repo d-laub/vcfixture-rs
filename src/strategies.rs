@@ -10,7 +10,7 @@ use proptest::strategy::BoxedStrategy;
 use crate::allele::{Allele, SvType};
 use crate::build::{RecordSpec, VcfBuilder};
 use crate::model::Document;
-use crate::reference::{ReferenceBuilder, ReferenceSpec, VariantKlass};
+use crate::reference::{DrawOpts, ReferenceBuilder, ReferenceSpec, VariantKlass};
 use crate::spec::field::{FieldDef, FieldKind};
 use crate::spec::number::Number;
 use crate::spec::types::Type;
@@ -190,6 +190,41 @@ impl Default for DocumentOpts {
     }
 }
 
+/// Resolve a single record REF and its list of ALT alleles from per-alt drawn
+/// `(ref, alt)` pairs.
+///
+/// For `n_alt == 1` the drawn pair is used directly (REF and ALT are always
+/// class-consistent). For multi-allelic records a single common REF is required
+/// (VCF semantics), so REF is taken from the first allele's pair and the other
+/// ALTs are rebuilt deterministically off the common REF anchor base. The
+/// builder does not enforce REF/ALT length agreement for sequence alleles, so
+/// the result always validates.
+fn build_ref_alts(
+    n_alt: usize,
+    klasses: &[VariantKlass],
+    ref_alts: &[(String, String)],
+) -> (String, Vec<Allele>) {
+    let final_ref = ref_alts[0].0.clone();
+    if n_alt == 1 {
+        return (final_ref, vec![Allele::parse(&ref_alts[0].1)]);
+    }
+    let refbase = &final_ref[..1]; // single-char anchor
+    let mut alts: Vec<Allele> = Vec::with_capacity(n_alt);
+    for (i, k) in klasses.iter().enumerate() {
+        let alt_str = match k {
+            VariantKlass::Snp => next_base(refbase, 1),
+            VariantKlass::Mnp => {
+                format!("{}{}", next_base(refbase, 1), next_base(refbase, 2))
+            }
+            VariantKlass::Ins => format!("{refbase}T"),
+            VariantKlass::Del | VariantKlass::Delins => ref_alts[i].1.clone(),
+            VariantKlass::SpanningDel => "*".to_string(),
+        };
+        alts.push(Allele::parse(&alt_str));
+    }
+    (final_ref, alts)
+}
+
 /// A reference-free document strategy over a single synthetic `chr1`.
 ///
 /// Every drawn `Document` is valid-by-construction: the builder's eager
@@ -242,65 +277,7 @@ pub fn documents(opts: DocumentOpts) -> impl Strategy<Value = Document> {
                             *k = VariantKlass::Snp;
                         }
                     }
-
-                    // Build per-alt (ref, alt) pairs using class-correct strategy
-                    // output. We take the REF from the first alt's pair (all alts
-                    // share one REF in VCF); subsequent alts reuse that same REF
-                    // base but replace their alt sequence.
-                    //
-                    // For multi-allelic records we need a common REF. Choose the
-                    // REF from the first allele and rebuild the ALT strings for
-                    // subsequent alleles to be consistent with that REF base.
-                    let common_ref: String = ref_alts[0].0.clone();
-                    let refbase = &common_ref[..1]; // single char anchor
-
-                    let mut alts: Vec<Allele> = Vec::with_capacity(n_alt);
-                    for (i, k) in klasses.iter().enumerate() {
-                        let alt_str = match k {
-                            VariantKlass::Snp => next_base(refbase, 1),
-                            VariantKlass::Mnp => {
-                                // Use the drawn pair's alt directly if REF lengths match.
-                                // For multi-allelic, just generate a 2-base alt off common_ref[0].
-                                format!("{}{}", next_base(refbase, 1), next_base(refbase, 2))
-                            }
-                            VariantKlass::Ins => format!("{refbase}T"),
-                            VariantKlass::Del => {
-                                // REF must be longer than ALT. Use the drawn ref/alt pair.
-                                // But we committed to common_ref as REF. If klass is Del
-                                // and common_ref length > 1 (from Mnp/Del ref), use that.
-                                // Otherwise force common_ref to have a tail.
-                                // Simplest: use ref_alts[i] directly if available.
-                                ref_alts[i].1.clone()
-                            }
-                            VariantKlass::Delins => ref_alts[i].1.clone(),
-                            VariantKlass::SpanningDel => "*".to_string(),
-                        };
-                        // For Del/Delins, the REF might need to come from ref_alts[i].
-                        // However we've committed to common_ref for all alts.
-                        // To keep it simple: Del/Delins use single-base REF with valid ALT.
-                        alts.push(Allele::parse(&alt_str));
-                    }
-
-                    // For Del, the REF must be longer than ALT. The current approach uses
-                    // single-base REF from the first alt. If first klass is Del, its alt
-                    // from ref_alts[0].1 is the single base and ref from ref_alts[0].0 is
-                    // "base+tail". So common_ref = ref_alts[0].0 might be multi-base.
-                    // We need to reconcile: use the first allele's full drawn pair,
-                    // and rebuild others relative to that ref.
-
-                    // REVISED APPROACH: Take REF from first allele's ref_alt pair.
-                    // Build ALTs consistently: for each alt, take the alt from its pair
-                    // but ensure it's valid with common_ref.
-                    // For the simple case (max_alt=1 by default), this is always correct.
-                    // For multi-alt, we use the simplified per-class approach above.
-                    // The key correctness case: when n_alt=1, ref_alts[0] is correct.
-                    let final_ref = ref_alts[0].0.clone();
-                    let final_alts = if n_alt == 1 {
-                        // Perfect: use the drawn pair directly.
-                        vec![Allele::parse(&ref_alts[0].1)]
-                    } else {
-                        alts
-                    };
+                    let (final_ref, final_alts) = build_ref_alts(n_alt, &klasses, &ref_alts);
 
                     let spec = RecordSpec::at("chr1", pos)
                         .ref_(final_ref)
@@ -314,11 +291,188 @@ pub fn documents(opts: DocumentOpts) -> impl Strategy<Value = Document> {
         })
 }
 
-/// Like `documents`, but also declares INFO and FORMAT fields (from
-/// `all_number_type_combos`) and populates each record's field values so
-/// cardinality always matches.
+/// A curated, valid subset of extra INFO/FORMAT fields exercised by
+/// `documents_with_fields`. Each entry is `(id, Number, Type, FieldKind)` with
+/// an explicit Number/Type so we control population. Flag is Info-only.
+fn extra_field_defs() -> Vec<FieldDef> {
+    vec![
+        // INFO Number=A Float — one value per alt.
+        FieldDef::new(
+            "AF",
+            Number::A,
+            Type::Float,
+            "Allele frequency",
+            FieldKind::Info,
+        )
+        .unwrap(),
+        // INFO Number=1 Integer.
+        FieldDef::new(
+            "NS",
+            Number::ONE,
+            Type::Integer,
+            "Samples with data",
+            FieldKind::Info,
+        )
+        .unwrap(),
+        // INFO Flag.
+        FieldDef::new(
+            "DB",
+            Number::FLAG,
+            Type::Flag,
+            "dbSNP membership",
+            FieldKind::Info,
+        )
+        .unwrap(),
+        // FORMAT Number=1 Integer.
+        FieldDef::new(
+            "GQ",
+            Number::ONE,
+            Type::Integer,
+            "Genotype quality",
+            FieldKind::Format,
+        )
+        .unwrap(),
+        // FORMAT Number=R Integer — one value per allele (ref + alts).
+        FieldDef::new(
+            "AD",
+            Number::R,
+            Type::Integer,
+            "Allelic depths",
+            FieldKind::Format,
+        )
+        .unwrap(),
+    ]
+}
+
+/// Like `documents`, but also declares a curated set of extra INFO and FORMAT
+/// fields and populates each record's values via `field_value_strategy` so
+/// cardinality always matches the record's `n_alt`/`ploidy`. Valid-by-
+/// construction: `field_value_strategy` resolves the exact cardinality for the
+/// declared Number/Type and returns `FieldValue::Flag` for Flag fields.
 pub fn documents_with_fields(opts: DocumentOpts) -> impl Strategy<Value = Document> {
-    documents(opts)
+    (
+        1usize..=opts.max_samples,
+        1usize..=2usize, // ploidy
+        1usize..=opts.max_records,
+    )
+        .prop_flat_map(move |(n_samples, ploidy, n_rec)| {
+            let max_alt = opts.max_alt;
+            let version = opts.version;
+            let field_defs = extra_field_defs();
+
+            // Per-record strategy: n_alt, per-alt (ref, alt) pairs, genotypes,
+            // a position gap, and the populated INFO/FORMAT field values.
+            let rec_strat = (1usize..=max_alt).prop_flat_map(move |n_alt| {
+                let klasses = prop::collection::vec(
+                    prop::sample::select(ALL_VARIANT_CLASSES.to_vec()),
+                    n_alt,
+                );
+                let ref_alts = prop::collection::vec(
+                    prop::sample::select(ALL_VARIANT_CLASSES.to_vec())
+                        .prop_flat_map(ref_alt_strategy),
+                    n_alt,
+                );
+                let gts = prop::collection::vec(genotype_strategy(ploidy, n_alt, 0.1), n_samples);
+                let gap = 1u64..=50u64;
+
+                // INFO values: one FieldValue per INFO field.
+                let info_defs: Vec<FieldDef> = extra_field_defs()
+                    .into_iter()
+                    .filter(|fd| fd.kind == FieldKind::Info)
+                    .collect();
+                let info_strats: Vec<BoxedStrategy<FieldValue>> = info_defs
+                    .iter()
+                    .map(|fd| field_value_strategy(fd, n_alt, ploidy))
+                    .collect();
+
+                // FORMAT values: per field, one FieldValue per sample.
+                let fmt_defs: Vec<FieldDef> = extra_field_defs()
+                    .into_iter()
+                    .filter(|fd| fd.kind == FieldKind::Format)
+                    .collect();
+                let fmt_strats: Vec<BoxedStrategy<Vec<FieldValue>>> = fmt_defs
+                    .iter()
+                    .map(|fd| {
+                        prop::collection::vec(field_value_strategy(fd, n_alt, ploidy), n_samples)
+                            .boxed()
+                    })
+                    .collect();
+
+                (
+                    Just(n_alt),
+                    klasses,
+                    ref_alts,
+                    gts,
+                    gap,
+                    info_strats,
+                    fmt_strats,
+                )
+            });
+
+            prop::collection::vec(rec_strat, n_rec).prop_map(move |recs| {
+                let samples: Vec<String> = (0..n_samples).map(|i| format!("s{i}")).collect();
+                let mut b = VcfBuilder::new(samples, [("chr1", Some(100_000u64))], version)
+                    .format("GT", None, None, None)
+                    .expect("GT declares");
+                // Declare the curated extra fields.
+                for fd in &field_defs {
+                    b = match fd.kind {
+                        FieldKind::Info => b
+                            .info(
+                                &fd.id,
+                                Some(fd.number),
+                                Some(fd.type_),
+                                Some(fd.description.clone()),
+                            )
+                            .expect("INFO declares"),
+                        FieldKind::Format => b
+                            .format(
+                                &fd.id,
+                                Some(fd.number),
+                                Some(fd.type_),
+                                Some(fd.description.clone()),
+                            )
+                            .expect("FORMAT declares"),
+                    };
+                }
+
+                let info_ids: Vec<String> = field_defs
+                    .iter()
+                    .filter(|fd| fd.kind == FieldKind::Info)
+                    .map(|fd| fd.id.clone())
+                    .collect();
+                let fmt_ids: Vec<String> = field_defs
+                    .iter()
+                    .filter(|fd| fd.kind == FieldKind::Format)
+                    .map(|fd| fd.id.clone())
+                    .collect();
+
+                let mut pos = 1000u64;
+                for (n_alt, mut klasses, ref_alts, gts, gap, info_vals, fmt_vals) in recs {
+                    let last = n_alt - 1;
+                    for (j, k) in klasses.iter_mut().enumerate() {
+                        if *k == VariantKlass::SpanningDel && j != last {
+                            *k = VariantKlass::Snp;
+                        }
+                    }
+                    let (final_ref, final_alts) = build_ref_alts(n_alt, &klasses, &ref_alts);
+
+                    let mut spec = RecordSpec::at("chr1", pos)
+                        .ref_(final_ref)
+                        .alt(final_alts)
+                        .gt(gts);
+                    for (id, val) in info_ids.iter().zip(info_vals) {
+                        spec = spec.info(id.clone(), val);
+                    }
+                    for (id, per_sample) in fmt_ids.iter().zip(fmt_vals) {
+                        spec = spec.format(id.clone(), per_sample);
+                    }
+                    b = b.record(spec).expect("valid record");
+                    pos += gap;
+                }
+                b.build().expect("valid document")
+            })
+        })
 }
 
 // ── Symbolic SV documents ────────────────────────────────────────────────────
@@ -434,14 +588,79 @@ pub fn references(n_contigs: usize, contig_len: usize) -> impl Strategy<Value = 
     })
 }
 
-/// Generates a `(ReferenceSpec, Document, GroundTruth)` triple where each
-/// record's position and REF bases are drawn from the reference sequence.
+const REF_CONTIG_LEN: usize = 500;
+/// Margin left at the end of each contig so `draw_ref_alt` (which may read up to
+/// `pos0 + 2` for Del/Mnp under `DrawOpts::default`) never runs out of bounds.
+const REF_DRAW_MARGIN: usize = 8;
+
+/// Generates a `(ReferenceSpec, Document, GroundTruth)` triple whose records are
+/// reference-consistent: each record draws a 0-based position within a contig
+/// (with margin) and derives its `(REF, ALT)` pair from the reference sequence
+/// via `ReferenceSpec::draw_ref_alt`. Positions are emitted as 1-based VCF POS.
+///
+/// Valid-by-construction: positions are bounded so `draw_ref_alt` stays in
+/// range, and the derived REF/ALT pairs are class-consistent.
 pub fn reference_and_documents(
     opts: DocumentOpts,
 ) -> impl Strategy<Value = (ReferenceSpec, Document, GroundTruth)> {
-    let ref_strat = references(2, 500);
-    (ref_strat, documents(opts)).prop_map(|(ref_spec, doc)| {
-        let truth = doc.truth();
-        (ref_spec, doc, truth)
-    })
+    let version = opts.version;
+    let ref_strat = references(2, REF_CONTIG_LEN);
+    ref_strat
+        .prop_flat_map(move |ref_spec| {
+            let n_contigs = ref_spec.contigs.len();
+            // Per-record draw: contig index, 0-based position, class.
+            let max_pos = REF_CONTIG_LEN.saturating_sub(REF_DRAW_MARGIN).max(1);
+            let rec_strat = (
+                0usize..n_contigs,
+                0usize..max_pos,
+                prop::sample::select(ALL_VARIANT_CLASSES.to_vec()),
+            );
+            (
+                Just(ref_spec),
+                1usize..=opts.max_samples,
+                1usize..=2usize, // ploidy
+                prop::collection::vec(rec_strat, 1..=opts.max_records),
+            )
+        })
+        .prop_map(move |(ref_spec, n_samples, ploidy, recs)| {
+            let samples: Vec<String> = (0..n_samples).map(|i| format!("s{i}")).collect();
+            // Declare contigs matching the reference spec so records on any
+            // contig validate against a declared contig.
+            let contig_pairs: Vec<(String, Option<u64>)> = ref_spec
+                .contigs
+                .iter()
+                .map(|(id, seq)| (id.clone(), Some(seq.len() as u64)))
+                .collect();
+            let mut b = VcfBuilder::new(samples, contig_pairs, version)
+                .format("GT", None, None, None)
+                .expect("GT declares");
+
+            for (ci, pos0, klass) in recs {
+                let (contig_id, _seq) = &ref_spec.contigs[ci];
+                // draw_ref_alt is bounded by REF_DRAW_MARGIN; it can only fail if
+                // pos0 is too close to the end, which we have excluded.
+                let (ref_seq, alt_seqs) = ref_spec
+                    .draw_ref_alt(contig_id, pos0, klass, &DrawOpts::default())
+                    .expect("reference draw in bounds");
+                let alts: Vec<Allele> = alt_seqs.iter().map(|a| Allele::parse(a)).collect();
+                // Simple valid phased GT: (ploidy-1) ref slots then one alt slot.
+                // Allele index 1 is always <= n_alt (>= 1 here).
+                let gt = {
+                    let mut slots: Vec<&str> = vec!["0"; ploidy.saturating_sub(1)];
+                    slots.push("1");
+                    slots.join("|")
+                };
+                let gts: Vec<String> = (0..n_samples).map(|_| gt.clone()).collect();
+                // VCF POS is 1-based.
+                let pos = pos0 as u64 + 1;
+                let spec = RecordSpec::at(contig_id.clone(), pos)
+                    .ref_(ref_seq)
+                    .alt(alts)
+                    .gt(gts);
+                b = b.record(spec).expect("valid reference-consistent record");
+            }
+            let doc = b.build().expect("valid reference-consistent document");
+            let truth = doc.truth();
+            (ref_spec, doc, truth)
+        })
 }
