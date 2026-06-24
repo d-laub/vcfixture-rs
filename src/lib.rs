@@ -1,6 +1,7 @@
 //! vcfixture — generate small VCF test data with decoded ground truth.
 
 pub mod allele;
+pub mod build;
 pub mod error;
 pub mod genotype;
 pub mod model;
@@ -9,6 +10,7 @@ pub mod value;
 pub mod variants;
 
 pub use allele::{Allele, SvType};
+pub use build::{RecordSpec, VcfBuilder};
 pub use error::BuildError;
 pub use genotype::Genotype;
 pub use model::{AltDef, ContigDef, Document, Record, SampleValues};
