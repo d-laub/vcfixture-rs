@@ -234,7 +234,7 @@ let doc = VcfBuilder::new(["s1", "s2"], [("chr1", Some(100_000))], VcfVersion::L
 
 let text  = doc.render();
 let truth = doc.truth();
-doc.write("x.vcf.gz", WriteOpts { bgzip: true, index: true })?;
+doc.write("x.vcf.gz", WriteOpts { bgzip: true, index: true }).unwrap();
 ```
 
 - `info(impl Into<Field>)` / `format(impl Into<Field>)`: accept a `Field` or
@@ -245,8 +245,8 @@ doc.write("x.vcf.gz", WriteOpts { bgzip: true, index: true })?;
 - A small **`Record` sub-builder** stands in for Python's keyword arguments
   (Rust has no kwargs). `Record::at(chrom, pos)` then chained setters
   `.ref_()/.alt()/.ids()/.qual()/.filter()/.gt()/.info()/.format()/.labels()`.
-  `VcfBuilder::record(rec)` runs validation and appends.
-- **Eager validation** ports every Python check, surfaced as `BuildError`:
+  `VcfBuilder::record(rec)` accumulates a record spec; validation runs later in `build()`.
+- **Deferred validation** (run in `build()`) ports every Python check, surfaced as `BuildError`:
   - reserved resolution failure when number/type omitted for an unknown id;
   - symbolic/breakend ALT requires a single-base REF padding base;
   - symbolic allele requires `SVLEN`; SVCLAIM per-type allow-list
