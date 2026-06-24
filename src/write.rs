@@ -249,7 +249,7 @@ pub fn write(
 
 /// Build and write a CSI index alongside a bgzipped VCF.
 ///
-/// Uses `noodles_csi` (v0.46) with a `BinnedIndex` (the CSI-native index type).
+/// Uses `noodles_csi` (v0.49) with a `BinnedIndex` (the CSI-native index type).
 /// Writes `<path>.csi` in the standard noodles CSI binary format.
 ///
 /// API used:
@@ -325,4 +325,167 @@ fn write_csi(doc: &Document, bgzf_path: &Path) -> Result<(), BuildError> {
     csi::fs::write(&csi_path, &index)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::allele::Allele;
+    use crate::build::{RecordSpec, VcfBuilder};
+    use crate::spec::number::Number;
+    use crate::spec::types::Type;
+    use crate::spec::version::LATEST;
+    use crate::value::FieldValue;
+
+    fn base() -> VcfBuilder {
+        VcfBuilder::new(["s1"], [("chr1", Some(100_000u64))], LATEST)
+    }
+
+    /// Returns the single data line (the last non-empty line) of a rendered doc.
+    fn data_line(text: &str) -> &str {
+        text.lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .next_back()
+            .expect("expected at least one data line")
+    }
+
+    /// Returns the 0-based tab-separated column of the single data line.
+    fn data_col(text: &str, idx: usize) -> &str {
+        data_line(text).split('\t').nth(idx).expect("column exists")
+    }
+
+    // --- FILTER three-way -------------------------------------------------
+
+    #[test]
+    fn filter_empty_renders_pass() {
+        let text = base()
+            .format("GT", None, None, None)
+            .unwrap()
+            .record(
+                RecordSpec::at("chr1", 100)
+                    .ref_("A")
+                    .alt([Allele::seq("T").unwrap()])
+                    .gt(["0|1"])
+                    .filter(Vec::<&str>::new()),
+            )
+            .unwrap()
+            .render()
+            .unwrap();
+        // FILTER is column index 6 (CHROM POS ID REF ALT QUAL FILTER ...)
+        assert_eq!(data_col(&text, 6), "PASS");
+    }
+
+    #[test]
+    fn filter_unset_renders_dot() {
+        let text = base()
+            .format("GT", None, None, None)
+            .unwrap()
+            .record(
+                RecordSpec::at("chr1", 100)
+                    .ref_("A")
+                    .alt([Allele::seq("T").unwrap()])
+                    .gt(["0|1"]),
+            )
+            .unwrap()
+            .render()
+            .unwrap();
+        assert_eq!(data_col(&text, 6), ".");
+    }
+
+    #[test]
+    fn filter_named_renders_value() {
+        let text = base()
+            .filter("q10", "Quality below 10")
+            .format("GT", None, None, None)
+            .unwrap()
+            .record(
+                RecordSpec::at("chr1", 100)
+                    .ref_("A")
+                    .alt([Allele::seq("T").unwrap()])
+                    .gt(["0|1"])
+                    .filter(["q10"]),
+            )
+            .unwrap()
+            .render()
+            .unwrap();
+        assert_eq!(data_col(&text, 6), "q10");
+        // And the FILTER header definition is emitted.
+        assert!(text.contains("##FILTER=<ID=q10,Description=\"Quality below 10\">"));
+    }
+
+    // --- Flag INFO bare key ----------------------------------------------
+
+    #[test]
+    fn flag_info_renders_bare_key() {
+        let text = base()
+            .info("DB", None, None, None) // reserved DB = Flag
+            .unwrap()
+            .format("GT", None, None, None)
+            .unwrap()
+            .record(
+                RecordSpec::at("chr1", 100)
+                    .ref_("A")
+                    .alt([Allele::seq("T").unwrap()])
+                    .gt(["0|1"])
+                    .info("DB", FieldValue::Flag),
+            )
+            .unwrap()
+            .render()
+            .unwrap();
+        // INFO is column index 7.
+        assert_eq!(data_col(&text, 7), "DB");
+        assert!(!text.contains("DB="));
+    }
+
+    // --- Percent-encoding -------------------------------------------------
+
+    #[test]
+    fn string_info_percent_encodes_semicolon() {
+        // A String INFO value containing ';' must render as '%3B'.
+        let text = base()
+            .info("NOTE", Some(Number::ONE), Some(Type::String), None)
+            .unwrap()
+            .format("GT", None, None, None)
+            .unwrap()
+            .record(
+                RecordSpec::at("chr1", 100)
+                    .ref_("A")
+                    .alt([Allele::seq("T").unwrap()])
+                    .gt(["0|1"])
+                    .info("NOTE", FieldValue::strings(["a;b"])),
+            )
+            .unwrap()
+            .render()
+            .unwrap();
+        let info = data_col(&text, 7);
+        assert!(info.contains("NOTE=a%3Bb"), "INFO was: {info}");
+        // The raw reserved char must not survive inside the value.
+        assert_eq!(info, "NOTE=a%3Bb");
+    }
+
+    // --- Symbolic ALT rendering ------------------------------------------
+
+    #[test]
+    fn symbolic_deletion_renders_angle_del() {
+        // DEL at LATEST (>= 4.4) needs single-base REF + SVLEN + SVCLAIM.
+        let text = base()
+            .info("SVLEN", None, None, None)
+            .unwrap()
+            .info("SVCLAIM", None, None, None)
+            .unwrap()
+            .format("GT", None, None, None)
+            .unwrap()
+            .record(
+                RecordSpec::at("chr1", 100)
+                    .ref_("A")
+                    .alt([Allele::deletion(Vec::<&str>::new())])
+                    .gt(["0|1"])
+                    .info("SVLEN", FieldValue::ints([100]))
+                    .info("SVCLAIM", FieldValue::strings(["D"])),
+            )
+            .unwrap()
+            .render()
+            .unwrap();
+        // ALT is column index 4.
+        assert_eq!(data_col(&text, 4), "<DEL>");
+    }
 }
