@@ -2,7 +2,7 @@
 
 use proptest::prelude::*;
 use vcfixture::strategies::{
-    documents, documents_with_fields, reference_and_documents, DocumentOpts,
+    documents, documents_with_fields, reference_and_documents, symbolic_documents, DocumentOpts,
 };
 
 proptest! {
@@ -134,5 +134,23 @@ proptest! {
                 .expect("ref position in bounds");
             prop_assert_eq!(&rec.ref_, &ref_from_spec);
         }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// `symbolic_documents` is the intricate SV path (REF padding / SVLEN /
+    /// SVCLAIM). Lock in its valid-by-construction guarantee: build/truth/render
+    /// never panic and the structural counts are consistent. Records render with
+    /// symbolic ALTs (`<DEL>` etc.), so we only assert structural invariants and
+    /// do not re-parse symbolic SVs through the noodles reader.
+    #[test]
+    fn symbolic_documents_valid(doc in symbolic_documents(DocumentOpts::default())) {
+        let truth = doc.truth();
+        let text = doc.render();
+        let data_lines = text.lines().filter(|l| !l.starts_with('#') && !l.is_empty()).count();
+        prop_assert_eq!(data_lines, truth.pos.len());
+        prop_assert_eq!(truth.genotypes.shape()[0], truth.pos.len());
     }
 }
