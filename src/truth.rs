@@ -224,15 +224,13 @@ mod tests {
     #[test]
     fn genotypes_phasing_and_missing() {
         let t = VcfBuilder::new(["s1", "s2"], [("chr1", Some(1000u64))], LATEST)
-            .format("GT", None, None, None)
-            .unwrap()
+            .format("GT")
             .record(
                 RecordSpec::at("chr1", 10)
                     .ref_("A")
                     .alt([Allele::seq("T").unwrap()])
                     .gt(["0|1", "./."]),
             )
-            .unwrap()
             .build()
             .unwrap()
             .truth();
@@ -247,12 +245,9 @@ mod tests {
     #[test]
     fn symbolic_svlen_and_end() {
         let t = VcfBuilder::new(["s1"], [("chr1", Some(100_000u64))], LATEST)
-            .format("GT", None, None, None)
-            .unwrap()
-            .info("SVLEN", None, None, None)
-            .unwrap()
-            .info("SVCLAIM", None, None, None)
-            .unwrap()
+            .format("GT")
+            .info("SVLEN")
+            .info("SVCLAIM")
             .record(
                 RecordSpec::at("chr1", 100)
                     .ref_("A")
@@ -261,7 +256,6 @@ mod tests {
                     .info("SVCLAIM", FieldValue::strings(["D"]))
                     .gt(["0|1"]),
             )
-            .unwrap()
             .build()
             .unwrap()
             .truth();
@@ -275,10 +269,8 @@ mod tests {
     #[test]
     fn info_excludes_gt_from_format() {
         let t = VcfBuilder::new(["s1"], [("chr1", Some(1000u64))], LATEST)
-            .format("GT", None, None, None)
-            .unwrap()
-            .format("GQ", None, None, None)
-            .unwrap()
+            .format("GT")
+            .format("GQ")
             .record(
                 RecordSpec::at("chr1", 10)
                     .ref_("A")
@@ -286,7 +278,6 @@ mod tests {
                     .gt(["0|1"])
                     .format("GQ", [FieldValue::ints([42])]),
             )
-            .unwrap()
             .build()
             .unwrap()
             .truth();

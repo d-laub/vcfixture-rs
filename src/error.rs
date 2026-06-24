@@ -103,6 +103,13 @@ pub enum BuildError {
         clen: usize,
     },
 
+    #[error("record {index}: {source}")]
+    InRecord {
+        index: usize,
+        #[source]
+        source: Box<BuildError>,
+    },
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

@@ -266,9 +266,8 @@ pub fn documents(opts: DocumentOpts) -> impl Strategy<Value = Document> {
 
             prop::collection::vec(rec_strat, n_rec).prop_map(move |recs| {
                 let samples: Vec<String> = (0..n_samples).map(|i| format!("s{i}")).collect();
-                let mut b = VcfBuilder::new(samples, [("chr1", Some(100_000u64))], version)
-                    .format("GT", None, None, None)
-                    .expect("GT declares");
+                let mut b =
+                    VcfBuilder::new(samples, [("chr1", Some(100_000u64))], version).format("GT");
 
                 let mut pos = 1000u64;
                 for (n_alt, mut klasses, ref_alts, gts, gap) in recs {
@@ -286,7 +285,7 @@ pub fn documents(opts: DocumentOpts) -> impl Strategy<Value = Document> {
                         .ref_(final_ref)
                         .alt(final_alts)
                         .gt(gts);
-                    b = b.record(spec).expect("valid record");
+                    b = b.record(spec);
                     pos += gap;
                 }
                 b.build().expect("valid document")
@@ -414,28 +413,19 @@ pub fn documents_with_fields(opts: DocumentOpts) -> impl Strategy<Value = Docume
 
             prop::collection::vec(rec_strat, n_rec).prop_map(move |recs| {
                 let samples: Vec<String> = (0..n_samples).map(|i| format!("s{i}")).collect();
-                let mut b = VcfBuilder::new(samples, [("chr1", Some(100_000u64))], version)
-                    .format("GT", None, None, None)
-                    .expect("GT declares");
+                let mut b =
+                    VcfBuilder::new(samples, [("chr1", Some(100_000u64))], version).format("GT");
                 // Declare the curated extra fields.
                 for fd in &field_defs {
                     b = match fd.kind {
-                        FieldKind::Info => b
-                            .info(
-                                &fd.id,
-                                Some(fd.number),
-                                Some(fd.type_),
-                                Some(fd.description.clone()),
-                            )
-                            .expect("INFO declares"),
-                        FieldKind::Format => b
-                            .format(
-                                &fd.id,
-                                Some(fd.number),
-                                Some(fd.type_),
-                                Some(fd.description.clone()),
-                            )
-                            .expect("FORMAT declares"),
+                        FieldKind::Info => b.info(
+                            crate::build::Field::typed(&fd.id, fd.number, fd.type_)
+                                .description(fd.description.clone()),
+                        ),
+                        FieldKind::Format => b.format(
+                            crate::build::Field::typed(&fd.id, fd.number, fd.type_)
+                                .description(fd.description.clone()),
+                        ),
                     };
                 }
 
@@ -470,7 +460,7 @@ pub fn documents_with_fields(opts: DocumentOpts) -> impl Strategy<Value = Docume
                     for (id, per_sample) in fmt_ids.iter().zip(fmt_vals) {
                         spec = spec.format(id.clone(), per_sample);
                     }
-                    b = b.record(spec).expect("valid record");
+                    b = b.record(spec);
                     pos += gap;
                 }
                 b.build().expect("valid document")
@@ -534,12 +524,9 @@ pub fn symbolic_documents(opts: DocumentOpts) -> impl Strategy<Value = Document>
 
                     let mut b =
                         VcfBuilder::new(samples.clone(), [("chr1", Some(100_000u64))], version)
-                            .format("GT", None, None, None)
-                            .expect("GT")
-                            .info("SVLEN", None, None, None)
-                            .expect("SVLEN")
-                            .info("SVCLAIM", None, None, None)
-                            .expect("SVCLAIM");
+                            .format("GT")
+                            .info("SVLEN")
+                            .info("SVCLAIM");
 
                     let mut pos = 1000u64;
                     for (refbase, sv_type, svlen, gt) in &recs {
@@ -557,7 +544,7 @@ pub fn symbolic_documents(opts: DocumentOpts) -> impl Strategy<Value = Document>
                         if need_svclaim {
                             spec = spec.info("SVCLAIM", FieldValue::strings([svclaim_val]));
                         }
-                        b = b.record(spec).expect("valid symbolic record");
+                        b = b.record(spec);
                         pos += 100;
                     }
                     b.build().expect("valid symbolic document")
@@ -634,9 +621,7 @@ pub fn reference_and_documents(
                 .iter()
                 .map(|(id, seq)| (id.clone(), Some(seq.len() as u64)))
                 .collect();
-            let mut b = VcfBuilder::new(samples, contig_pairs, version)
-                .format("GT", None, None, None)
-                .expect("GT declares");
+            let mut b = VcfBuilder::new(samples, contig_pairs, version).format("GT");
 
             for (ci, pos0, klass) in recs {
                 let (contig_id, _seq) = &ref_spec.contigs[ci];
@@ -663,7 +648,7 @@ pub fn reference_and_documents(
                     .ref_(ref_seq)
                     .alt(alts)
                     .gt(gts);
-                b = b.record(spec).expect("valid reference-consistent record");
+                b = b.record(spec);
             }
             let doc = b.build().expect("valid reference-consistent document");
             let truth = doc.truth();
