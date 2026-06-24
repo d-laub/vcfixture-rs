@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Gate: nothing is bumped, tagged, or published unless these pass.
+      - name: test
+        run: cargo test --all-features --locked
+      - name: package check
+        run: cargo publish --dry-run
+
+      # Bump version + changelog + tag. push:false so we own the push and can
+      # fold the Cargo.lock sync into the single bump commit.
+      - name: Bump version
+        id: cz
+        uses: commitizen-tools/commitizen-action@0.23.1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          push: false
+          changelog_increment_filename: .release-notes.md
+
+      # commitizen bumps Cargo.toml but not Cargo.lock; sync it and amend it into
+      # the bump commit so the committed lockfile is never stale.
+      - name: Sync lockfile and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          cargo update --workspace
+          git add Cargo.lock
+          git commit --amend --no-edit
+          git tag -f "v${{ steps.cz.outputs.version }}"
+          git push origin "HEAD:${{ github.ref_name }}"
+          git push origin "v${{ steps.cz.outputs.version }}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ steps.cz.outputs.version }}" \
+            --title "v${{ steps.cz.outputs.version }}" \
+            --notes-file .release-notes.md
+
+      - name: Authenticate to crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
