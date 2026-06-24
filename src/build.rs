@@ -1,3 +1,9 @@
+//! The [`VcfBuilder`] accumulator and its `build()` validation pipeline.
+//!
+//! Field declarations and records are collected infallibly; all validation is
+//! deferred to [`VcfBuilder::build`], which resolves reserved fields, checks
+//! cardinality and structural-variant rules, and returns a [`Document`].
+
 use std::collections::BTreeSet;
 
 use indexmap::IndexMap;
@@ -30,7 +36,7 @@ fn cn_svlen_type(t: SvType) -> bool {
     matches!(t, SvType::Cnv | SvType::Del | SvType::Dup)
 }
 
-/// A record's spec, before validation/appending.
+/// A record specification collected by [`VcfBuilder`], validated at build time.
 #[derive(Debug, Clone, Default)]
 pub struct RecordSpec {
     chrom: String,
@@ -47,6 +53,7 @@ pub struct RecordSpec {
 }
 
 impl RecordSpec {
+    /// Start a record at `chrom` position `pos` (1-based, VCF convention).
     pub fn at(chrom: impl Into<String>, pos: u64) -> RecordSpec {
         RecordSpec {
             chrom: chrom.into(),
@@ -54,34 +61,42 @@ impl RecordSpec {
             ..Default::default()
         }
     }
+    /// Set the REF allele string.
     pub fn ref_(mut self, r: impl Into<String>) -> Self {
         self.ref_ = r.into();
         self
     }
+    /// Set the ALT alleles.
     pub fn alt(mut self, alts: impl IntoIterator<Item = Allele>) -> Self {
         self.alts = alts.into_iter().collect();
         self
     }
+    /// Set the ID column (semicolon-joined in VCF output).
     pub fn ids(mut self, ids: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.ids = Some(ids.into_iter().map(Into::into).collect());
         self
     }
+    /// Set the QUAL score.
     pub fn qual(mut self, q: f64) -> Self {
         self.qual = Some(q);
         self
     }
+    /// Set the FILTER values; an empty iterator renders as `PASS`.
     pub fn filter(mut self, f: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.filters = Some(f.into_iter().map(Into::into).collect());
         self
     }
+    /// Set per-sample genotype strings (e.g. `"0|1"`), one per sample in declaration order.
     pub fn gt(mut self, gts: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.gt = Some(gts.into_iter().map(Into::into).collect());
         self
     }
+    /// Add an INFO field value for key `id`.
     pub fn info(mut self, id: impl Into<String>, value: FieldValue) -> Self {
         self.info.insert(id.into(), value);
         self
     }
+    /// Add a FORMAT field, supplying one `FieldValue` per sample.
     pub fn format(
         mut self,
         id: impl Into<String>,
@@ -90,6 +105,7 @@ impl RecordSpec {
         self.fmt.insert(id.into(), per_sample.into_iter().collect());
         self
     }
+    /// Attach arbitrary string labels to this record (propagated to [`crate::truth::GroundTruth::labels`]).
     pub fn labels(mut self, labels: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.labels = labels.into_iter().map(Into::into).collect();
         self
@@ -173,6 +189,7 @@ impl From<String> for Field {
     }
 }
 
+/// Infallible accumulator for VCF samples, contigs, field declarations, and records.
 pub struct VcfBuilder {
     samples: Vec<String>,
     contigs: Vec<ContigDef>,
@@ -185,6 +202,7 @@ pub struct VcfBuilder {
 }
 
 impl VcfBuilder {
+    /// Create a new builder with sample names, contig `(id, length)` pairs, and a VCF version.
     pub fn new(
         samples: impl IntoIterator<Item = impl Into<String>>,
         contigs: impl IntoIterator<Item = (impl Into<String>, Option<u64>)>,
@@ -208,35 +226,42 @@ impl VcfBuilder {
         }
     }
 
+    /// Declare an INFO field. A bare `&str` is resolved as a reserved field name.
     pub fn info(mut self, field: impl Into<Field>) -> VcfBuilder {
         self.info_fields.push(field.into());
         self
     }
 
+    /// Declare a FORMAT field. A bare `&str` is resolved as a reserved field name.
     pub fn format(mut self, field: impl Into<Field>) -> VcfBuilder {
         self.format_fields.push(field.into());
         self
     }
 
+    /// Declare a FILTER header entry with `id` and a human-readable `description`.
     pub fn filter(mut self, id: impl Into<String>, description: impl Into<String>) -> VcfBuilder {
         self.filter_defs.push((id.into(), description.into()));
         self
     }
 
+    /// Declare an ALT header entry with `id` and a human-readable `description`.
     pub fn alt(mut self, id: impl Into<String>, description: impl Into<String>) -> VcfBuilder {
         self.alt_defs.insert(id.into(), description.into());
         self
     }
 
+    /// Append a record specification; validated when [`VcfBuilder::build`] is called.
     pub fn record(mut self, spec: RecordSpec) -> VcfBuilder {
         self.records.push(spec);
         self
     }
 
+    /// Build and render to a VCF string in one step.
     pub fn render(self) -> Result<String, BuildError> {
         Ok(self.build()?.render())
     }
 
+    /// Build and write to `path` in one step, applying `opts`.
     pub fn write(
         self,
         path: impl AsRef<std::path::Path>,
@@ -245,6 +270,7 @@ impl VcfBuilder {
         self.build()?.write(path, opts)
     }
 
+    /// Build and derive the ground-truth oracle in one step.
     pub fn truth(self) -> Result<crate::truth::GroundTruth, BuildError> {
         Ok(self.build()?.truth())
     }

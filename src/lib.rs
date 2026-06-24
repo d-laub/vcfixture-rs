@@ -1,4 +1,22 @@
-//! vcfixture — generate small VCF test data with decoded ground truth.
+//! Generate small VCF test data with a decoded ground-truth oracle.
+//!
+//! `vcfixture` builds a VCF [`Document`] in code, renders it to text (or a
+//! bgzipped, indexed file), and derives a [`GroundTruth`] — arrays of
+//! positions, genotypes, and per-allele metadata — so parser tests assert
+//! against a known oracle instead of hand-coded literals.
+//!
+//! # Workflow
+//!
+//! 1. [`VcfBuilder`] accumulates samples, contigs, field declarations, and
+//!    records. It is infallible until [`VcfBuilder::build`], which validates
+//!    everything at once and returns a [`Document`] or a [`BuildError`].
+//! 2. [`Document::render`] produces VCF text; [`Document::write`] writes a file;
+//!    [`Document::truth`] derives the [`GroundTruth`] oracle.
+//!
+//! Property-test strategies for fuzzing a parser live in [`strategies`], behind
+//! the `proptest` feature (off by default).
+//!
+//! # Example
 //!
 //! ```
 //! use vcfixture::{Allele, Field, RecordSpec, VcfBuilder, FieldValue};

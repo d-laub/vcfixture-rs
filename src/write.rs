@@ -1,3 +1,6 @@
+//! VCF text serialization ([`render`]) and file output ([`write()`], optionally
+//! bgzipped and CSI-indexed) plus [`WriteOpts`].
+
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -18,18 +21,21 @@ pub struct WriteOpts {
 }
 
 impl WriteOpts {
+    /// Plain-text VCF output (no compression, no index).
     pub fn text() -> WriteOpts {
         WriteOpts {
             bgzip: false,
             index: false,
         }
     }
+    /// bgzip-compressed VCF output without an index.
     pub fn bgzipped() -> WriteOpts {
         WriteOpts {
             bgzip: true,
             index: false,
         }
     }
+    /// bgzip-compressed VCF output with a CSI index written alongside.
     pub fn bgzipped_indexed() -> WriteOpts {
         WriteOpts {
             bgzip: true,
