@@ -38,7 +38,7 @@ pub mod variants;
 pub mod write;
 
 pub use allele::{Allele, SvType};
-pub use build::{RecordSpec, VcfBuilder};
+pub use build::{Field, RecordSpec, VcfBuilder};
 pub use error::BuildError;
 pub use genotype::Genotype;
 pub use model::{AltDef, ContigDef, Document, Record, SampleValues};

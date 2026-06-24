@@ -96,6 +96,86 @@ impl RecordSpec {
     }
 }
 
+/// A field declaration, resolved to a `FieldDef` at build time.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct Field {
+    id: String,
+    decl: Decl,
+    description: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+enum Decl {
+    /// Look the field up in the reserved registry for the document version.
+    Reserved,
+    /// Explicit `Number` and `Type`.
+    Typed(Number, Type),
+    /// Flag field: `Number=0`, `Type=Flag` (INFO only; enforced at build).
+    Flag,
+}
+
+impl Field {
+    /// Resolve `id` via the reserved registry at build time.
+    pub fn reserved(id: impl Into<String>) -> Field {
+        Field {
+            id: id.into(),
+            decl: Decl::Reserved,
+            description: None,
+        }
+    }
+
+    /// Declare `id` with an explicit `number` and `type_`.
+    pub fn typed(id: impl Into<String>, number: Number, type_: Type) -> Field {
+        Field {
+            id: id.into(),
+            decl: Decl::Typed(number, type_),
+            description: None,
+        }
+    }
+
+    /// Declare a Flag field (`Number=0`, `Type=Flag`). Valid for INFO only.
+    pub fn flag(id: impl Into<String>) -> Field {
+        Field {
+            id: id.into(),
+            decl: Decl::Flag,
+            description: None,
+        }
+    }
+
+    /// Set the `Description=` header text. Defaults to the field id.
+    pub fn description(mut self, d: impl Into<String>) -> Field {
+        self.description = Some(d.into());
+        self
+    }
+
+    /// Resolve to a concrete `FieldDef` for the given kind and version.
+    #[allow(dead_code)]
+    fn resolve(&self, kind: FieldKind, version: VcfVersion) -> Result<FieldDef, BuildError> {
+        let desc = || self.description.clone().unwrap_or_else(|| self.id.clone());
+        match &self.decl {
+            Decl::Reserved => reserved(&self.id, kind, version),
+            Decl::Typed(number, type_) => {
+                FieldDef::new(self.id.as_str(), *number, *type_, desc(), kind)
+            }
+            Decl::Flag => FieldDef::new(self.id.as_str(), Number::FLAG, Type::Flag, desc(), kind),
+        }
+    }
+}
+
+impl From<&str> for Field {
+    fn from(id: &str) -> Field {
+        Field::reserved(id)
+    }
+}
+
+impl From<String> for Field {
+    fn from(id: String) -> Field {
+        Field::reserved(id)
+    }
+}
+
 pub struct VcfBuilder {
     samples: Vec<String>,
     contigs: Vec<ContigDef>,
@@ -713,5 +793,55 @@ mod tests {
                     .format("CN", [FieldValue::floats([2.0]), FieldValue::floats([3.0])]),
             );
         assert!(matches!(r, Err(crate::error::BuildError::CnSvlenMismatch)));
+    }
+
+    #[test]
+    fn field_reserved_resolves_from_registry() {
+        // "AF" is a reserved INFO field (Number=A, Type=Float).
+        let def = Field::reserved("AF")
+            .resolve(FieldKind::Info, LATEST)
+            .unwrap();
+        assert_eq!(def.id, "AF");
+        assert_eq!(def.number, Number::A);
+        assert_eq!(def.type_, Type::Float);
+    }
+
+    #[test]
+    fn field_typed_resolves_explicitly_with_description() {
+        let def = Field::typed("DP", Number::ONE, Type::Integer)
+            .description("read depth")
+            .resolve(FieldKind::Info, LATEST)
+            .unwrap();
+        assert_eq!(def.id, "DP");
+        assert_eq!(def.number, Number::ONE);
+        assert_eq!(def.type_, Type::Integer);
+        assert_eq!(def.description, "read depth");
+    }
+
+    #[test]
+    fn field_typed_defaults_description_to_id() {
+        let def = Field::typed("DP", Number::ONE, Type::Integer)
+            .resolve(FieldKind::Info, LATEST)
+            .unwrap();
+        assert_eq!(def.description, "DP");
+    }
+
+    #[test]
+    fn field_flag_resolves_as_info_flag() {
+        let def = Field::flag("SOMATIC")
+            .resolve(FieldKind::Info, LATEST)
+            .unwrap();
+        assert_eq!(def.type_, Type::Flag);
+        assert_eq!(def.number, Number::FLAG);
+    }
+
+    #[test]
+    fn field_from_str_is_reserved() {
+        let from_str: Field = "AF".into();
+        let explicit = Field::reserved("AF");
+        assert_eq!(
+            from_str.resolve(FieldKind::Info, LATEST).unwrap(),
+            explicit.resolve(FieldKind::Info, LATEST).unwrap()
+        );
     }
 }
