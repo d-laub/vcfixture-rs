@@ -1,0 +1,10 @@
+[book]
+title = "vcfixture"
+authors = ["David Laub"]
+description = "Generate small VCF test data with a decoded ground-truth oracle."
+src = "src"
+language = "en"
+
+[output.html]
+git-repository-url = "https://github.com/d-laub/vcfixture-rs"
+edit-url-template = "https://github.com/d-laub/vcfixture-rs/edit/main/docs/book/{path}"

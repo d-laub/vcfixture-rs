@@ -31,3 +31,10 @@ proptest = "1"
 [features]
 default = []
 proptest = ["dep:proptest"]
+
+[[example]]
+name = "proptest_fuzz"
+required-features = ["proptest"]
+
+[package.metadata.docs.rs]
+all-features = true

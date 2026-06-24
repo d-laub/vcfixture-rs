@@ -1,3 +1,5 @@
+//! [`FieldValue`] and [`Scalar`]: decoded INFO/FORMAT values.
+
 /// A single decoded INFO/FORMAT scalar.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Scalar {
@@ -24,14 +26,17 @@ impl FieldValue {
         }
     }
 
+    /// Construct a list value from integer scalars.
     pub fn ints<I: IntoIterator<Item = i64>>(xs: I) -> FieldValue {
         FieldValue::List(xs.into_iter().map(|x| Some(Scalar::Int(x))).collect())
     }
 
+    /// Construct a list value from float scalars.
     pub fn floats<I: IntoIterator<Item = f64>>(xs: I) -> FieldValue {
         FieldValue::List(xs.into_iter().map(|x| Some(Scalar::Float(x))).collect())
     }
 
+    /// Construct a list value from string scalars.
     pub fn strings<I, S>(xs: I) -> FieldValue
     where
         I: IntoIterator<Item = S>,

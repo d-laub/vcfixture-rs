@@ -1,7 +1,11 @@
+//! [`Allele`] — sequence, symbolic structural-variant, and breakend ALTs, with
+//! constructors and VCF-string rendering/parsing.
+
 use std::str::FromStr;
 
 use crate::error::BuildError;
 
+/// First-level symbolic SV type token (e.g. `DEL`, `DUP`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SvType {
     Del,
@@ -12,6 +16,7 @@ pub enum SvType {
 }
 
 impl SvType {
+    /// Return the VCF symbolic ID string (e.g. `"DEL"`, `"DUP"`).
     pub fn as_str(&self) -> &'static str {
         match self {
             SvType::Del => "DEL",
@@ -38,6 +43,7 @@ impl FromStr for SvType {
     }
 }
 
+/// A VCF ALT allele — sequence, symbolic SV, breakend, or special token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Allele {
     Seq(String),
@@ -73,6 +79,7 @@ fn is_seq_or_empty(s: &str) -> bool {
 }
 
 impl Allele {
+    /// Construct a sequence allele, returning an error if `bases` contains characters other than A, C, G, T, N (case-insensitive).
     pub fn seq(bases: impl Into<String>) -> Result<Allele, BuildError> {
         let bases = bases.into();
         if !is_seq(&bases) {
@@ -81,10 +88,12 @@ impl Allele {
         Ok(Allele::Seq(bases))
     }
 
+    /// Construct the spanning deletion token `*`.
     pub fn star() -> Allele {
         Allele::Star
     }
 
+    /// Construct the unspecified allele token `<*>`.
     pub fn unspecified() -> Allele {
         Allele::Unspecified
     }
@@ -96,22 +105,27 @@ impl Allele {
         }
     }
 
+    /// Construct a `<DEL[:subtype]>` symbolic allele.
     pub fn deletion(subtypes: impl IntoIterator<Item = impl Into<String>>) -> Allele {
         Allele::symbolic(SvType::Del, subtypes)
     }
 
+    /// Construct a `<INS[:subtype]>` symbolic allele.
     pub fn insertion(subtypes: impl IntoIterator<Item = impl Into<String>>) -> Allele {
         Allele::symbolic(SvType::Ins, subtypes)
     }
 
+    /// Construct a `<DUP[:subtype]>` symbolic allele.
     pub fn duplication(subtypes: impl IntoIterator<Item = impl Into<String>>) -> Allele {
         Allele::symbolic(SvType::Dup, subtypes)
     }
 
+    /// Construct a `<INV[:subtype]>` symbolic allele.
     pub fn inversion(subtypes: impl IntoIterator<Item = impl Into<String>>) -> Allele {
         Allele::symbolic(SvType::Inv, subtypes)
     }
 
+    /// Construct a `<CNV[:subtype]>` symbolic allele.
     pub fn cnv(subtypes: impl IntoIterator<Item = impl Into<String>>) -> Allele {
         Allele::symbolic(SvType::Cnv, subtypes)
     }
@@ -148,6 +162,7 @@ impl Allele {
         }
     }
 
+    /// Render the allele to its VCF string representation.
     pub fn render(&self) -> String {
         match self {
             Allele::Seq(b) => b.clone(),

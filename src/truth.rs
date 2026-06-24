@@ -1,3 +1,6 @@
+//! [`GroundTruth`] — the decoded oracle derived from a [`Document`]: position,
+//! genotype, phasing, and per-allele arrays a parser test asserts against.
+
 use std::collections::{BTreeSet, HashMap};
 
 use ndarray::{Array1, Array2, Array3};
@@ -7,6 +10,7 @@ use crate::model::Document;
 use crate::value::{FieldValue, Scalar};
 use crate::variants::{classify_seq, record_class, VariantClass};
 
+/// Coarse classification of an ALT allele in the ground-truth oracle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlleleKind {
     Snp,
@@ -20,29 +24,51 @@ pub enum AlleleKind {
     Bnd,
 }
 
+/// Per-allele ground-truth metadata derived from a [`crate::model::Document`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlleleTruth {
+    /// Coarse variant class for this allele.
     pub kind: AlleleKind,
+    /// `true` for sequence (`Seq`) alleles; `false` for symbolic/breakend/special.
     pub is_sequence: bool,
+    /// Symbolic SV type string (e.g. `"DEL"`, `"DUP:TANDEM"`), if applicable.
     pub sv_type: Option<String>,
+    /// Absolute SVLEN value, if present in INFO.
     pub svlen: Option<i64>,
+    /// Computed end position (`pos + svlen`) for spanning SV types (DEL, DUP, INV, CNV).
     pub sv_end: Option<i64>,
 }
 
+/// Decoded oracle derived from a [`crate::model::Document`].
+///
+/// All arrays are indexed `[record, sample, ploidy]` unless noted.
 #[derive(Debug, Clone)]
 pub struct GroundTruth {
+    /// Sample names in declaration order.
     pub samples: Vec<String>,
+    /// Contig IDs in declaration order.
     pub contigs: Vec<String>,
+    /// 1-based POS for each record; shape `[n_records]`.
     pub pos: Array1<i64>,
+    /// REF allele string for each record.
     pub ref_: Vec<String>,
+    /// Rendered ALT strings per record (`alts[record][alt_index]`).
     pub alts: Vec<Vec<String>>,
+    /// Record-level variant class.
     pub variant_class: Vec<VariantClass>,
+    /// Allele indices; shape `[n_records, n_samples, ploidy]`; `-1` for missing.
     pub genotypes: Array3<i32>,
+    /// `true` if the genotype for that record+sample is phased; shape `[n_records, n_samples]`.
     pub phasing: Array2<bool>,
+    /// INFO field values per record.
     pub info: Vec<HashMap<String, FieldValue>>,
+    /// FORMAT field values per record per sample (excludes GT, which is in `genotypes`).
     pub format: Vec<Vec<HashMap<String, FieldValue>>>,
+    /// Arbitrary labels attached via `RecordSpec::labels`.
     pub labels: Vec<BTreeSet<String>>,
+    /// Per-allele truth for each record (`alts_truth[record][alt_index]`).
     pub alts_truth: Vec<Vec<AlleleTruth>>,
+    /// Boolean mask: `true` for sequence alleles; shape `[n_records][n_alts]`.
     pub is_sequence_mask: Vec<Array1<bool>>,
 }
 
@@ -107,6 +133,7 @@ fn allele_truth(pos: u64, allele: &Allele, svlen_val: Option<i64>) -> AlleleTrut
     }
 }
 
+/// Derive the [`GroundTruth`] oracle from a validated [`Document`].
 pub fn derive(doc: &Document) -> GroundTruth {
     let n_rec = doc.records.len();
     let n_smp = doc.samples.len();
