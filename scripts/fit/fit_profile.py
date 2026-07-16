@@ -28,6 +28,7 @@ import datetime as _dt
 import json
 import subprocess
 import tempfile
+import warnings
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
@@ -62,17 +63,35 @@ def histogram(
     Returns ``{"edges": [...], "weights": [...]}`` with
     ``len(weights) == len(edges) - 1``, matching the Rust ``Histogram``
     schema in ``src/bulk/profile.rs``.
+
+    Values outside ``[edges[0], edges[-1]]`` are dropped from the
+    normalization (as `numpy.histogram` already does implicitly) but, unlike
+    a bare `numpy.histogram` call, this warns whenever *any* values are
+    dropped -- not just when *all* of them are -- since a silently-dropped
+    tail (e.g. inter-variant gaps over centromeres/telomeres exceeding the
+    `gap_dist` cap) would otherwise skew the fitted distribution with zero
+    diagnostic output.
     """
     edges = [float(e) for e in edges]
     if len(edges) < 2:
         raise ValueError("histogram needs >= 2 edges")
     if any(b <= a for a, b in zip(edges, edges[1:])):
         raise ValueError("histogram edges must be strictly increasing")
-    counts, _ = np.histogram(np.asarray(values, dtype=np.float64), bins=edges)
-    total = counts.sum()
-    if total <= 0:
+    arr = np.asarray(values, dtype=np.float64)
+    counts, _ = np.histogram(arr, bins=edges)
+    n_in_range = int(counts.sum())
+    n_total = int(arr.size)
+    n_dropped = n_total - n_in_range
+    if n_dropped > 0:
+        frac = n_dropped / n_total
+        warnings.warn(
+            f"histogram: dropped {n_dropped}/{n_total} values ({frac:.1%}) "
+            f"outside the edge range [{edges[0]}, {edges[-1]}]",
+            stacklevel=2,
+        )
+    if n_in_range <= 0:
         raise ValueError("no values fell within the histogram edges")
-    weights = (counts / total).tolist()
+    weights = (counts / n_in_range).tolist()
     return {"edges": edges, "weights": weights}
 
 
@@ -94,11 +113,17 @@ def class_mix_from_counts(counts: Mapping[str, int]) -> dict[str, float]:
 def classify(ref: str, alt: str) -> str:
     """Classify a single REF/ALT pair into one of `CLASS_NAMES`.
 
-    This is the scalar reference implementation. The extraction pipeline
-    uses `_classify_expr`, a vectorized polars expression that computes the
-    same classification over an entire pvar column at once -- looping this
-    function over 10s-100s of millions of pvar rows in Python would be far
-    too slow.
+    This is the scalar reference implementation. It assumes `alt` is a
+    *single* allele -- a comma-joined multiallelic ALT (e.g. "G,T") must be
+    split into one call per allele by the caller; passing the raw joined
+    string here silently misclassifies (e.g. `classify("A", "A,G")` reads
+    as an insertion, not two independent alleles). The extraction pipeline
+    handles this via `_explode_alleles` before `_classify_expr` ever runs.
+
+    The extraction pipeline uses `_classify_expr`, a vectorized polars
+    expression that computes the same classification over an entire pvar
+    column at once -- looping this function over 10s-100s of millions of
+    pvar rows in Python would be far too slow.
     """
     if alt.startswith("<") or "[" in alt or "]" in alt:
         return "symbolic"
@@ -114,7 +139,12 @@ def classify(ref: str, alt: str) -> str:
 
 
 def _classify_expr(ref: pl.Expr, alt: pl.Expr) -> pl.Expr:
-    """Vectorized equivalent of `classify`, for use over a full pvar column."""
+    """Vectorized equivalent of `classify`, for use over a full pvar column.
+
+    Like `classify`, this assumes `alt` is a single allele per row -- run it
+    only after `_explode_alleles` has split any comma-joined multiallelic
+    ALT into one row per allele.
+    """
     is_symbolic = alt.str.starts_with("<") | alt.str.contains(r"[\[\]]", literal=False)
     ref_len = ref.str.len_chars()
     alt_len = alt.str.len_chars()
@@ -144,6 +174,13 @@ def read_pvar(path: str | Path) -> pl.DataFrame:
     (`polars.scan_csv`) and collects with the streaming engine so the file is
     never fully materialized as an eager, unstreamed read; `.zst` decoding is
     handled natively by polars based on the file extension.
+
+    ``ALT`` may be a comma-joined multiallelic list (e.g. "G,T") exactly as
+    plink2 pvar stores it natively -- pgen does NOT auto-split multiallelic
+    records. Callers that need a single REF/ALT pair per row (classification,
+    indel length, Ti/Tv) must run `_explode_alleles` first; callers that
+    operate per-*record* (contig density, inter-variant gaps,
+    `multiallelic_rate`) should use the frame as returned here.
     """
     # CHROM must stay a string even for numeric-looking contig names like
     # "1" or "22" -- ContigStat.id is a String in src/bulk/profile.rs, and
@@ -257,11 +294,34 @@ def _sfs_edges(n_samples: int) -> list[float]:
 # --------------------------------------------------------------------------
 
 
+def _explode_alleles(df: pl.DataFrame) -> pl.DataFrame:
+    """Split multiallelic ALT into one row per REF/ALT allele pair.
+
+    plink2 pvar retains multiallelic records natively -- it does NOT
+    auto-split them the way `bcftools norm -m-` would -- so `ALT` can be a
+    comma-joined list (e.g. "G,T"). `classify()` / `_classify_expr` are only
+    defined for a single REF/ALT pair, so this must run before any
+    per-allele statistic (variant class, indel length, Ti/Tv) is computed.
+
+    This is a per-*allele* view: a site with 2 ALT alleles becomes 2 rows,
+    each with the shared CHROM/POS/ID/REF and its own single ALT. A
+    biallelic record (the common case) splits into a 1-element list and
+    explodes back to the same single row, so this is a no-op for it.
+    Callers that need per-*record* semantics instead (contig density,
+    inter-variant gaps, `multiallelic_rate`) must use the un-exploded frame.
+
+    Vectorized via `Series.str.split` + `DataFrame.explode` -- no Python
+    loop over rows, so this streams fine over a 500+ MB pvar.
+    """
+    return df.with_columns(pl.col("ALT").str.split(",")).explode("ALT", empty_as_null=False)
+
+
 def _classify_df(df: pl.DataFrame) -> pl.DataFrame:
     return df.with_columns(_classify_expr(pl.col("REF"), pl.col("ALT")).alias("class"))
 
 
 def _contig_stats(df: pl.DataFrame) -> list[dict]:
+    """Per-contig record count and density. `df` is per-RECORD (not exploded)."""
     agg = (
         df.group_by("CHROM", maintain_order=True)
         .agg(
@@ -284,7 +344,12 @@ def _contig_stats(df: pl.DataFrame) -> list[dict]:
 
 
 def _gaps(df: pl.DataFrame) -> pl.Series:
-    """Inter-variant gaps (bp) within each contig, sorted-position diffs."""
+    """Inter-variant gaps (bp) within each contig, sorted-position diffs.
+
+    `df` is per-RECORD (not exploded): a multiallelic site is still one
+    position, so exploding first would fabricate spurious zero-length gaps
+    between the alleles of the same site.
+    """
     return (
         df.sort(["CHROM", "POS"])
         .select(pl.col("POS").diff().over("CHROM").alias("gap"))
@@ -293,16 +358,18 @@ def _gaps(df: pl.DataFrame) -> pl.Series:
     )
 
 
-def _class_counts(df: pl.DataFrame) -> dict[str, int]:
+def _class_counts(alleles: pl.DataFrame) -> dict[str, int]:
+    """Tally classes over a per-ALLELE frame (post `_explode_alleles` + `_classify_df`)."""
     counts = dict.fromkeys(CLASS_NAMES, 0)
-    tally = df.group_by("class").agg(pl.len().alias("n"))
+    tally = alleles.group_by("class").agg(pl.len().alias("n"))
     for row in tally.iter_rows(named=True):
         counts[row["class"]] = row["n"]
     return counts
 
 
-def _indel_lengths(df: pl.DataFrame) -> pl.Series:
-    indels = df.filter(pl.col("class").is_in(["insertion", "deletion"]))
+def _indel_lengths(alleles: pl.DataFrame) -> pl.Series:
+    """Indel lengths over a per-ALLELE frame (post `_explode_alleles` + `_classify_df`)."""
+    indels = alleles.filter(pl.col("class").is_in(["insertion", "deletion"]))
     # str.len_chars() is UInt32; subtracting two UInt32 columns wraps around
     # on underflow instead of going negative, so cast to a signed type first.
     alt_len = pl.col("ALT").str.len_chars().cast(pl.Int64)
@@ -311,7 +378,12 @@ def _indel_lengths(df: pl.DataFrame) -> pl.Series:
 
 
 def _multiallelic_rate(df: pl.DataFrame) -> float:
-    """Fraction of pvar rows whose ALT field lists more than one allele."""
+    """Fraction of pvar RECORDS whose ALT field lists more than one allele.
+
+    Must run on the un-exploded, per-record frame: this counts sites, not
+    alleles, so a triallelic site still contributes exactly 1 to both the
+    numerator and denominator, not 2.
+    """
     n = df.height
     if n == 0:
         return 0.0
@@ -319,9 +391,9 @@ def _multiallelic_rate(df: pl.DataFrame) -> float:
     return n_multi / n
 
 
-def _titv(df: pl.DataFrame) -> float:
-    """Transition/transversion ratio over SNP rows (`_classify_df` must have run)."""
-    snps = df.filter(pl.col("class") == "snp")
+def _titv(alleles: pl.DataFrame) -> float:
+    """Transition/transversion ratio over SNP alleles (post `_explode_alleles` + `_classify_df`)."""
+    snps = alleles.filter(pl.col("class") == "snp")
     if snps.height == 0:
         raise ValueError("no SNPs found; cannot compute Ti/Tv")
     pair = pl.concat_str([pl.col("REF"), pl.col("ALT")])
@@ -330,6 +402,45 @@ def _titv(df: pl.DataFrame) -> float:
     if n_tv == 0:
         raise ValueError("no transversions found; cannot compute a finite Ti/Tv ratio")
     return n_ts / n_tv
+
+
+def compute_pvar_stats(df: pl.DataFrame) -> dict:
+    """Compute every `fitted` statistic derived purely from the pvar frame.
+
+    `df` is the raw, per-record frame from `read_pvar` (optionally
+    contig-filtered) -- ALT may still be comma-joined for multiallelic
+    sites. Two different units of observation are in play here and must
+    not be conflated:
+
+    - per-RECORD: `contigs` (density), `gap_dist` inputs, and
+      `multiallelic_rate` all count one pvar row as one observation,
+      regardless of how many ALT alleles it lists.
+    - per-ALLELE: `variant_classes`, `indel_length`, and `titv` each count
+      one observation per REF/ALT pair -- a site with 2 ALT alleles
+      contributes 2 independent class/indel-length/Ti-Tv observations.
+      `classify()` is only defined for a single allele, so `ALT` is split
+      via `_explode_alleles` before any of these three run.
+
+    A biallelic-only pvar is unaffected either way: `_explode_alleles` is a
+    no-op per row when ALT has no comma.
+    """
+    contigs = _contig_stats(df)
+    gaps = _gaps(df)
+    multiallelic_rate = _multiallelic_rate(df)
+
+    alleles = _classify_df(_explode_alleles(df))
+    class_counts = _class_counts(alleles)
+    indel_lens = _indel_lengths(alleles)
+    titv = _titv(alleles)
+
+    return {
+        "contigs": contigs,
+        "gaps": gaps,
+        "multiallelic_rate": multiallelic_rate,
+        "class_counts": class_counts,
+        "indel_lens": indel_lens,
+        "titv": titv,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -346,11 +457,35 @@ def _run_plink2(args: list[str]) -> None:
         )
 
 
-def fit_sfs(pgen_prefix: str | Path, contigs: Iterable[str] | None = None) -> list[int]:
-    """Shell out to `plink2 --freq counts` and return the ALT_CTS column.
+def _split_alt_cts(alt_cts: Sequence[str] | pl.Series) -> list[float]:
+    """Parse plink2 `--freq counts` ALT_CTS into one count per ALT allele.
+
+    For a multiallelic site, plink2's `.acount` keeps `ALT` and `ALT_CTS`
+    comma-joined and positionally aligned (e.g. `ALT="G,T"`,
+    `ALT_CTS="1,1"`): the i-th count belongs to the i-th ALT allele. This
+    splits that alignment into one float observation per allele, matching
+    the per-allele split `_explode_alleles` does for classification -- so
+    each ALT allele contributes its own count to the `sfs` histogram
+    instead of the whole comma-joined string being handed to
+    `np.asarray(..., dtype=float)`, which raises on a string like "1,1".
+
+    A biallelic row (`ALT_CTS` with no comma) splits into a 1-element list
+    and is unaffected. Vectorized via polars `Series.str.split` + explode --
+    no Python loop, though `.acount` files are one row per site so this
+    would be cheap either way.
+    """
+    s = pl.Series("ALT_CTS", list(alt_cts), dtype=pl.Utf8)
+    return s.str.split(",").explode(empty_as_null=False).cast(pl.Float64).to_list()
+
+
+def fit_sfs(pgen_prefix: str | Path, contigs: Iterable[str] | None = None) -> list[float]:
+    """Shell out to `plink2 --freq counts` and return one ALT_CTS per allele.
 
     ALT_CTS is the observed non-reference allele count per site -- exactly
-    the site-frequency-spectrum input the `sfs` histogram is fit from.
+    the site-frequency-spectrum input the `sfs` histogram is fit from. For
+    multiallelic sites plink2 keeps ALT_CTS comma-joined (aligned with the
+    equally comma-joined ALT column); `_split_alt_cts` splits that into one
+    count per allele.
     """
     with tempfile.TemporaryDirectory() as tmp:
         out_prefix = str(Path(tmp) / "sfs")
@@ -358,8 +493,10 @@ def fit_sfs(pgen_prefix: str | Path, contigs: Iterable[str] | None = None) -> li
         if contigs:
             args += ["--chr", ",".join(contigs)]
         _run_plink2(args)
-        df = pl.read_csv(f"{out_prefix}.acount", separator="\t")
-        return df["ALT_CTS"].to_list()
+        df = pl.read_csv(
+            f"{out_prefix}.acount", separator="\t", schema_overrides={"ALT_CTS": pl.Utf8}
+        )
+        return _split_alt_cts(df["ALT_CTS"])
 
 
 def fit_missing_rate(pgen_prefix: str | Path, contigs: Iterable[str] | None = None) -> float:
@@ -492,18 +629,18 @@ def main(argv: list[str] | None = None) -> None:
     df = read_pvar(pvar_path)
     if args.contigs:
         df = df.filter(pl.col("CHROM").is_in(args.contigs))
-    df = _classify_df(df)
 
-    contigs = _contig_stats(df)
+    stats = compute_pvar_stats(df)
+    contigs = stats["contigs"]
     if not contigs:
         raise ValueError("no variants found for the requested contig(s)")
     contig_ids = [c["id"] for c in contigs]
 
-    gaps = _gaps(df)
-    class_counts = _class_counts(df)
-    indel_lens = _indel_lengths(df)
-    titv = _titv(df)
-    multiallelic_rate = _multiallelic_rate(df)
+    gaps = stats["gaps"]
+    class_counts = stats["class_counts"]
+    indel_lens = stats["indel_lens"]
+    titv = stats["titv"]
+    multiallelic_rate = stats["multiallelic_rate"]
 
     chr_filter = contig_ids if args.contigs else None
     acs = fit_sfs(args.pgen, contigs=chr_filter)

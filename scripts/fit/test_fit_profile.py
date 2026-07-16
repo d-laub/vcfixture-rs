@@ -1,6 +1,27 @@
 import json
+import shutil
+import subprocess
+import warnings
 
-from fit_profile import build_profile, histogram, class_mix_from_counts
+import polars as pl
+import pytest
+
+from fit_profile import (
+    build_profile,
+    classify,
+    _classify_df,
+    _explode_alleles,
+    _multiallelic_rate,
+    _sfs_edges,
+    _split_alt_cts,
+    class_mix_from_counts,
+    compute_pvar_stats,
+    fit_sfs,
+    histogram,
+    main,
+)
+
+PLINK2_AVAILABLE = shutil.which("plink2") is not None
 
 
 def test_histogram_weights_are_one_shorter_than_edges():
@@ -41,3 +62,246 @@ def test_build_profile_emits_schema_valid_json():
     assert j["dialed"]["payload"] in {"gt-only", "gt-vaf", "gatk", "mutect2"}
     # provenance must be populated, never left as a placeholder
     assert j["provenance"]["n_samples_source"] == 10
+
+
+# --------------------------------------------------------------------------
+# histogram(): out-of-range values must warn, not vanish silently
+# --------------------------------------------------------------------------
+
+
+def test_histogram_warns_when_some_values_are_out_of_range():
+    # Regression test for the "Important" review finding: histogram() only
+    # used to raise if ALL values fell outside edges. A partially
+    # out-of-range input (e.g. gap_dist values beyond the 1e5 bp cap) must
+    # at least emit a diagnostic instead of silently vanishing from the
+    # normalization.
+    with pytest.warns(UserWarning, match=r"dropped 1/6.*16\.7%"):
+        h = histogram([1, 1, 2, 5, 50, 99999], edges=[1, 2, 10, 100])
+    assert h["weights"] == pytest.approx([0.4, 0.4, 0.2])
+    assert sum(h["weights"]) == pytest.approx(1.0)
+
+
+def test_histogram_raises_when_all_values_are_out_of_range():
+    with pytest.raises(ValueError, match="no values fell within"):
+        histogram([1000, 2000], edges=[1, 2, 10, 100])
+
+
+def test_histogram_does_not_warn_when_all_values_in_range():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        histogram([1, 1, 2, 5], edges=[1, 2, 10, 100])
+
+
+# --------------------------------------------------------------------------
+# Multiallelic ALT: per-allele split (the "Critical" finding)
+# --------------------------------------------------------------------------
+
+
+def test_split_alt_cts_parses_plink2s_comma_joined_column():
+    # This is exactly the string plink2 `--freq counts` emits for a
+    # multiallelic site's ALT_CTS -- passing it straight into
+    # np.asarray(..., dtype=float) is what crashed fit_sfs() before the fix.
+    assert _split_alt_cts(["1,1"]) == [1.0, 1.0]
+    assert _split_alt_cts(["2,1", "3", "3"]) == [2.0, 1.0, 3.0, 3.0]
+
+
+def test_fit_sfs_regression_comma_joined_alt_cts_no_longer_crashes(monkeypatch, tmp_path):
+    # Simulate what fit_sfs() sees after plink2 --freq counts on a
+    # multiallelic pgen, without needing plink2 itself: a comma-joined
+    # ALT_CTS column aligned with a comma-joined ALT column.
+    acount = tmp_path / "sfs.acount"
+    acount.write_text(
+        "#CHROM\tID\tREF\tALT\tALT_CTS\tOBS_CT\n"
+        "1\trs1\tA\tG,T\t2,1\t6\n"
+        "1\trs2\tC\tT\t3\t6\n"
+    )
+
+    def fake_run_plink2(args):
+        return None
+
+    monkeypatch.setattr("fit_profile._run_plink2", fake_run_plink2)
+    monkeypatch.setattr("tempfile.TemporaryDirectory", lambda: _FixedTmpDir(tmp_path))
+    acs = fit_sfs("unused-prefix")
+    assert acs == [2.0, 1.0, 3.0]
+
+
+class _FixedTmpDir:
+    def __init__(self, path):
+        self._path = str(path)
+
+    def __enter__(self):
+        return self._path
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_multiallelic_alt_corrupts_scalar_classify_but_not_the_split_pipeline():
+    # Documents the silent-corruption half of the crash bug from the code
+    # review: classify()/_classify_expr are only defined for a single
+    # REF/ALT pair. Feeding them a raw, un-split multiallelic ALT silently
+    # misclassifies -- exactly the reviewer's repro.
+    assert classify("A", "A,G") == "insertion"  # wrong: two SNP alleles misread as an insertion
+
+    df = pl.DataFrame({
+        "CHROM": ["1", "1"],
+        "POS": [100, 200],
+        "ID": ["rs1", "rs2"],
+        "REF": ["A", "C"],
+        "ALT": ["G,T", "T"],
+    })
+    alleles = _classify_df(_explode_alleles(df))
+    # 3 alleles total: rs1/G, rs1/T, rs2/T -- all real SNPs once split.
+    assert alleles["class"].to_list() == ["snp", "snp", "snp"]
+
+
+def test_explode_alleles_splits_multiallelic_and_is_a_no_op_for_biallelic():
+    df = pl.DataFrame({
+        "CHROM": ["1", "1"],
+        "POS": [100, 200],
+        "ID": ["rs1", "rs2"],
+        "REF": ["A", "AT"],
+        "ALT": ["G,T", "A"],
+    })
+    alleles = _explode_alleles(df)
+    assert alleles.height == 3
+    assert alleles["ALT"].to_list() == ["G", "T", "A"]
+    # shared per-record fields are broadcast onto every allele row
+    assert alleles.filter(pl.col("ID") == "rs1")["REF"].to_list() == ["A", "A"]
+
+
+def test_multiallelic_rate_counts_records_not_alleles():
+    # A triallelic site (2 ALT alleles) must contribute exactly 1 to both
+    # the numerator and denominator of multiallelic_rate, not 2 -- this
+    # must be computed on the un-exploded, per-record frame.
+    df = pl.DataFrame({
+        "CHROM": ["1", "1", "1"],
+        "POS": [100, 200, 300],
+        "ID": ["rs1", "rs2", "rs3"],
+        "REF": ["A", "C", "G"],
+        "ALT": ["G,T,C", "T", "A"],
+    })
+    assert _multiallelic_rate(df) == pytest.approx(1 / 3)
+
+
+def test_compute_pvar_stats_gives_two_class_and_two_indel_observations_per_multiallelic_site():
+    # The brief's stated invariant: a multiallelic site with 2 ALTs
+    # contributes 2 class observations and (if applicable) 2 indel-length
+    # observations, while still counting as ONE record for
+    # multiallelic_rate. A second, plain SNP record is included purely so
+    # `_titv` (which compute_pvar_stats also computes) has a transition and
+    # a transversion to work with -- unrelated to what this test checks.
+    df = pl.DataFrame({
+        "CHROM": ["1", "1"],
+        "POS": [100, 200],
+        "ID": ["rs1", "rs2"],
+        "REF": ["A", "A"],
+        "ALT": ["AG,ATT", "C"],  # rs1: two insertions of length 1 and 2; rs2: A>C transversion
+    })
+    stats = compute_pvar_stats(df)
+    assert stats["class_counts"]["insertion"] == 2
+    assert stats["class_counts"]["snp"] == 1
+    assert sorted(stats["indel_lens"].to_list()) == [1, 2]
+    # 1 multiallelic record (rs1) out of 2 total records.
+    assert stats["multiallelic_rate"] == pytest.approx(0.5)
+
+
+# --------------------------------------------------------------------------
+# SFS singleton bin invariant: must stay exactly [1, 2)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("n", [1, 2, 3, 10, 3202, 16007])
+def test_sfs_edges_first_bin_is_exactly_one_two(n):
+    edges = _sfs_edges(n)
+    assert edges[0] == 1.0
+    assert edges[1] == 2.0
+
+
+# --------------------------------------------------------------------------
+# End-to-end: reviewer's gold-standard repro (skips gracefully without plink2)
+# --------------------------------------------------------------------------
+
+
+def _write_synthetic_vcf(path):
+    path.write_text(
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=1>\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\n"
+        "1\t100\trs1\tA\tG,T\t.\t.\t.\tGT\t1/2\t0/0\t0|1\n"
+        "1\t200\trs2\tC\tT\t.\t.\t.\tGT\t0/1\t1/1\t0/0\n"
+        "1\t300\trs3\tAT\tA\t.\t.\t.\tGT\t0/1\t1/1\t0/0\n"
+    )
+
+
+def _replica_validate_profile(p: dict) -> None:
+    """Replicates the invariants `Profile::validate` enforces in Rust
+    (src/bulk/profile.rs), without depending on the Rust crate itself:
+    strictly-increasing finite histogram edges, non-negative finite
+    weights summing > 0, a ClassMix summing to 1.0 within 1e-6, and
+    every rate in [0, 1].
+    """
+    for hist_name in ("gap_dist", "sfs", "indel_length"):
+        h = p["fitted"][hist_name]
+        assert len(h["weights"]) == len(h["edges"]) - 1
+        assert all(b > a for a, b in zip(h["edges"], h["edges"][1:]))
+        assert all(w >= 0 for w in h["weights"])
+        assert sum(h["weights"]) > 0
+    classmix = p["fitted"]["variant_classes"]
+    assert abs(sum(classmix.values()) - 1.0) < 1e-6
+    for rate in ("multiallelic_rate", "missing_rate", "phased_rate"):
+        assert 0.0 <= p["fitted"][rate] <= 1.0
+    assert p["fitted"]["ploidy"] >= 1
+    assert len(p["fitted"]["contigs"]) >= 1
+
+
+@pytest.mark.skipif(not PLINK2_AVAILABLE, reason="plink2 not installed")
+def test_end_to_end_multiallelic_pgen_does_not_crash_and_has_per_allele_semantics(tmp_path):
+    # This is the reviewer's exact repro: a pvar with a genuine
+    # multiallelic record (REF=A ALT=G,T), converted with
+    # `plink2 --make-pgen` (which retains it natively, unlike bcftools
+    # norm -m-), run all the way through the extraction script.
+    vcf_path = tmp_path / "test.vcf"
+    _write_synthetic_vcf(vcf_path)
+    prefix = str(tmp_path / "prefix")
+    subprocess.run(
+        ["plink2", "--vcf", str(vcf_path), "--make-pgen", "--out", prefix],
+        check=True,
+        capture_output=True,
+    )
+
+    out_path = tmp_path / "profile.json"
+    # main() previously raised ValueError: could not convert string to
+    # float: '2,1' inside fit_sfs() -> histogram() on this exact input.
+    main(["--pgen", prefix, "--name", "synthtest", "--out", str(out_path)])
+
+    p = json.loads(out_path.read_text())
+    _replica_validate_profile(p)
+
+    # Per-allele semantics: rs1 contributes 2 SNP observations (A/G, A/T),
+    # rs2 contributes 1 SNP observation (C/T), rs3 contributes 1 deletion.
+    assert p["fitted"]["variant_classes"]["snp"] == pytest.approx(0.75)
+    assert p["fitted"]["variant_classes"]["deletion"] == pytest.approx(0.25)
+    # multiallelic_rate is per-RECORD: 1 multiallelic site out of 3 records.
+    assert p["fitted"]["multiallelic_rate"] == pytest.approx(1 / 3)
+    # sfs singleton bin edges are untouched by any of this.
+    assert p["fitted"]["sfs"]["edges"][0] == 1.0
+    assert p["fitted"]["sfs"]["edges"][1] == 2.0
+
+
+@pytest.mark.skipif(not PLINK2_AVAILABLE, reason="plink2 not installed")
+def test_fit_sfs_preserves_positional_alignment_between_alt_and_alt_cts(tmp_path):
+    # A stronger check than symmetric counts: rs1's two ALT alleles have
+    # *different* counts (G=2, T=1), so a bug that mixed up which count
+    # belongs to which allele -- or just summed/averaged them -- would be
+    # caught here, not just a crash.
+    vcf_path = tmp_path / "test.vcf"
+    _write_synthetic_vcf(vcf_path)
+    prefix = str(tmp_path / "prefix")
+    subprocess.run(
+        ["plink2", "--vcf", str(vcf_path), "--make-pgen", "--out", prefix],
+        check=True,
+        capture_output=True,
+    )
+    acs = fit_sfs(prefix)
+    assert acs == pytest.approx([2.0, 1.0, 3.0, 3.0])
