@@ -83,7 +83,11 @@ impl BulkWriter {
     /// Creates a new writer at `path`, writing `header` immediately.
     ///
     /// `workers` sizes the bgzf compression thread pool for `Bcf`/`VcfGz`;
-    /// it is ignored for uncompressed `Vcf`.
+    /// it is ignored for uncompressed `Vcf`. `compression_level` is
+    /// validated unconditionally, even for `Vcf` (where it goes unused): an
+    /// out-of-range level is rejected the same way regardless of format
+    /// rather than only surfacing once a caller switches to a compressed
+    /// one.
     pub fn create(
         path: &Path,
         format: Format,
@@ -251,22 +255,27 @@ mod tests {
                 .build();
             w.write(&h, &rec).unwrap();
         }
-        // The multithreaded bgzf writer dispatches blocks to background
-        // compression/writer threads; `flush()` starts that dispatch, but
-        // completion is asynchronous, so poll briefly rather than assuming
-        // it has already landed by the time `flush()` returns.
         w.flush().unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while w.compressed_bytes() == 0 && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        assert!(
-            w.compressed_bytes() > 0,
-            "counter should see compressed bytes"
-        );
+
+        // Clone the counter (cheap: `Arc<AtomicU64>`) before consuming `w`,
+        // so we can assert on it once dispatch is *guaranteed* complete
+        // rather than polling for an async background thread to catch up.
+        // `finish_and_index` drops `self.sink`, whose `MultithreadedWriter`
+        // `Drop` impl calls `finish()`, which synchronously joins the
+        // deflater/writer threads before returning — so by the time
+        // `finish_and_index` returns below, every byte has landed.
+        let count = Arc::clone(&w.count);
         w.finish_and_index(&path).unwrap();
 
+        assert!(
+            count.load(Ordering::Relaxed) > 0,
+            "counter should see compressed bytes once dispatch has joined"
+        );
         assert!(path.exists());
+        assert!(
+            std::fs::metadata(&path).unwrap().len() > 0,
+            "output file must be non-empty"
+        );
         assert!(
             path.with_extension("bcf.csi").exists(),
             "csi must be written"
@@ -284,33 +293,79 @@ mod tests {
 
     #[test]
     fn output_is_byte_identical_regardless_of_worker_count() {
-        fn run(workers: usize) -> Vec<u8> {
+        // `MultithreadedWriter` only has something to *reorder* once a run
+        // spans more than one bgzf block: its staging buffer dispatches a
+        // block to the compression/writer thread pool once it holds
+        // `MAX_BUF_SIZE` (~65,498) uncompressed bytes. A payload under that
+        // threshold becomes a single block no matter how many workers are
+        // configured, in which case this test would pass even if a real
+        // reordering bug existed. The record count and padded ALT allele
+        // below are sized to comfortably clear several block boundaries —
+        // the payload-size assertion further down pins that down so the
+        // test can't be silently shrunk back into vacuity.
+        const RECORDS: usize = 1_000;
+        const ALT_PAD_LEN: usize = 400;
+        const MAX_BUF_SIZE: usize = 65_498;
+
+        fn records(alt: &str) -> Vec<RecordBuf> {
+            (1..=RECORDS)
+                .map(|pos| {
+                    RecordBuf::builder()
+                        .set_reference_sequence_name("chr1")
+                        .set_variant_start(noodles_core::Position::try_from(pos).unwrap())
+                        .set_reference_bases("A")
+                        .set_alternate_bases(vcf::variant::record_buf::AlternateBases::from(vec![
+                            alt.to_string(),
+                        ]))
+                        .build()
+                })
+                .collect()
+        }
+
+        fn run(workers: usize, h: &vcf::Header, recs: &[RecordBuf]) -> Vec<u8> {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("t.bcf");
-            let h = header();
             let mut w =
-                BulkWriter::create(&path, Format::Bcf, &h, 6, NonZero::new(workers).unwrap())
+                BulkWriter::create(&path, Format::Bcf, h, 6, NonZero::new(workers).unwrap())
                     .unwrap();
-            for pos in 1usize..=500 {
-                let rec = RecordBuf::builder()
-                    .set_reference_sequence_name("chr1")
-                    .set_variant_start(noodles_core::Position::try_from(pos).unwrap())
-                    .set_reference_bases("A")
-                    .set_alternate_bases(vcf::variant::record_buf::AlternateBases::from(vec![
-                        String::from("T"),
-                    ]))
-                    .build();
-                w.write(&h, &rec).unwrap();
+            for rec in recs {
+                w.write(h, rec).unwrap();
             }
             w.finish_and_index(&path).unwrap();
             std::fs::read(&path).unwrap()
         }
 
-        let a = run(1);
-        let b = run(8);
+        let h = header();
+        let alt = "T".repeat(ALT_PAD_LEN);
+        let recs = records(&alt);
+
+        // Measure the true *uncompressed* record payload directly (rather
+        // than trusting arithmetic on record count and padding length),
+        // independent of how well bgzf's DEFLATE happens to compress this
+        // repetitive test data, by encoding the same records into an
+        // in-memory, uncompressed BCF.
+        let mut uncompressed = bcf::io::Writer::from(Vec::new());
+        uncompressed.write_header(&h).unwrap();
+        for rec in &recs {
+            uncompressed.write_variant_record(&h, rec).unwrap();
+        }
+        let uncompressed_payload = uncompressed.get_ref().len();
+        assert!(
+            uncompressed_payload > 3 * MAX_BUF_SIZE,
+            "test payload ({uncompressed_payload} bytes) must exceed several bgzf \
+             blocks ({MAX_BUF_SIZE} bytes each) or this test cannot detect reordering bugs"
+        );
+
+        let a = run(1, &h, &recs);
+        let b = run(4, &h, &recs);
+        let c = run(16, &h, &recs);
         assert_eq!(
             a, b,
-            "output must be byte-identical regardless of thread count"
+            "output must be byte-identical regardless of thread count (1 vs 4 workers)"
+        );
+        assert_eq!(
+            a, c,
+            "output must be byte-identical regardless of thread count (1 vs 16 workers)"
         );
         assert!(!a.is_empty());
     }
