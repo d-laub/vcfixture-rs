@@ -6,6 +6,7 @@
 
 pub mod profile;
 pub mod sample;
+pub mod summary;
 pub mod writer;
 
 pub use profile::{Payload, Profile};
