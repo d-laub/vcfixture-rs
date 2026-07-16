@@ -21,4 +21,10 @@ target
 #.idea/
 
 docs/book/book/
+
 .superpowers/
+
+# Python (scripts/fit)
+__pycache__/
+*.pyc
+.pytest_cache/

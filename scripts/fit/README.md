@@ -1,0 +1,124 @@
+# `scripts/fit/`
+
+`fit_profile.py` turns a real plink2 pgen/pvar cohort into a `vcfixture` bulk-generation
+profile JSON (`profiles/*.json`), the file `Profile::builtin` embeds via
+`include_str!` in `src/bulk/profile.rs`.
+
+## What it does
+
+The profile schema splits every profile into two parts, and this script only ever
+writes the first one:
+
+- **`fitted`** — statistics measured from the source cohort: per-contig
+  variant density, the inter-variant gap distribution, the site-frequency
+  spectrum (allele-count histogram), variant-class mix, indel-length
+  distribution, Ti/Tv, multiallelic rate, missing rate, phased rate, and
+  ploidy. Every value here is computed from `--pgen`; the script never
+  hand-picks a `fitted` value.
+- **`dialed`** — generation choices independent of any fit. Today that's just
+  `payload` (the FORMAT-field preset: `gt-only`, `gt-vaf`, `gatk`, or
+  `mutect2`), which cannot be inferred from a pgen (pgen stores genotypes
+  only, no per-record FORMAT payload) and is instead passed via `--payload`.
+
+`provenance` (source path, sample/variant counts, fit date, tool version) is
+always populated from the real run -- never left as a placeholder.
+
+Internally: `polars.scan_csv` (lazy, streaming) reads the pvar for contigs,
+gaps, variant classification, indel lengths, Ti/Tv, and multiallelic rate;
+`plink2 --freq counts` supplies the site-frequency spectrum; `plink2
+--missing` supplies the missing-call rate; a bounded VCF export
+(`--phase-sample-mb`, default 1 Mb from the first fitted contig) supplies an
+estimate of the phased-call rate, since pgen has no direct phase-fraction
+report.
+
+**Multiallelic records.** plink2 pvar retains multiallelic sites natively
+(it does NOT auto-split them the way `bcftools norm -m-` would), so `ALT`
+can be a comma-joined list like `"G,T"`. Two different units of observation
+apply and must not be conflated:
+
+- per-**record**: `contigs` (density), `gap_dist`, and `multiallelic_rate`
+  count one pvar row as one observation, regardless of how many ALT alleles
+  it lists.
+- per-**allele**: `variant_classes`, `indel_length`, and `titv` each count
+  one observation per REF/ALT pair -- a site with 2 ALT alleles
+  (`_explode_alleles`) contributes 2 independent observations to each of
+  these three, computed by `compute_pvar_stats`. `fit_sfs` mirrors this on
+  the plink2 side: `plink2 --freq counts` keeps `ALT_CTS` comma-joined and
+  positionally aligned with `ALT` (e.g. `ALT="G,T"`, `ALT_CTS="1,1"`), and
+  `_split_alt_cts` splits that into one allele-count observation per
+  `sfs` input.
+
+A biallelic-only pvar is unaffected either way -- splitting a single-allele
+ALT is a no-op.
+
+**Out-of-range histogram values.** `histogram()` drops values outside the
+edge range (as `numpy.histogram` already does) but warns whenever *any*
+values are dropped, not just when *all* of them are -- e.g. `gap_dist`
+values beyond the 1e5 bp cap (real inter-variant gaps over centromeres/
+telomeres) would otherwise vanish from the fitted distribution with no
+diagnostic output.
+
+The **singleton SFS bin is exactly `[1, 2)`** by construction (`_sfs_edges`
+doubles from 1 upward): real 1kGP high-coverage data is ~47.6% singletons
+vs. ~12.3% for a neutral coalescent SFS, and getting that first bin wrong
+would silently produce a neutral-looking spectrum instead of the empirical
+one the whole point of this script is to capture.
+
+This script is never imported by Rust. Its only contract with the rest of
+the crate is the JSON schema in `src/bulk/profile.rs`.
+
+## Usage
+
+```bash
+pixi run -e fit fit -- \
+    --pgen <plink2 prefix> \
+    --name <profile-name> \
+    --out profiles/<profile-name>.json \
+    [--payload gt-only|gt-vaf|gatk|mutect2] \
+    [--contigs chr1 chr2 ...] \
+    [--ploidy 2]
+```
+
+`--pgen` is a plink2 fileset *prefix*: the script expects
+`<prefix>.pgen`, `<prefix>.psam`, and either `<prefix>.pvar.zst` or
+`<prefix>.pvar`.
+
+## Re-fitting the two committed profiles
+
+```bash
+# germline-1kgp (3,202 samples; gt-only is 1kGP-faithful)
+pixi run -e fit fit -- \
+    --pgen /carter/users/dlaub/data/1kGP/plink2/hg38.norm \
+    --name germline-1kgp \
+    --out profiles/germline-1kgp.json \
+    --payload gt-only
+
+# somatic-gdc (16,007 samples; note the source .pvar is uncompressed,
+# not .pvar.zst -- the prefix is the same either way)
+pixi run -e fit fit -- \
+    --pgen /carter/shared/data/gdc/somatic/wgs_DR45/results/gdc_wgs_DR45.gt \
+    --name somatic-gdc \
+    --out profiles/somatic-gdc.json \
+    --payload gt-vaf
+```
+
+Re-fitting new data is the same one command with a different `--pgen` prefix.
+The output must be committed to `profiles/` -- `Profile::builtin` embeds it
+at compile time via `include_str!`, so the crate only ever reads the
+committed JSON, never `/carter` at build or run time.
+
+## Tests
+
+```bash
+pixi run -e fit test-fit
+```
+
+The test suite (`test_fit_profile.py`) exercises only the small synthetic
+inputs it constructs inline -- it never touches `/carter` and requires no
+network access. Most tests need only `polars`/`numpy` (no `plink2`); a
+handful of end-to-end tests build a tiny synthetic multiallelic VCF, convert
+it with `plink2 --make-pgen`, and run it through the full extraction
+pipeline (the gold-standard regression coverage for the multiallelic
+crash this script used to hit) -- those are marked
+`@pytest.mark.skipif(not PLINK2_AVAILABLE, ...)` and skip cleanly wherever
+`plink2` is not on `PATH`, such as CI.
