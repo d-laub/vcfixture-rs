@@ -5,6 +5,7 @@
 //! `docs/superpowers/specs/2026-07-16-bulk-generation-design.md`.
 
 pub mod profile;
+pub mod sample;
 
 pub use profile::{Payload, Profile};
 
