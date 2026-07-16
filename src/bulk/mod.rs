@@ -4,6 +4,7 @@
 //! streams records and derives no per-genotype oracle — see
 //! `docs/superpowers/specs/2026-07-16-bulk-generation-design.md`.
 
+pub mod gen;
 pub mod profile;
 pub mod sample;
 pub mod summary;
