@@ -557,6 +557,14 @@ impl HistSampler {
     }
 
     /// Draw a bin by CDF binary search, then a value uniformly within it.
+    ///
+    /// Callers quantize with `.floor()`, never `.round()`. A bin `[lo, hi)` over
+    /// integer edges represents the integers `lo ..= hi - 1`, so `floor` of a
+    /// uniform draw on `[lo, hi)` is exactly discrete-uniform over them.
+    /// `.round()` instead sends the bin's upper half to `hi` — for the SFS's
+    /// `[1, 2)` singleton bin that bleeds half the singleton mass to AC=2,
+    /// halving the fitted singleton fraction (0.476 -> ~0.24) and failing
+    /// `sfs_reproduces_singleton_fraction`.
     fn sample<R: Rng>(&self, rng: &mut R) -> f64 {
         let u: f64 = rng.gen();
         let bin = self.cdf.partition_point(|c| *c < u).min(self.cdf.len() - 1);
@@ -597,15 +605,15 @@ impl Samplers {
     }
 
     pub fn gap<R: Rng>(&self, rng: &mut R) -> u64 {
-        (self.gap.sample(rng).round() as u64).max(1)
+        (self.gap.sample(rng).floor() as u64).max(1)
     }
 
     pub fn allele_count<R: Rng>(&self, rng: &mut R, n_alleles: u64) -> u64 {
-        (self.sfs.sample(rng).round() as u64).clamp(1, n_alleles)
+        (self.sfs.sample(rng).floor() as u64).clamp(1, n_alleles)
     }
 
     pub fn indel_len<R: Rng>(&self, rng: &mut R) -> usize {
-        (self.indel.sample(rng).round() as usize).max(1)
+        (self.indel.sample(rng).floor() as usize).max(1)
     }
 
     pub fn class<R: Rng>(&self, rng: &mut R) -> VariantClass {
