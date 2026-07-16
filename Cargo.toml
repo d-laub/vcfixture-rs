@@ -16,13 +16,18 @@ indexmap = "2"
 thiserror = "2"
 rand = "0.8"
 rand_chacha = "0.3"
-noodles-core = "0.17"
-noodles-vcf = "0.79"
-noodles-bgzf = "0.41"
-noodles-csi = "0.49"
-noodles-tabix = "0.55"
-noodles-fasta = "0.51"
+noodles-core = "0.18"
+noodles-vcf = "0.83"
+noodles-bgzf = "0.45"
+noodles-csi = "0.53"
+noodles-tabix = "0.59"
+noodles-fasta = "0.58"
 proptest = { version = "1", optional = true }
+noodles-bcf = { version = "0.81", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+rayon = { version = "1", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
 
 [dev-dependencies]
 insta = "1"
@@ -31,10 +36,17 @@ proptest = "1"
 [features]
 default = []
 proptest = ["dep:proptest"]
+bulk = ["dep:noodles-bcf", "dep:serde", "dep:serde_json", "dep:rayon"]
+cli = ["bulk", "dep:clap"]
 
 [[example]]
 name = "proptest_fuzz"
 required-features = ["proptest"]
+
+[[bin]]
+name = "vcfixture"
+path = "src/bin/vcfixture.rs"
+required-features = ["cli"]
 
 [package.metadata.docs.rs]
 all-features = true
