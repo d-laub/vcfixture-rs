@@ -32,6 +32,7 @@ clap = { version = "4", features = ["derive"], optional = true }
 [dev-dependencies]
 insta = "1"
 proptest = "1"
+tempfile = "3"
 
 [features]
 default = []
