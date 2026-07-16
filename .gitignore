@@ -21,3 +21,8 @@ target
 #.idea/
 
 docs/book/book/
+
+# Python (scripts/fit)
+__pycache__/
+*.pyc
+.pytest_cache/

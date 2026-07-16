@@ -1,6 +1,6 @@
 [workspace]
 name = "vcfixture-rs"
-channels = ["conda-forge"]
+channels = ["conda-forge", "bioconda"]
 platforms = ["osx-arm64", "linux-64"]
 
 [dependencies]
@@ -23,3 +23,22 @@ lint-actions = "actionlint"
 docs-build   = "mdbook build docs/book"
 docs-test    = "mdbook test docs/book"
 docs-serve   = "mdbook serve docs/book"
+
+# plink2 only ships bioconda builds for linux-64, so the `fit` feature (and
+# the `fit` environment built from it) is restricted to linux-64.
+[feature.fit]
+platforms = ["linux-64"]
+
+[feature.fit.dependencies]
+python = ">=3.11"
+polars = "*"
+numpy = "*"
+plink2 = "*"
+pytest = "*"
+
+[feature.fit.tasks]
+fit      = "python scripts/fit/fit_profile.py"
+test-fit = "pytest scripts/fit -q"
+
+[environments]
+fit = ["fit"]
