@@ -145,6 +145,19 @@ impl Histogram {
                 self.edges.len()
             )));
         }
+        // Reject NaN/Inf before any comparison-based check below: NaN
+        // comparisons are always false, so `< 0.0`, `<= 0.0`, etc. would
+        // otherwise let a NaN-poisoned histogram through silently.
+        if self.weights.iter().any(|w| !w.is_finite()) {
+            return Err(BulkError::Invalid(
+                "histogram weights must be finite (no NaN or Inf)".into(),
+            ));
+        }
+        if self.edges.iter().any(|e| !e.is_finite()) {
+            return Err(BulkError::Invalid(
+                "histogram edges must be finite (no NaN or Inf)".into(),
+            ));
+        }
         if self.weights.iter().any(|w| *w < 0.0) {
             return Err(BulkError::Invalid("histogram weights must be >= 0".into()));
         }
@@ -163,6 +176,22 @@ impl Histogram {
 impl ClassMix {
     /// Check that class frequencies sum to 1.0 (within floating-point tolerance).
     pub fn validate(&self) -> Result<(), BulkError> {
+        // NaN poisons the sum below, but `(sum - 1.0).abs() > 1e-6` is false
+        // for NaN, so check each component explicitly first.
+        for (label, v) in [
+            ("snp", self.snp),
+            ("insertion", self.insertion),
+            ("deletion", self.deletion),
+            ("mnp", self.mnp),
+            ("complex", self.complex),
+            ("symbolic", self.symbolic),
+        ] {
+            if v.is_nan() {
+                return Err(BulkError::Invalid(format!(
+                    "variant_classes.{label} must not be NaN"
+                )));
+            }
+        }
         let sum =
             self.snp + self.insertion + self.deletion + self.mnp + self.complex + self.symbolic;
         if (sum - 1.0).abs() > 1e-6 {
@@ -211,6 +240,41 @@ mod tests {
             mnp: 0.0,
             complex: 0.0,
             symbolic: 0.0,
+        };
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn histogram_rejects_nan_weight() {
+        // NaN weights must not slip past validation into sampling.
+        let h = Histogram {
+            edges: vec![0.0, 1.0, 2.0],
+            weights: vec![1.0, f64::NAN],
+        };
+        assert!(h.validate().is_err());
+    }
+
+    #[test]
+    fn histogram_rejects_nan_edge() {
+        // NaN edges must not slip past validation into sampling.
+        let h = Histogram {
+            edges: vec![0.0, f64::NAN, 2.0],
+            weights: vec![1.0, 1.0],
+        };
+        assert!(h.validate().is_err());
+    }
+
+    #[test]
+    fn class_mix_rejects_nan_component() {
+        // NaN in a component poisons the sum, but (sum - 1.0).abs() > 1e-6
+        // is false for NaN, so the old check let this through silently.
+        let m = ClassMix {
+            snp: f64::NAN,
+            insertion: 0.2,
+            deletion: 0.2,
+            mnp: 0.2,
+            complex: 0.2,
+            symbolic: 0.2,
         };
         assert!(m.validate().is_err());
     }
