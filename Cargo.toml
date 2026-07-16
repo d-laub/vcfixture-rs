@@ -28,21 +28,27 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 rayon = { version = "1", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
+tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
 insta = "1"
 proptest = "1"
 tempfile = "3"
+noodles-bcf = "0.81"
 
 [features]
 default = []
 proptest = ["dep:proptest"]
-bulk = ["dep:noodles-bcf", "dep:serde", "dep:serde_json", "dep:rayon"]
+bulk = ["dep:noodles-bcf", "dep:serde", "dep:serde_json", "dep:rayon", "dep:tempfile"]
 cli = ["bulk", "dep:clap"]
 
 [[example]]
 name = "proptest_fuzz"
 required-features = ["proptest"]
+
+[[example]]
+name = "bulk"
+required-features = ["bulk"]
 
 [[bin]]
 name = "vcfixture"
