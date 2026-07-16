@@ -176,8 +176,10 @@ impl Histogram {
 impl ClassMix {
     /// Check that class frequencies sum to 1.0 (within floating-point tolerance).
     pub fn validate(&self) -> Result<(), BulkError> {
-        // NaN poisons the sum below, but `(sum - 1.0).abs() > 1e-6` is false
-        // for NaN, so check each component explicitly first.
+        // Reject NaN/Inf before the sum check below: NaN poisons the sum,
+        // and infinities (e.g. opposite-sign components) can also poison it
+        // to NaN, but `(sum - 1.0).abs() > 1e-6` is false for NaN either
+        // way, so check each component explicitly first.
         for (label, v) in [
             ("snp", self.snp),
             ("insertion", self.insertion),
@@ -186,9 +188,9 @@ impl ClassMix {
             ("complex", self.complex),
             ("symbolic", self.symbolic),
         ] {
-            if v.is_nan() {
+            if !v.is_finite() {
                 return Err(BulkError::Invalid(format!(
-                    "variant_classes.{label} must not be NaN"
+                    "variant_classes.{label} must be finite (no NaN or Inf)"
                 )));
             }
         }
@@ -275,6 +277,22 @@ mod tests {
             mnp: 0.2,
             complex: 0.2,
             symbolic: 0.2,
+        };
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn class_mix_rejects_infinite_components() {
+        // Opposite-sign infinities poison the sum to NaN, but
+        // (sum - 1.0).abs() > 1e-6 is false for NaN, so an is_nan()-only
+        // per-component check lets this through silently.
+        let m = ClassMix {
+            snp: f64::INFINITY,
+            insertion: f64::NEG_INFINITY,
+            deletion: 0.0,
+            mnp: 0.0,
+            complex: 0.0,
+            symbolic: 0.0,
         };
         assert!(m.validate().is_err());
     }
