@@ -12,6 +12,15 @@ that are picked by the user and never claimed to be measured). Every value
 this script writes under ``fitted`` is derived from the source data passed
 in; nothing here should ever be a hand-picked literal.
 
+Every statistic in this module is computed as a *lazy* polars aggregation
+whose collected result is small (a handful of rows, a histogram, a scalar)
+-- never the full pvar/`.acount` frame. Real cohorts are 75M (1kGP germline)
+to 350M (somatic) rows with variable-length REF/ALT strings; materializing
+that as an eager `pl.DataFrame` or a Python list is what used to OOM-kill
+this script well before it finished (see git history / the design doc for
+the measured 20+ GB RSS). Keep every new statistic lazy end-to-end: build a
+`pl.LazyFrame` pipeline, and only `.collect()` a bounded-size result.
+
 Usage
 -----
     pixi run -e fit fit -- \\
@@ -55,6 +64,42 @@ TRANSITION_PAIRS = frozenset({"AG", "GA", "CT", "TC"})
 # --------------------------------------------------------------------------
 
 
+def _validate_edges(edges: Sequence[float]) -> list[float]:
+    edges = [float(e) for e in edges]
+    if len(edges) < 2:
+        raise ValueError("histogram needs >= 2 edges")
+    if any(b <= a for a, b in zip(edges, edges[1:])):
+        raise ValueError("histogram edges must be strictly increasing")
+    return edges
+
+
+def _finalize_histogram(
+    counts: Sequence[int], edges: Sequence[float], n_dropped: int
+) -> dict[str, list[float]]:
+    """Normalize per-bin `counts` (length ``len(edges) - 1``) into weights.
+
+    Shared tail end of both the small-scale `histogram()` (which bins an
+    already-materialized array with `numpy.histogram`) and the large-scale
+    `histogram_lazy()` path (which bins hundreds of millions of rows via a
+    lazy polars `group_by` and only ever collects the tiny per-bin counts) --
+    the warning/normalization semantics must be identical either way.
+    """
+    edges = _validate_edges(edges)
+    n_in_range = int(sum(counts))
+    n_total = n_in_range + int(n_dropped)
+    if n_dropped > 0:
+        frac = n_dropped / n_total
+        warnings.warn(
+            f"histogram: dropped {n_dropped}/{n_total} values ({frac:.1%}) "
+            f"outside the edge range [{edges[0]}, {edges[-1]}]",
+            stacklevel=3,
+        )
+    if n_in_range <= 0:
+        raise ValueError("no values fell within the histogram edges")
+    weights = [c / n_in_range for c in counts]
+    return {"edges": edges, "weights": weights}
+
+
 def histogram(
     values: Sequence[float] | np.ndarray | pl.Series, edges: Sequence[float]
 ) -> dict[str, list[float]]:
@@ -71,28 +116,84 @@ def histogram(
     tail (e.g. inter-variant gaps over centromeres/telomeres exceeding the
     `gap_dist` cap) would otherwise skew the fitted distribution with zero
     diagnostic output.
+
+    This bins an already-materialized `values` array with `numpy.histogram`
+    -- fine for small inputs (tests, small cohorts) but NOT for the
+    real-scale pvar-derived statistics (75M-350M rows), which go through
+    `histogram_lazy` instead so the values are never collected into a single
+    in-memory array.
     """
-    edges = [float(e) for e in edges]
-    if len(edges) < 2:
-        raise ValueError("histogram needs >= 2 edges")
-    if any(b <= a for a, b in zip(edges, edges[1:])):
-        raise ValueError("histogram edges must be strictly increasing")
+    edges = _validate_edges(edges)
     arr = np.asarray(values, dtype=np.float64)
     counts, _ = np.histogram(arr, bins=edges)
-    n_in_range = int(counts.sum())
-    n_total = int(arr.size)
-    n_dropped = n_total - n_in_range
-    if n_dropped > 0:
-        frac = n_dropped / n_total
-        warnings.warn(
-            f"histogram: dropped {n_dropped}/{n_total} values ({frac:.1%}) "
-            f"outside the edge range [{edges[0]}, {edges[-1]}]",
-            stacklevel=2,
+    n_dropped = int(arr.size) - int(counts.sum())
+    return _finalize_histogram(counts.tolist(), edges, n_dropped)
+
+
+def _bucket_index_expr(value: pl.Expr, edges: Sequence[float]) -> pl.Expr:
+    """Vectorized equivalent of `numpy.histogram`'s bin assignment.
+
+    Returns an `Int64` expression giving the 0-indexed bin each row's
+    `value` falls into, or `null` if it falls outside ``[edges[0],
+    edges[-1]]``. Bins are half-open ``[edges[i], edges[i+1])`` except the
+    last, which is closed on both ends -- matching `numpy.histogram`'s
+    convention exactly (a value equal to the final edge lands in the last
+    bin, not out of range).
+
+    This is the piece that lets histograms be computed over a `LazyFrame`
+    with hundreds of millions of rows: the number of edges is small and
+    static (tens, not millions), so the `when/then` chain built here is
+    cheap regardless of how many rows the expression is evaluated over, and
+    evaluating it never requires holding more than one row in memory at a
+    time -- unlike `numpy.histogram`, which needs the full array.
+    """
+    edges = _validate_edges(edges)
+    n_bins = len(edges) - 1
+    expr = pl.when((value >= edges[0]) & (value < edges[1])).then(pl.lit(0, dtype=pl.Int64))
+    for i in range(1, n_bins - 1):
+        expr = expr.when((value >= edges[i]) & (value < edges[i + 1])).then(
+            pl.lit(i, dtype=pl.Int64)
         )
-    if n_in_range <= 0:
-        raise ValueError("no values fell within the histogram edges")
-    weights = (counts / n_in_range).tolist()
-    return {"edges": edges, "weights": weights}
+    if n_bins > 1:
+        expr = expr.when((value >= edges[-2]) & (value <= edges[-1])).then(
+            pl.lit(n_bins - 1, dtype=pl.Int64)
+        )
+    return expr.otherwise(None)
+
+
+def histogram_lazy(lf: pl.LazyFrame, value: pl.Expr, edges: Sequence[float]) -> pl.LazyFrame:
+    """Lazily bucketize `value` (evaluated over `lf`) into `edges` bins.
+
+    Returns a `LazyFrame` with one row per populated bin index (`_bin`,
+    `n`), plus possibly one row with `_bin == null` holding the count of
+    out-of-range values. Collecting this yields at most ``len(edges)`` rows
+    -- a handful to a few dozen -- no matter how many rows `lf` has, because
+    the `group_by` reduces before anything is materialized. Pair with
+    `_finalize_histogram_from_binned` to get the same
+    ``{"edges": ..., "weights": ...}`` shape `histogram()` produces.
+    """
+    edges = _validate_edges(edges)
+    return (
+        lf.select(_bucket_index_expr(value, edges).alias("_bin"))
+        .group_by("_bin")
+        .agg(pl.len().alias("n"))
+    )
+
+
+def _finalize_histogram_from_binned(
+    binned: pl.DataFrame, edges: Sequence[float]
+) -> dict[str, list[float]]:
+    """Turn a collected `histogram_lazy` result into the schema-facing dict."""
+    edges = _validate_edges(edges)
+    n_bins = len(edges) - 1
+    counts = [0] * n_bins
+    n_dropped = 0
+    for b, n in binned.iter_rows():
+        if b is None:
+            n_dropped = int(n)
+        else:
+            counts[int(b)] = int(n)
+    return _finalize_histogram(counts, edges, n_dropped)
 
 
 def class_mix_from_counts(counts: Mapping[str, int]) -> dict[str, float]:
@@ -167,13 +268,21 @@ def _classify_expr(ref: pl.Expr, alt: pl.Expr) -> pl.Expr:
     )
 
 
-def read_pvar(path: str | Path) -> pl.DataFrame:
-    """Read a `.pvar` or `.pvar.zst` file, keeping only #CHROM/POS/ID/REF/ALT.
+def read_pvar(path: str | Path) -> pl.LazyFrame:
+    """Lazily scan a `.pvar` or `.pvar.zst` file, keeping only #CHROM/POS/ID/REF/ALT.
 
-    A 1kGP-scale pvar can be 500+ MB of text. This scans lazily
-    (`polars.scan_csv`) and collects with the streaming engine so the file is
-    never fully materialized as an eager, unstreamed read; `.zst` decoding is
-    handled natively by polars based on the file extension.
+    A 1kGP-scale pvar can be 500+ MB of compressed text (75M+ rows); the
+    somatic cohort's is 5.9 GB uncompressed (348M rows) with REF/ALT strings
+    up to 60+ characters. This returns an *unmaterialized* `pl.LazyFrame` --
+    callers must keep every downstream statistic expressed as a lazy
+    aggregation (`compute_pvar_stats` does this) and only collect small,
+    bounded results. Calling `.collect()` on the frame this returns without
+    first reducing it (e.g. via `group_by`/aggregation) will eagerly pull
+    every row into memory and reproduce the OOM this function exists to
+    avoid -- a streaming `.collect(engine="streaming")` streams the
+    *computation*, not the *result*: the result is still a fully
+    materialized `DataFrame` holding every row. `.zst` decoding is handled
+    natively by polars based on the file extension either way.
 
     ``ALT`` may be a comma-joined multiallelic list (e.g. "G,T") exactly as
     plink2 pvar stores it natively -- pgen does NOT auto-split multiallelic
@@ -192,7 +301,7 @@ def read_pvar(path: str | Path) -> pl.DataFrame:
         comment_prefix="##",
         schema_overrides={"#CHROM": pl.Utf8, "ID": pl.Utf8, "REF": pl.Utf8, "ALT": pl.Utf8},
     ).rename({"#CHROM": "CHROM"})
-    return lf.select(["CHROM", "POS", "ID", "REF", "ALT"]).collect(engine="streaming")
+    return lf.select(["CHROM", "POS", "ID", "REF", "ALT"])
 
 
 def build_profile(
@@ -201,9 +310,9 @@ def build_profile(
     source: str,
     n_samples: int,
     contigs: list[dict],
-    gaps: Sequence[float],
-    acs: Sequence[float],
-    indel_lens: Sequence[float],
+    gap_dist: dict,
+    sfs: dict,
+    indel_length: dict,
     class_counts: Mapping[str, int],
     titv: float,
     multiallelic_rate: float,
@@ -215,21 +324,26 @@ def build_profile(
 ) -> dict:
     """Assemble a schema-valid Profile dict (see `src/bulk/profile.rs`).
 
-    Every field under "fitted" is derived from `gaps`/`acs`/`indel_lens`/
-    `class_counts`/`contigs`/the scalar rates passed in by the caller (which
-    `main()` computes from real pgen/pvar data) -- never hand-picked here.
-    `dialed.payload` is the one deliberate exception: it is a generation
-    choice, not a fitted statistic.
+    `gap_dist`, `sfs`, and `indel_length` are already-finalized histogram
+    dicts (``{"edges": [...], "weights": [...]}``, as produced by
+    `histogram`/`histogram_lazy` + `_finalize_histogram*`) rather than raw
+    value sequences: at real scale those sequences would be 75M-350M
+    elements, so the histogram must already have been reduced by the caller
+    (`main()`, via lazy polars aggregations) before it ever reaches this
+    function. Every field under "fitted" is otherwise derived from
+    `class_counts`/`contigs`/the scalar rates passed in by the caller --
+    never hand-picked here. `dialed.payload` is the one deliberate
+    exception: it is a generation choice, not a fitted statistic.
     """
     if n_variants_source is None:
         n_variants_source = sum(c["n_variants"] for c in contigs)
 
     fitted = {
         "contigs": contigs,
-        "gap_dist": histogram(gaps, _gap_edges()),
-        "sfs": histogram(acs, _sfs_edges(n_samples)),
+        "gap_dist": gap_dist,
+        "sfs": sfs,
         "variant_classes": class_mix_from_counts(class_counts),
-        "indel_length": histogram(indel_lens, INDEL_EDGES),
+        "indel_length": indel_length,
         "titv": titv,
         "multiallelic_rate": multiallelic_rate,
         "missing_rate": missing_rate,
@@ -290,11 +404,11 @@ def _sfs_edges(n_samples: int) -> list[float]:
 
 
 # --------------------------------------------------------------------------
-# Extraction from a pvar DataFrame (vectorized polars, no Python row loops)
+# Extraction from a pvar LazyFrame (vectorized polars, no Python row loops)
 # --------------------------------------------------------------------------
 
 
-def _explode_alleles(df: pl.DataFrame) -> pl.DataFrame:
+def _explode_alleles(lf: pl.LazyFrame) -> pl.LazyFrame:
     """Split multiallelic ALT into one row per REF/ALT allele pair.
 
     plink2 pvar retains multiallelic records natively -- it does NOT
@@ -310,20 +424,29 @@ def _explode_alleles(df: pl.DataFrame) -> pl.DataFrame:
     Callers that need per-*record* semantics instead (contig density,
     inter-variant gaps, `multiallelic_rate`) must use the un-exploded frame.
 
-    Vectorized via `Series.str.split` + `DataFrame.explode` -- no Python
-    loop over rows, so this streams fine over a 500+ MB pvar.
+    Vectorized via `Expr.str.split` + `LazyFrame.explode` -- no Python loop
+    over rows, and this stays lazy: nothing is materialized until a
+    downstream `.collect()` on a reduced (e.g. `group_by`) result.
     """
-    return df.with_columns(pl.col("ALT").str.split(",")).explode("ALT", empty_as_null=False)
+    return lf.with_columns(pl.col("ALT").str.split(",")).explode("ALT", empty_as_null=False)
 
 
-def _classify_df(df: pl.DataFrame) -> pl.DataFrame:
-    return df.with_columns(_classify_expr(pl.col("REF"), pl.col("ALT")).alias("class"))
+def _classify_df(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf.with_columns(_classify_expr(pl.col("REF"), pl.col("ALT")).alias("class"))
 
 
-def _contig_stats(df: pl.DataFrame) -> list[dict]:
-    """Per-contig record count and density. `df` is per-RECORD (not exploded)."""
-    agg = (
-        df.group_by("CHROM", maintain_order=True)
+def _contig_stats_lazy(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Per-contig record count, span, and position bounds. `lf` is per-RECORD (not exploded).
+
+    Collecting this yields one row per contig (tens, not millions) --
+    `pos_min` is kept alongside the public `id`/`n_variants`/`density_per_kb`
+    fields purely so `main()` can look up the first fitted contig's start
+    position for `fit_phased_rate` without an extra full-file scan; it is
+    dropped before the profile's `contigs` list (see `_contig_rows_from_df`)
+    since it isn't part of the `ContigStat` schema in `src/bulk/profile.rs`.
+    """
+    return (
+        lf.group_by("CHROM")
         .agg(
             n_variants=pl.len(),
             pos_min=pl.col("POS").min(),
@@ -333,81 +456,98 @@ def _contig_stats(df: pl.DataFrame) -> list[dict]:
         .with_columns(density_per_kb=pl.col("n_variants") / (pl.col("span_bp") / 1000.0))
         .sort("CHROM")
     )
+
+
+def _contig_rows_from_df(df: pl.DataFrame) -> list[dict]:
     return [
         {
             "id": row["CHROM"],
             "n_variants": row["n_variants"],
             "density_per_kb": row["density_per_kb"],
         }
-        for row in agg.iter_rows(named=True)
+        for row in df.iter_rows(named=True)
     ]
 
 
-def _gaps(df: pl.DataFrame) -> pl.Series:
-    """Inter-variant gaps (bp) within each contig, sorted-position diffs.
+def _contig_pos_min_from_df(df: pl.DataFrame) -> dict[str, int]:
+    return {row["CHROM"]: row["pos_min"] for row in df.iter_rows(named=True)}
 
-    `df` is per-RECORD (not exploded): a multiallelic site is still one
+
+def _gap_bins_lazy(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Inter-variant gap (bp) histogram bin counts, within each contig.
+
+    `lf` is per-RECORD (not exploded): a multiallelic site is still one
     position, so exploding first would fabricate spurious zero-length gaps
     between the alleles of the same site.
+
+    Returns the `histogram_lazy` bin-count frame directly (bounded by
+    `GAP_N_BINS`), never the underlying gaps themselves -- a 1kGP-scale
+    contig can have tens of millions of gaps, which is exactly the array
+    `read_pvar`'s docstring warns against materializing.
     """
-    return (
-        df.sort(["CHROM", "POS"])
+    gaps = (
+        lf.sort(["CHROM", "POS"])
         .select(pl.col("POS").diff().over("CHROM").alias("gap"))
-        .drop_nulls()
-        .filter(pl.col("gap") > 0)["gap"]
+        .filter(pl.col("gap").is_not_null() & (pl.col("gap") > 0))
     )
+    return histogram_lazy(gaps, pl.col("gap"), _gap_edges())
 
 
-def _class_counts(alleles: pl.DataFrame) -> dict[str, int]:
-    """Tally classes over a per-ALLELE frame (post `_explode_alleles` + `_classify_df`)."""
+def _class_counts_from_df(df: pl.DataFrame) -> dict[str, int]:
     counts = dict.fromkeys(CLASS_NAMES, 0)
-    tally = alleles.group_by("class").agg(pl.len().alias("n"))
-    for row in tally.iter_rows(named=True):
+    for row in df.iter_rows(named=True):
         counts[row["class"]] = row["n"]
     return counts
 
 
-def _indel_lengths(alleles: pl.DataFrame) -> pl.Series:
-    """Indel lengths over a per-ALLELE frame (post `_explode_alleles` + `_classify_df`)."""
+def _indel_bins_lazy(alleles: pl.LazyFrame) -> pl.LazyFrame:
+    """Indel-length histogram bin counts over a per-ALLELE frame (post `_explode_alleles` + `_classify_df`)."""
     indels = alleles.filter(pl.col("class").is_in(["insertion", "deletion"]))
     # str.len_chars() is UInt32; subtracting two UInt32 columns wraps around
     # on underflow instead of going negative, so cast to a signed type first.
     alt_len = pl.col("ALT").str.len_chars().cast(pl.Int64)
     ref_len = pl.col("REF").str.len_chars().cast(pl.Int64)
-    return indels.select((alt_len - ref_len).abs().alias("len"))["len"]
+    length = (alt_len - ref_len).abs()
+    return histogram_lazy(indels, length, INDEL_EDGES)
 
 
-def _multiallelic_rate(df: pl.DataFrame) -> float:
-    """Fraction of pvar RECORDS whose ALT field lists more than one allele.
+def _multiallelic_rate_lazy(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Record count and multiallelic-record count (both scalars), per-RECORD frame.
 
     Must run on the un-exploded, per-record frame: this counts sites, not
     alleles, so a triallelic site still contributes exactly 1 to both the
     numerator and denominator, not 2.
     """
-    n = df.height
-    if n == 0:
-        return 0.0
-    n_multi = df.select(pl.col("ALT").str.contains(",", literal=True).sum()).item()
-    return n_multi / n
+    return lf.select(
+        n=pl.len(),
+        n_multi=pl.col("ALT").str.contains(",", literal=True).sum(),
+    )
 
 
-def _titv(alleles: pl.DataFrame) -> float:
-    """Transition/transversion ratio over SNP alleles (post `_explode_alleles` + `_classify_df`)."""
+def _multiallelic_rate_from_row(n: int, n_multi: int) -> float:
+    return (n_multi / n) if n else 0.0
+
+
+def _titv_lazy(alleles: pl.LazyFrame) -> pl.LazyFrame:
+    """SNP count and transition count (both scalars) over a per-ALLELE frame."""
     snps = alleles.filter(pl.col("class") == "snp")
-    if snps.height == 0:
-        raise ValueError("no SNPs found; cannot compute Ti/Tv")
     pair = pl.concat_str([pl.col("REF"), pl.col("ALT")])
-    n_ts = snps.select(pair.is_in(TRANSITION_PAIRS).sum()).item()
-    n_tv = snps.height - n_ts
+    return snps.select(n_snps=pl.len(), n_ts=pair.is_in(TRANSITION_PAIRS).sum())
+
+
+def _titv_from_row(n_snps: int, n_ts: int) -> float:
+    if n_snps == 0:
+        raise ValueError("no SNPs found; cannot compute Ti/Tv")
+    n_tv = n_snps - n_ts
     if n_tv == 0:
         raise ValueError("no transversions found; cannot compute a finite Ti/Tv ratio")
     return n_ts / n_tv
 
 
-def compute_pvar_stats(df: pl.DataFrame) -> dict:
+def compute_pvar_stats(lf: pl.LazyFrame) -> dict:
     """Compute every `fitted` statistic derived purely from the pvar frame.
 
-    `df` is the raw, per-record frame from `read_pvar` (optionally
+    `lf` is the raw, per-record `pl.LazyFrame` from `read_pvar` (optionally
     contig-filtered) -- ALT may still be comma-joined for multiallelic
     sites. Two different units of observation are in play here and must
     not be conflated:
@@ -423,23 +563,39 @@ def compute_pvar_stats(df: pl.DataFrame) -> dict:
 
     A biallelic-only pvar is unaffected either way: `_explode_alleles` is a
     no-op per row when ALT has no comma.
-    """
-    contigs = _contig_stats(df)
-    gaps = _gaps(df)
-    multiallelic_rate = _multiallelic_rate(df)
 
-    alleles = _classify_df(_explode_alleles(df))
-    class_counts = _class_counts(alleles)
-    indel_lens = _indel_lengths(alleles)
-    titv = _titv(alleles)
+    Every one of these is built as a lazy query whose *collected* output is
+    small (contig count, histogram bin counts, or a one-row scalar frame) --
+    never the full per-record or per-allele frame. All six queries below
+    share two common subplans (the raw `lf` scan and the exploded `alleles`
+    scan), so `pl.collect_all` executes each of those scans once, not six
+    times, via polars' common-subplan elimination.
+    """
+    contig_lf = _contig_stats_lazy(lf)
+    gap_bins_lf = _gap_bins_lazy(lf)
+    multi_lf = _multiallelic_rate_lazy(lf)
+
+    alleles = _classify_df(_explode_alleles(lf))
+    class_lf = alleles.group_by("class").agg(pl.len().alias("n"))
+    indel_bins_lf = _indel_bins_lazy(alleles)
+    titv_lf = _titv_lazy(alleles)
+
+    contig_df, gap_bins_df, multi_df, class_df, indel_bins_df, titv_df = pl.collect_all(
+        [contig_lf, gap_bins_lf, multi_lf, class_lf, indel_bins_lf, titv_lf],
+        engine="streaming",
+    )
+
+    n, n_multi = multi_df.row(0)
+    n_snps, n_ts = titv_df.row(0)
 
     return {
-        "contigs": contigs,
-        "gaps": gaps,
-        "multiallelic_rate": multiallelic_rate,
-        "class_counts": class_counts,
-        "indel_lens": indel_lens,
-        "titv": titv,
+        "contigs": _contig_rows_from_df(contig_df),
+        "contig_pos_min": _contig_pos_min_from_df(contig_df),
+        "gap_dist": _finalize_histogram_from_binned(gap_bins_df, _gap_edges()),
+        "multiallelic_rate": _multiallelic_rate_from_row(n, n_multi),
+        "class_counts": _class_counts_from_df(class_df),
+        "indel_length": _finalize_histogram_from_binned(indel_bins_df, INDEL_EDGES),
+        "titv": _titv_from_row(n_snps, n_ts),
     }
 
 
@@ -457,6 +613,22 @@ def _run_plink2(args: list[str]) -> None:
         )
 
 
+def _pfile_args(pgen_prefix: str | Path, vzs: bool) -> list[str]:
+    """Build the `--pfile` argument list, adding plink2's `vzs` marker when needed.
+
+    plink2 does NOT auto-detect a `.pvar.zst` the way `read_pvar` does: if
+    only the `.zst`-compressed pvar exists (no plain `.pvar` alongside it,
+    which is how the committed 1kGP/somatic filesets are laid out), a bare
+    `--pfile <prefix>` fails with "Failed to open <prefix>.pvar : No such
+    file or directory" -- `vzs` must be passed as a second positional token
+    after the prefix to tell plink2 to look for `.pvar.zst` instead.
+    """
+    args = ["--pfile", str(pgen_prefix)]
+    if vzs:
+        args.append("vzs")
+    return args
+
+
 def _split_alt_cts(alt_cts: Sequence[str] | pl.Series) -> list[float]:
     """Parse plink2 `--freq counts` ALT_CTS into one count per ALT allele.
 
@@ -464,48 +636,90 @@ def _split_alt_cts(alt_cts: Sequence[str] | pl.Series) -> list[float]:
     comma-joined and positionally aligned (e.g. `ALT="G,T"`,
     `ALT_CTS="1,1"`): the i-th count belongs to the i-th ALT allele. This
     splits that alignment into one float observation per allele, matching
-    the per-allele split `_explode_alleles` does for classification -- so
-    each ALT allele contributes its own count to the `sfs` histogram
-    instead of the whole comma-joined string being handed to
-    `np.asarray(..., dtype=float)`, which raises on a string like "1,1".
+    the per-allele split `_explode_alleles` does for classification.
 
-    A biallelic row (`ALT_CTS` with no comma) splits into a 1-element list
-    and is unaffected. Vectorized via polars `Series.str.split` + explode --
-    no Python loop, though `.acount` files are one row per site so this
-    would be cheap either way.
+    This is the small-scale, eager reference implementation (`Series` in,
+    `list[float]` out) -- fine for a handful of rows (as in the unit tests
+    below), but NOT how `fit_sfs` computes the real `sfs` histogram: a
+    1kGP-scale `.acount` has one row per pvar record (up to ~350M for the
+    somatic cohort), so materializing every count into a Python list would
+    reproduce the exact OOM `read_pvar` used to cause. `fit_sfs` instead
+    performs the equivalent split+explode lazily via `pl.scan_csv` and only
+    collects the tiny, bucketized `histogram_lazy` result.
     """
     s = pl.Series("ALT_CTS", list(alt_cts), dtype=pl.Utf8)
     return s.str.split(",").explode(empty_as_null=False).cast(pl.Float64).to_list()
 
 
-def fit_sfs(pgen_prefix: str | Path, contigs: Iterable[str] | None = None) -> list[float]:
-    """Shell out to `plink2 --freq counts` and return one ALT_CTS per allele.
+def fit_sfs(
+    pgen_prefix: str | Path,
+    n_samples: int,
+    contigs: Iterable[str] | None = None,
+    vzs: bool = False,
+) -> dict:
+    """Shell out to `plink2 --freq counts` and return the fitted `sfs` histogram.
 
     ALT_CTS is the observed non-reference allele count per site -- exactly
     the site-frequency-spectrum input the `sfs` histogram is fit from. For
     multiallelic sites plink2 keeps ALT_CTS comma-joined (aligned with the
-    equally comma-joined ALT column); `_split_alt_cts` splits that into one
-    count per allele.
+    equally comma-joined ALT column); this splits that into one count per
+    allele, exactly like `_split_alt_cts`, but does so lazily via
+    `pl.scan_csv` + `histogram_lazy` and returns the finalized histogram
+    directly -- the `.acount` file has one row per pvar record (up to ~350M
+    for the somatic cohort), so collecting every count into a Python list
+    (the old behavior) would materialize hundreds of millions of floats.
+
+    The temporary directory holding `.acount` is deleted once this function
+    returns, so the full lazy-scan-to-histogram pipeline (including the
+    final `.collect()`, which only ever produces a few dozen bin-count rows)
+    must run inside the `with tempfile.TemporaryDirectory()` block below --
+    returning an uncollected `LazyFrame` scanning that file would go stale.
     """
     with tempfile.TemporaryDirectory() as tmp:
         out_prefix = str(Path(tmp) / "sfs")
-        args = ["--pfile", str(pgen_prefix), "--freq", "counts", "--out", out_prefix]
+        # --nonfounders: plink2's --freq counts defaults to founders-only,
+        # which would silently compute ALT_CTS over fewer than the
+        # `n_samples` used to build `_sfs_edges` (a real cohort has related
+        # individuals / nonfounders present, e.g. 1kGP is 2583 founders out
+        # of 3202 total samples) -- without this, plink2 refuses to run at
+        # all ("--freq counts specified, but with neither --ac-founders nor
+        # --nonfounders; and nonfounders are present").
+        args = _pfile_args(pgen_prefix, vzs) + [
+            "--freq",
+            "counts",
+            "--nonfounders",
+            "--out",
+            out_prefix,
+        ]
         if contigs:
             args += ["--chr", ",".join(contigs)]
         _run_plink2(args)
-        df = pl.read_csv(
+        edges = _sfs_edges(n_samples)
+        lf = pl.scan_csv(
             f"{out_prefix}.acount", separator="\t", schema_overrides={"ALT_CTS": pl.Utf8}
         )
-        return _split_alt_cts(df["ALT_CTS"])
+        alt_cts = (
+            lf.select(pl.col("ALT_CTS").str.split(","))
+            .explode("ALT_CTS", empty_as_null=False)
+            .select(pl.col("ALT_CTS").cast(pl.Float64))
+        )
+        binned = histogram_lazy(alt_cts, pl.col("ALT_CTS"), edges).collect(engine="streaming")
+        return _finalize_histogram_from_binned(binned, edges)
 
 
-def fit_missing_rate(pgen_prefix: str | Path, contigs: Iterable[str] | None = None) -> float:
-    """Shell out to `plink2 --missing` and return the global hardcall missing rate."""
+def fit_missing_rate(
+    pgen_prefix: str | Path, contigs: Iterable[str] | None = None, vzs: bool = False
+) -> float:
+    """Shell out to `plink2 --missing` and return the global hardcall missing rate.
+
+    `.vmiss` also has one row per pvar record, so this scans it lazily and
+    sums the two count columns via a single reducing `.select()` -- the
+    collected result is one row -- rather than reading the whole file
+    eagerly with `pl.read_csv`.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         out_prefix = str(Path(tmp) / "miss")
-        args = [
-            "--pfile",
-            str(pgen_prefix),
+        args = _pfile_args(pgen_prefix, vzs) + [
             "--missing",
             "variant-only",
             "--out",
@@ -514,9 +728,12 @@ def fit_missing_rate(pgen_prefix: str | Path, contigs: Iterable[str] | None = No
         if contigs:
             args += ["--chr", ",".join(contigs)]
         _run_plink2(args)
-        df = pl.read_csv(f"{out_prefix}.vmiss", separator="\t")
-        n_missing = df["MISSING_CT"].sum()
-        n_obs = df["OBS_CT"].sum()
+        totals = (
+            pl.scan_csv(f"{out_prefix}.vmiss", separator="\t")
+            .select(n_missing=pl.col("MISSING_CT").sum(), n_obs=pl.col("OBS_CT").sum())
+            .collect(engine="streaming")
+        )
+        n_missing, n_obs = totals.row(0)
         return n_missing / n_obs if n_obs else 0.0
 
 
@@ -525,20 +742,23 @@ def fit_phased_rate(
     contig: str,
     pos_min: int,
     window_bp: int = 1_000_000,
+    vzs: bool = False,
 ) -> float:
     """Estimate the fraction of genotype calls that are phased.
 
     pgen has no direct "phased fraction" report, so this exports a bounded
     window (`window_bp` starting at `pos_min` on `contig`) to VCF and counts
     the phased ('|') vs unphased ('/') GT separators plink2 actually wrote,
-    across every sample x variant call in that window.
+    across every sample x variant call in that window. The window (default
+    1 Mb) is bounded regardless of cohort size, so the line-by-line VCF
+    parse below stays small and isn't a materialization risk the way an
+    unbounded pvar/`.acount` scan would be.
     """
     with tempfile.TemporaryDirectory() as tmp:
         out_prefix = str(Path(tmp) / "phase")
         _run_plink2(
-            [
-                "--pfile",
-                str(pgen_prefix),
+            _pfile_args(pgen_prefix, vzs)
+            + [
                 "--chr",
                 contig,
                 "--from-bp",
@@ -619,40 +839,42 @@ def main(argv: list[str] | None = None) -> None:
     prefix = str(args.pgen)
     psam_path = Path(f"{prefix}.psam")
     pvar_path = Path(f"{prefix}.pvar.zst")
-    if not pvar_path.exists():
+    vzs = pvar_path.exists()
+    if not vzs:
         pvar_path = Path(f"{prefix}.pvar")
     if not pvar_path.exists():
         raise FileNotFoundError(f"no .pvar or .pvar.zst found for prefix {prefix}")
 
     n_samples = _read_n_samples(psam_path)
 
-    df = read_pvar(pvar_path)
+    lf = read_pvar(pvar_path)
     if args.contigs:
-        df = df.filter(pl.col("CHROM").is_in(args.contigs))
+        lf = lf.filter(pl.col("CHROM").is_in(args.contigs))
 
-    stats = compute_pvar_stats(df)
+    stats = compute_pvar_stats(lf)
     contigs = stats["contigs"]
     if not contigs:
         raise ValueError("no variants found for the requested contig(s)")
     contig_ids = [c["id"] for c in contigs]
 
-    gaps = stats["gaps"]
+    gap_dist = stats["gap_dist"]
     class_counts = stats["class_counts"]
-    indel_lens = stats["indel_lens"]
+    indel_length = stats["indel_length"]
     titv = stats["titv"]
     multiallelic_rate = stats["multiallelic_rate"]
 
     chr_filter = contig_ids if args.contigs else None
-    acs = fit_sfs(args.pgen, contigs=chr_filter)
-    missing_rate = fit_missing_rate(args.pgen, contigs=chr_filter)
+    sfs = fit_sfs(args.pgen, n_samples, contigs=chr_filter, vzs=vzs)
+    missing_rate = fit_missing_rate(args.pgen, contigs=chr_filter, vzs=vzs)
 
     first_contig = contigs[0]
-    pos_min = int(df.filter(pl.col("CHROM") == first_contig["id"])["POS"].min())
+    pos_min = int(stats["contig_pos_min"][first_contig["id"]])
     phased_rate = fit_phased_rate(
         args.pgen,
         contig=first_contig["id"],
         pos_min=pos_min,
         window_bp=int(args.phase_sample_mb * 1_000_000),
+        vzs=vzs,
     )
 
     profile = build_profile(
@@ -660,9 +882,9 @@ def main(argv: list[str] | None = None) -> None:
         source=prefix,
         n_samples=n_samples,
         contigs=contigs,
-        gaps=gaps,
-        acs=acs,
-        indel_lens=indel_lens,
+        gap_dist=gap_dist,
+        sfs=sfs,
+        indel_length=indel_length,
         class_counts=class_counts,
         titv=titv,
         multiallelic_rate=multiallelic_rate,

@@ -7,11 +7,14 @@ import polars as pl
 import pytest
 
 from fit_profile import (
+    INDEL_EDGES,
     build_profile,
     classify,
     _classify_df,
     _explode_alleles,
-    _multiallelic_rate,
+    _gap_edges,
+    _multiallelic_rate_from_row,
+    _multiallelic_rate_lazy,
     _sfs_edges,
     _split_alt_cts,
     class_mix_from_counts,
@@ -37,14 +40,20 @@ def test_class_mix_sums_to_one():
 
 
 def test_build_profile_emits_schema_valid_json():
+    # gap_dist/sfs/indel_length are already-finalized histogram dicts at
+    # this point -- build_profile no longer computes histograms itself
+    # (that would require materializing the full gaps/acs/indel_lens
+    # sequences, which is exactly what OOMs at real cohort scale). They're
+    # built here with the small-scale `histogram()` helper purely because
+    # this test's inputs are tiny literals.
     p = build_profile(
         name="test",
         source="/dev/null",
         n_samples=10,
         contigs=[{"id": "chr1", "n_variants": 100, "density_per_kb": 40.0}],
-        gaps=[1, 2, 3, 40],
-        acs=[1, 1, 2, 19],
-        indel_lens=[1, 2, 3],
+        gap_dist=histogram([1, 2, 3, 40], _gap_edges()),
+        sfs=histogram([1, 1, 2, 19], _sfs_edges(10)),
+        indel_length=histogram([1, 2, 3], INDEL_EDGES),
         class_counts={"snp": 83, "insertion": 6, "deletion": 9,
                       "mnp": 1, "complex": 1, "symbolic": 0},
         titv=2.05,
@@ -121,8 +130,14 @@ def test_fit_sfs_regression_comma_joined_alt_cts_no_longer_crashes(monkeypatch, 
 
     monkeypatch.setattr("fit_profile._run_plink2", fake_run_plink2)
     monkeypatch.setattr("tempfile.TemporaryDirectory", lambda: _FixedTmpDir(tmp_path))
-    acs = fit_sfs("unused-prefix")
-    assert acs == [2.0, 1.0, 3.0]
+    # n_samples=3 -> _sfs_edges(3) == [1.0, 2.0, 4.0, 6.0]. The 3 ALT_CTS
+    # observations after splitting "2,1" -> 2.0, 1.0 are [2.0, 1.0, 3.0]:
+    # 1.0 lands in [1,2) (1 obs), 2.0 and 3.0 both land in [2,4) (2 obs).
+    # fit_sfs used to crash trying to float() the raw "2,1" string directly;
+    # now it returns the finalized histogram, never a materialized list.
+    sfs = fit_sfs("unused-prefix", n_samples=3)
+    assert sfs["edges"] == [1.0, 2.0, 4.0, 6.0]
+    assert sfs["weights"] == pytest.approx([1 / 3, 2 / 3, 0.0])
 
 
 class _FixedTmpDir:
@@ -150,7 +165,7 @@ def test_multiallelic_alt_corrupts_scalar_classify_but_not_the_split_pipeline():
         "REF": ["A", "C"],
         "ALT": ["G,T", "T"],
     })
-    alleles = _classify_df(_explode_alleles(df))
+    alleles = _classify_df(_explode_alleles(df.lazy())).collect()
     # 3 alleles total: rs1/G, rs1/T, rs2/T -- all real SNPs once split.
     assert alleles["class"].to_list() == ["snp", "snp", "snp"]
 
@@ -163,7 +178,7 @@ def test_explode_alleles_splits_multiallelic_and_is_a_no_op_for_biallelic():
         "REF": ["A", "AT"],
         "ALT": ["G,T", "A"],
     })
-    alleles = _explode_alleles(df)
+    alleles = _explode_alleles(df.lazy()).collect()
     assert alleles.height == 3
     assert alleles["ALT"].to_list() == ["G", "T", "A"]
     # shared per-record fields are broadcast onto every allele row
@@ -181,7 +196,8 @@ def test_multiallelic_rate_counts_records_not_alleles():
         "REF": ["A", "C", "G"],
         "ALT": ["G,T,C", "T", "A"],
     })
-    assert _multiallelic_rate(df) == pytest.approx(1 / 3)
+    n, n_multi = _multiallelic_rate_lazy(df.lazy()).collect().row(0)
+    assert _multiallelic_rate_from_row(n, n_multi) == pytest.approx(1 / 3)
 
 
 def test_compute_pvar_stats_gives_two_class_and_two_indel_observations_per_multiallelic_site():
@@ -198,10 +214,17 @@ def test_compute_pvar_stats_gives_two_class_and_two_indel_observations_per_multi
         "REF": ["A", "A"],
         "ALT": ["AG,ATT", "C"],  # rs1: two insertions of length 1 and 2; rs2: A>C transversion
     })
-    stats = compute_pvar_stats(df)
+    stats = compute_pvar_stats(df.lazy())
     assert stats["class_counts"]["insertion"] == 2
     assert stats["class_counts"]["snp"] == 1
-    assert sorted(stats["indel_lens"].to_list()) == [1, 2]
+    # indel_length is now a finalized histogram (never a materialized list
+    # of lengths): lengths 1 and 2 land in INDEL_EDGES bins [1,2) and [2,3)
+    # respectively, one observation each.
+    indel_hist = stats["indel_length"]
+    assert indel_hist["edges"] == INDEL_EDGES
+    assert indel_hist["weights"][0] == pytest.approx(0.5)  # length 1 -> [1,2)
+    assert indel_hist["weights"][1] == pytest.approx(0.5)  # length 2 -> [2,3)
+    assert sum(indel_hist["weights"]) == pytest.approx(1.0)
     # 1 multiallelic record (rs1) out of 2 total records.
     assert stats["multiallelic_rate"] == pytest.approx(0.5)
 
@@ -303,5 +326,10 @@ def test_fit_sfs_preserves_positional_alignment_between_alt_and_alt_cts(tmp_path
         check=True,
         capture_output=True,
     )
-    acs = fit_sfs(prefix)
-    assert acs == pytest.approx([2.0, 1.0, 3.0, 3.0])
+    # n_samples=3 -> _sfs_edges(3) == [1.0, 2.0, 4.0, 6.0]. The 4 per-allele
+    # observations are rs1/G=2.0, rs1/T=1.0, rs2=3.0, rs3=3.0: if G and T's
+    # counts were summed/averaged instead of kept independent, or
+    # misaligned with the wrong allele, this bin split would come out wrong.
+    sfs = fit_sfs(prefix, n_samples=3)
+    assert sfs["edges"] == [1.0, 2.0, 4.0, 6.0]
+    assert sfs["weights"] == pytest.approx([0.25, 0.75, 0.0])
