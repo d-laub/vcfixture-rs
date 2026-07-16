@@ -56,6 +56,24 @@ Hypothesis-style strategies for fuzzing a VCF parser are available behind the
 vcfixture = { version = "0.1", features = ["proptest"] }
 ```
 
+## Bulk generation
+
+Behind the `cli` feature (which implies `bulk`), the `vcfixture bulk`
+subcommand generates large, realistic-enough BCF/VCF files for benchmarking a
+reader's speed, memory, or compression — not for exact-value fixtures. It
+fits statistics from real data ahead of time into a committed `Profile`, then
+streams records from it, so it scales far past what `VcfBuilder` can hold in
+memory.
+
+```bash
+cargo install vcfixture --features cli
+vcfixture bulk --profile germline-1kgp --samples 3202 \
+  --contigs chr1,chr2,chr3 --target-size 100MB --seed 42 -o bench.bcf
+```
+
+See the [Bulk generation guide](https://d-laub.github.io/vcfixture-rs/bulk-generation.html)
+for the fitted-vs-dialed split, the payload presets, and the API.
+
 ## Documentation
 
 - [User guide](https://d-laub.github.io/vcfixture-rs/) (mdBook)

@@ -6,6 +6,7 @@
 use std::env;
 use std::num::NonZero;
 
+// ANCHOR: bulk
 use vcfixture::bulk::{BulkSpec, Payload, Profile, Size};
 
 fn main() {
@@ -32,6 +33,7 @@ fn main() {
         summary.per_contig.len(),
         path.display()
     );
+    // ANCHOR_END: bulk
 
     // Clean up: this example's whole point is the runtime assertion above,
     // not the artifact it leaves behind.

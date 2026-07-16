@@ -578,6 +578,24 @@ impl BulkSpec {
     }
 }
 
+/// Parse a byte size like `100MB`, `512KB`, `1GB`, or a bare byte count.
+pub fn parse_size(s: &str) -> Result<u64, BulkError> {
+    let t = s.trim();
+    let (num, mult) = if let Some(p) = t.strip_suffix("GB") {
+        (p, 1024 * 1024 * 1024)
+    } else if let Some(p) = t.strip_suffix("MB") {
+        (p, 1024 * 1024)
+    } else if let Some(p) = t.strip_suffix("KB") {
+        (p, 1024)
+    } else {
+        (t, 1)
+    };
+    num.trim()
+        .parse::<u64>()
+        .map(|n| n * mult)
+        .map_err(|_| BulkError::Invalid(format!("bad size: {s}")))
+}
+
 /// The populated span of one contig's generated records — the maximum
 /// position among them, or `1` if the contig has zero records. Positions
 /// are strictly increasing within a contig (see
