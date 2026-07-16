@@ -131,8 +131,25 @@ scripts/fit/           - Python extraction (pixi task)
 Feature gates keep the crate light for existing fixture consumers:
 
 - `bulk` (default off) — the bulk module; pulls `serde`, `serde_json`,
-  `noodles-bcf`, PRNG.
+  `noodles-bcf`, `rayon`, PRNG.
 - `cli` (default off, implies `bulk`) — the binary; pulls `clap`.
+
+**Prerequisite: a coordinated noodles upgrade.** `noodles-bcf` cannot be added at
+the crate's current noodles versions — it pulls a *second* `noodles-vcf` (0.83)
+alongside the existing 0.79, plus duplicate `bgzf`/`core`/`csi`/`tabix`, and types
+across the two would not interoperate. (`noodles-bcf` 0.87 is additionally
+unusable: it requires rustc 1.89 against our `rust-version = "1.86"`.) The
+resolved single-version set, verified to compile clean with all 70 existing tests
+passing:
+
+| crate         | from   | to     |
+| ------------- | ------ | ------ |
+| noodles-vcf   | 0.79   | 0.83   |
+| noodles-bgzf  | 0.41   | 0.45   |
+| noodles-core  | 0.17   | 0.18   |
+| noodles-csi   | 0.49   | 0.53   |
+| noodles-tabix | 0.55   | 0.59   |
+| noodles-bcf   | —      | 0.81   |
 
 ### Profile schema
 
@@ -231,18 +248,31 @@ or scheduling. Generation parallelizes with rayon over record blocks.
 
 ### Writer and sizing
 
-Streaming BCF + CSI. The index is built from live bgzf virtual offsets as records
-are written, replacing the existing `write_csi` approach (re-render the document,
-replay it through an in-memory bgzf writer) which is O(size) twice and cannot
-survive bulk scale. `noodles-bgzf`'s `MultithreadedWriter` does the compression.
+Records stream into `noodles_bcf::io::Writer` (via the `vcf::variant::io::Write`
+trait) wrapped around `noodles-bgzf`'s `MultithreadedWriter`. Nothing accumulates.
+
+**Indexing is a second pass, not on-the-fly.** `MultithreadedWriter` exposes only
+`new` / `with_worker_count` / `finish` — it does **not** expose
+`virtual_position()`; only the single-threaded `bgzf::io::Writer` does. So live
+offset capture is incompatible with the multithreaded compression the throughput
+target depends on. Instead, after writing, `noodles_bcf::fs::index(path)` builds
+the CSI in one streaming read pass and `csi::fs::write` persists it. This uses
+upstream code rather than a hand-rolled indexer, and still replaces the existing
+`write_csi` (re-render the document, replay through an in-memory bgzf writer),
+which is O(size) twice and cannot survive bulk scale. Cost is one extra read pass
+(~1–2 s at 100 MB) — acceptable under the accept-longer decision.
 
 Output defaults to `.bcf` + `.csi`. `--format` also accepts `vcf.gz` and `vcf`.
 
 Two sizing modes:
 
-- `--target-size 100MB` — stream until the compressed offset reaches the target.
-  Exact, not estimated: compressed bytes/record depends on allele frequency, so it
-  cannot be predicted in closed form, but it can be *observed* while writing.
+- `--target-size 100MB` — stream until compressed bytes reach the target. Exact,
+  not estimated: compressed bytes/record depends on allele frequency and cannot be
+  predicted in closed form, but it can be *observed* while writing. Since
+  `MultithreadedWriter` exposes no position either, the byte count comes from a
+  `CountingWriter` placed **underneath** it (it emits compressed blocks to its
+  inner writer, so bytes through that writer are exactly the compressed size),
+  sharing an `Arc<AtomicU64>` the generator polls between record blocks.
 - `--records N` / `--records-per-contig N` — emit exact counts.
 
 `--samples` is always explicit. Size targeting solves for records with samples
