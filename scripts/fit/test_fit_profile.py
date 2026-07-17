@@ -337,6 +337,14 @@ def test_compute_pvar_stats_gives_two_class_and_two_indel_observations_per_multi
     assert sum(indel_hist["weights"]) == pytest.approx(1.0)
     # 1 multiallelic record (rs1) out of 2 total records.
     assert stats["multiallelic_rate"] == pytest.approx(0.5)
+    # Regression guard for the six-plan collection (D4): both records are on
+    # contig "1", so exactly one contig; rs2 (A>C) is the only SNP and it's
+    # a transversion, so titv = n_ts / n_tv = 0 / 1 = 0.0.
+    assert len(stats["contigs"]) == 1
+    assert stats["titv"] == pytest.approx(0.0)
+    # One inter-record gap (POS 100 -> 200, both on contig "1"), landing in
+    # a single gap_dist bin -- weights still sum to 1.0.
+    assert sum(stats["gap_dist"]["weights"]) == pytest.approx(1.0)
 
 
 # --------------------------------------------------------------------------

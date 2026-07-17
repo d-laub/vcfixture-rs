@@ -772,8 +772,12 @@ def compute_pvar_stats(lf: pl.LazyFrame) -> dict:
     small (contig count, histogram bin counts, or a one-row scalar frame) --
     never the full per-record or per-allele frame. All six queries below
     share two common subplans (the raw `lf` scan and the exploded `alleles`
-    scan), so `pl.collect_all` executes each of those scans once, not six
-    times, via polars' common-subplan elimination.
+    scan), but they are collected one at a time rather than via
+    `pl.collect_all`: `collect_all`'s common-subplan elimination *caches*
+    the shared 348M-row scan/explode output so it can be reused across the
+    six plans, costing +20 GB (26.4 GB vs 6.4 GB) for no real gain, since a
+    re-scan from warm page cache is both leaner and faster than holding a
+    materialised copy around.
     """
     assert_pvar_sorted(lf)
 
@@ -786,10 +790,17 @@ def compute_pvar_stats(lf: pl.LazyFrame) -> dict:
     indel_bins_lf = _indel_bins_lazy(alleles)
     titv_lf = _titv_lazy(alleles)
 
-    contig_df, gap_bins_df, multi_df, class_df, indel_bins_df, titv_df = pl.collect_all(
-        [contig_lf, gap_bins_lf, multi_lf, class_lf, indel_bins_lf, titv_lf],
-        engine="streaming",
-    )
+    # Collect each plan on its own rather than pl.collect_all: collect_all's
+    # common-subplan elimination *caches* the shared 348M-row scan/explode
+    # output, costing +20 GB (26.4 GB vs 6.4 GB) and buying nothing -- a
+    # re-scan from warm page cache is both leaner and faster than holding a
+    # materialised copy. Measured on the 348M-row somatic pvar.
+    contig_df = contig_lf.collect(engine="streaming")
+    gap_bins_df = gap_bins_lf.collect(engine="streaming")
+    multi_df = multi_lf.collect(engine="streaming")
+    class_df = class_lf.collect(engine="streaming")
+    indel_bins_df = indel_bins_lf.collect(engine="streaming")
+    titv_df = titv_lf.collect(engine="streaming")
 
     n, n_multi = multi_df.row(0)
     n_snps, n_ts = titv_df.row(0)
