@@ -57,8 +57,9 @@ pub enum BulkError {
 /// How many records to generate, and how that maps onto per-contig counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Size {
-    /// Exactly `n` records total, split across contigs proportional to each
-    /// contig's fitted density (see [`resolve_contig_stat`]).
+    /// Exactly `n` records total, split across contigs proportional to
+    /// fitted per-contig variant count (`n_variants`) (see
+    /// [`resolve_contig_stat`]).
     Records(u64),
     /// Exactly `n` records for *each* requested contig.
     RecordsPerContig(u64),
@@ -68,8 +69,9 @@ pub enum Size {
     /// compression settings — and the same (absent) mid-stream flush
     /// cadence — as the real write, so the measured size is exactly what
     /// the real write produces, not an estimate. Per-contig counts are
-    /// split proportional to fitted density, like [`Size::Records`]. See
-    /// [`BulkSpec::write`] and [`BulkSpec::resolve_target_counts`].
+    /// split proportional to fitted per-contig variant count (`n_variants`),
+    /// like [`Size::Records`]. See [`BulkSpec::write`] and
+    /// [`BulkSpec::resolve_target_counts`].
     Target(u64),
 }
 
@@ -309,7 +311,7 @@ impl BulkSpec {
 
         let counts: Vec<u64> = match self.size {
             Size::RecordsPerContig(n) => vec![n; self.contig_ids.len()],
-            Size::Records(total) => distribute_by_density(fitted, &self.contig_ids, total),
+            Size::Records(total) => distribute_by_n_variants(fitted, &self.contig_ids, total),
             Size::Target(target_bytes) => {
                 self.resolve_target_counts(&pool, &samplers, fitted, target_bytes)?
             }
@@ -498,11 +500,12 @@ impl BulkSpec {
     /// scale with the largest contig alone.
     ///
     /// Both the initial guess and each round's top-up are split
-    /// proportional to each contig's fitted density via
-    /// [`distribute_by_density`] — the same helper [`Size::Records`] uses —
-    /// rather than an even split, so `Size::Target`'s per-contig realism
-    /// matches `Size::Records`'s. This is pure arithmetic on already-fitted
-    /// statistics (no new randomness), so it does not affect determinism.
+    /// proportional to each contig's fitted per-contig variant count
+    /// (`n_variants`) via [`distribute_by_n_variants`] — the same helper
+    /// [`Size::Records`] uses — rather than an even split, so
+    /// `Size::Target`'s per-contig realism matches `Size::Records`'s. This
+    /// is pure arithmetic on already-fitted statistics (no new randomness),
+    /// so it does not affect determinism.
     fn resolve_target_counts(
         &self,
         pool: &rayon::ThreadPool,
@@ -515,7 +518,7 @@ impl BulkSpec {
 
         let n_contigs = self.contig_ids.len() as u64;
         let mut per_contig_count =
-            distribute_by_density(fitted, &self.contig_ids, INITIAL_PER_CONTIG * n_contigs);
+            distribute_by_n_variants(fitted, &self.contig_ids, INITIAL_PER_CONTIG * n_contigs);
 
         for _round in 0..MAX_ROUNDS {
             let bytes = self.measure_compressed_bytes(pool, samplers, fitted, &per_contig_count)?;
@@ -528,7 +531,7 @@ impl BulkSpec {
             let bytes_per_record = (bytes as f64 / total_records.max(1) as f64).max(1.0);
             let shortfall = (target_bytes - bytes) as f64;
             let extra = ((shortfall / bytes_per_record) * 1.15).ceil() as u64 + 1;
-            let extra_split = distribute_by_density(fitted, &self.contig_ids, extra);
+            let extra_split = distribute_by_n_variants(fitted, &self.contig_ids, extra);
             for (c, e) in per_contig_count.iter_mut().zip(&extra_split) {
                 *c += e;
             }
@@ -709,15 +712,23 @@ fn normalize_contig_id(id: &str) -> String {
 }
 
 /// Splits `total` records across `contig_ids` proportional to each
-/// contig's fitted density (via [`resolve_contig_stat`]), using the
-/// largest-remainder method so the per-contig counts sum to exactly
-/// `total`. Falls back to an even split if every resolved weight is zero
-/// (a degenerate profile), rather than dividing by zero.
-fn distribute_by_density(fitted: &Fitted, contig_ids: &[String], total: u64) -> Vec<u64> {
+/// contig's fitted per-contig variant count (`n_variants`, via
+/// [`resolve_contig_stat`]), using the largest-remainder method so the
+/// per-contig counts sum to exactly `total`. Falls back to an even split if
+/// every resolved weight is zero (a degenerate profile), rather than
+/// dividing by zero.
+///
+/// Weighting by `n_variants` rather than `density_per_kb`: output density is
+/// a *global* `1/mean(gap)` draw (`gap_dist` is not fit per contig), so a
+/// per-contig fitted density is never actually reproduced by this split --
+/// and an outlier contig (e.g. MT at ~350/kb, ~12x the rest) would skew the
+/// split for a statistic the output doesn't even follow. `n_variants`, by
+/// contrast, reproduces the source's real per-contig variant distribution.
+fn distribute_by_n_variants(fitted: &Fitted, contig_ids: &[String], total: u64) -> Vec<u64> {
     let weights: Vec<f64> = contig_ids
         .iter()
         .enumerate()
-        .map(|(i, id)| resolve_contig_stat(fitted, i, id).density_per_kb.max(0.0))
+        .map(|(i, id)| resolve_contig_stat(fitted, i, id).n_variants as f64)
         .collect();
     let weight_sum: f64 = weights.iter().sum();
     let n = contig_ids.len() as u64;
@@ -812,5 +823,37 @@ fn format_map(key: &str) -> Map<HeaderFormatMap> {
             "Per-sample component statistics for Fisher strand bias",
         ),
         other => Map::<HeaderFormatMap>::from(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A profile where n_variants order != density order, so the two split
+    // strategies give different answers.
+    const DISCRIMINATING_PROFILE: &str = r#"{
+      "name": "disc", "provenance": {"source":"x","n_samples_source":10,
+        "n_variants_source":11000,"fitted_on":"2026-01-01","fit_tool_version":"t",
+        "supplied":["ploidy"]},
+      "fitted": { "contigs": [
+          { "id": "big", "n_variants": 10000, "density_per_kb": 10.0 },
+          { "id": "small", "n_variants": 1000, "density_per_kb": 90.0 }
+        ],
+        "gap_dist": {"edges":[1.0,2.0],"weights":[1.0]},
+        "sfs": {"edges":[1.0,2.0],"weights":[1.0]},
+        "variant_classes": {"snp":1.0,"insertion":0.0,"deletion":0.0,"mnp":0.0,"complex":0.0,"symbolic":0.0},
+        "indel_length": {"edges":[1.0,2.0],"weights":[1.0]},
+        "titv": 2.0, "multiallelic_rate": 0.0, "missing_rate": 0.0, "phased_rate": 1.0
+      },
+      "dialed": { "payload": "gt-only", "ploidy": 2 }
+    }"#;
+
+    #[test]
+    fn records_split_follows_n_variants_not_density() {
+        let p = Profile::from_json(DISCRIMINATING_PROFILE).unwrap();
+        let ids = vec!["big".to_string(), "small".to_string()];
+        let counts = distribute_by_n_variants(&p.fitted, &ids, 11_000);
+        assert_eq!(counts, vec![10_000, 1_000]);
     }
 }
