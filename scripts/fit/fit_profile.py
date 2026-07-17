@@ -174,15 +174,21 @@ def _bucket_index_expr(value: pl.Expr, edges: Sequence[float]) -> pl.Expr:
     """
     edges = _validate_edges(edges)
     n_bins = len(edges) - 1
+    if n_bins == 1:
+        # single bin is closed on both ends, matching numpy.histogram
+        return (
+            pl.when((value >= edges[0]) & (value <= edges[1]))
+            .then(pl.lit(0, dtype=pl.Int64))
+            .otherwise(None)
+        )
     expr = pl.when((value >= edges[0]) & (value < edges[1])).then(pl.lit(0, dtype=pl.Int64))
     for i in range(1, n_bins - 1):
         expr = expr.when((value >= edges[i]) & (value < edges[i + 1])).then(
             pl.lit(i, dtype=pl.Int64)
         )
-    if n_bins > 1:
-        expr = expr.when((value >= edges[-2]) & (value <= edges[-1])).then(
-            pl.lit(n_bins - 1, dtype=pl.Int64)
-        )
+    expr = expr.when((value >= edges[-2]) & (value <= edges[-1])).then(
+        pl.lit(n_bins - 1, dtype=pl.Int64)
+    )
     return expr.otherwise(None)
 
 

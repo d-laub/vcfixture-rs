@@ -5,6 +5,7 @@ import subprocess
 import warnings
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 import pytest
 
@@ -13,6 +14,7 @@ from fit_profile import (
     INDEL_EDGES,
     build_profile,
     classify,
+    _bucket_index_expr,
     _classify_df,
     _explode_alleles,
     _gap_bins_lazy,
@@ -153,6 +155,15 @@ def test_histogram_does_not_warn_when_all_values_in_range():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         histogram([1, 1, 2, 5], edges=[1, 2, 10, 100])
+
+
+def test_bucket_index_single_bin_includes_last_edge():
+    edges = [1.0, 10.0]  # one bin, closed [1, 10]
+    df = pl.DataFrame({"v": [1.0, 5.0, 10.0, 10.0, 0.5, 11.0]})
+    got = df.select(_bucket_index_expr(pl.col("v"), edges).alias("b"))["b"].to_list()
+    counts, _ = np.histogram(df["v"].to_numpy(), bins=edges)
+    assert counts.tolist() == [4]
+    assert got == [0, 0, 0, 0, None, None]
 
 
 # --------------------------------------------------------------------------
