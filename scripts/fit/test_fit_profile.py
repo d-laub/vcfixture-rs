@@ -7,6 +7,7 @@ import polars as pl
 import pytest
 
 from fit_profile import (
+    CLASS_NAMES,
     INDEL_EDGES,
     build_profile,
     classify,
@@ -64,6 +65,7 @@ def test_build_profile_emits_schema_valid_json():
         missing_rate=0.0,
         phased_rate=1.0,
         ploidy=2,
+        supplied=["ploidy"],
     )
     j = json.loads(json.dumps(p))
     assert set(j) == {"name", "provenance", "fitted", "dialed"}
@@ -75,6 +77,22 @@ def test_build_profile_emits_schema_valid_json():
     assert j["dialed"]["ploidy"] == 2
     # provenance must be populated, never left as a placeholder
     assert j["provenance"]["n_samples_source"] == 10
+
+
+def test_build_profile_records_supplied_fields():
+    prof = build_profile(
+        name="t", source="x", n_samples=10,
+        contigs=[{"id": "chr1", "n_variants": 100, "density_per_kb": 40.0}],
+        gap_dist={"edges": [1.0, 2.0], "weights": [1.0]},
+        sfs={"edges": [1.0, 2.0], "weights": [1.0]},
+        indel_length={"edges": [1.0, 2.0], "weights": [1.0]},
+        class_counts={n: 1 for n in CLASS_NAMES},
+        titv=2.0, multiallelic_rate=0.1, missing_rate=0.0,
+        phased_rate=1.0, ploidy=2, supplied=["ploidy", "phased_rate"],
+    )
+    assert prof["provenance"]["supplied"] == ["phased_rate", "ploidy"]
+    assert "ploidy" not in prof["fitted"]
+    assert prof["dialed"]["ploidy"] == 2
 
 
 # --------------------------------------------------------------------------

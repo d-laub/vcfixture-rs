@@ -32,6 +32,8 @@ pub struct Provenance {
     pub n_variants_source: u64,
     pub fitted_on: String,
     pub fit_tool_version: String,
+    #[serde(default)]
+    pub supplied: Vec<String>,
 }
 
 /// Statistics estimated from a real cohort. Never hand-pick values here.
@@ -370,6 +372,15 @@ mod tests {
     fn ploidy_lives_in_dialed_not_fitted() {
         let p = Profile::builtin("germline-1kgp").unwrap();
         assert_eq!(p.dialed.ploidy, 2);
+    }
+
+    #[test]
+    fn sites_only_profile_marks_phased_rate_supplied() {
+        // germline-1kgp-unphased is fitted from a sites-only VCF, so
+        // phased_rate and n_samples are supplied, not measured.
+        let p = Profile::builtin("germline-1kgp-unphased").unwrap();
+        assert!(p.provenance.supplied.contains(&"ploidy".to_string()));
+        assert!(p.provenance.supplied.contains(&"phased_rate".to_string()));
     }
 
     #[test]

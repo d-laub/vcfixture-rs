@@ -5,7 +5,8 @@
     "n_samples_source": 3202,
     "n_variants_source": 73652396,
     "fitted_on": "2026-07-16",
-    "fit_tool_version": "0.1.0"
+    "fit_tool_version": "0.1.0",
+    "supplied": ["ploidy"]
   },
   "fitted": {
     "contigs": [

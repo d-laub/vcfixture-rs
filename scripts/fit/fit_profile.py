@@ -420,6 +420,7 @@ def build_profile(
     missing_rate: float,
     phased_rate: float,
     ploidy: int,
+    supplied: list[str],
     payload: str = "gt-only",
     n_variants_source: int | None = None,
 ) -> dict:
@@ -436,6 +437,13 @@ def build_profile(
     never hand-picked here. `dialed.payload` and `dialed.ploidy` are the
     deliberate exceptions: they are generation choices, not fitted
     statistics.
+
+    `supplied` names every field the caller passed in rather than measured
+    from the source data (e.g. `ploidy` always; `phased_rate`/`n_samples`
+    too when fitting from a sites-only VCF, since neither is derivable from
+    one) -- it makes which values in "fitted"/"dialed" are hand-supplied,
+    not measured, auditable from the JSON alone. No default: callers must
+    say explicitly.
     """
     if n_variants_source is None:
         n_variants_source = sum(c["n_variants"] for c in contigs)
@@ -459,6 +467,7 @@ def build_profile(
             "n_variants_source": n_variants_source,
             "fitted_on": _dt.date.today().isoformat(),
             "fit_tool_version": __version__,
+            "supplied": sorted(supplied),
         },
         "fitted": fitted,
         "dialed": {"payload": payload, "ploidy": ploidy},
@@ -1018,6 +1027,7 @@ def _fit_from_pgen(args: argparse.Namespace) -> dict:
         phased_rate=phased_rate,
         ploidy=args.ploidy,
         payload=args.payload,
+        supplied=["ploidy"],
     )
 
 
@@ -1054,6 +1064,7 @@ def _fit_from_sites_vcf(args: argparse.Namespace) -> dict:
         phased_rate=args.phased_rate,
         ploidy=args.ploidy,
         payload=args.payload,
+        supplied=["ploidy", "phased_rate", "n_samples"],
     )
 
 
