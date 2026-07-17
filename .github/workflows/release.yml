@@ -34,6 +34,11 @@ jobs:
           push: false
           changelog_increment_filename: .release-notes.md
 
+      # commitizen-action is a Docker action running as root, so the objects and
+      # files it writes are root-owned and unwritable by the runner user.
+      - name: Reclaim workspace ownership
+        run: sudo chown -R "$(id -u):$(id -g)" .
+
       # commitizen bumps Cargo.toml but not Cargo.lock; sync it and amend it into
       # the bump commit so the committed lockfile is never stale.
       - name: Sync lockfile and push
