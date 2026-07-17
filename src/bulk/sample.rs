@@ -197,8 +197,8 @@ impl Samplers {
             transition
         } else {
             let transversions: [u8; 2] = match ref_base {
-                b'A' | b'G' => [b'C', b'T'],
-                _ => [b'A', b'G'],
+                b'A' | b'G' => *b"CT",
+                _ => *b"AG",
             };
             transversions[rng.gen_range(0..2)]
         }

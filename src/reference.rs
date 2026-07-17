@@ -8,7 +8,7 @@ use rand_chacha::ChaCha8Rng;
 
 use crate::error::BuildError;
 
-const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+const BASES: [u8; 4] = *b"ACGT";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VariantKlass {
