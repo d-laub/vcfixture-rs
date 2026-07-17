@@ -638,17 +638,52 @@ def _gap_bins_lazy(lf: pl.LazyFrame) -> pl.LazyFrame:
     position, so exploding first would fabricate spurious zero-length gaps
     between the alleles of the same site.
 
+    `lf` is assumed coordinate-sorted within each contig (plink2 emits pvar
+    sorted by CHROM, POS; guarded by `assert_pvar_sorted`). Gaps are a
+    straight `POS.diff()` masked to same-contig adjacent rows (`CHROM ==
+    CHROM.shift(1)`), NOT `sort().diff().over("CHROM")`: the sort is a
+    full-frame pipeline breaker and `.over()` is a non-streaming window,
+    which together cost ~20 GB at genome scale (348M rows). shift+mask
+    streams in ~220 MB and is bit-identical on sorted input.
+
     Returns the `histogram_lazy` bin-count frame directly (bounded by
     `GAP_N_BINS`), never the underlying gaps themselves -- a 1kGP-scale
     contig can have tens of millions of gaps, which is exactly the array
     `read_pvar`'s docstring warns against materializing.
     """
     gaps = (
-        lf.sort(["CHROM", "POS"])
-        .select(pl.col("POS").diff().over("CHROM").alias("gap"))
-        .filter(pl.col("gap").is_not_null() & (pl.col("gap") > 0))
+        lf.select(
+            pl.col("POS").diff().alias("gap"),
+            (pl.col("CHROM") == pl.col("CHROM").shift(1)).alias("same_contig"),
+        )
+        .filter(
+            pl.col("same_contig")
+            & pl.col("gap").is_not_null()
+            & (pl.col("gap") > 0)
+        )
+        .select("gap")
     )
     return histogram_lazy(gaps, pl.col("gap"), _gap_edges())
+
+
+def assert_pvar_sorted(lf: pl.LazyFrame) -> None:
+    """Fail if any within-contig POS is out of order (the precondition
+    `_gap_bins_lazy` relies on after dropping its sort). Streams: one boolean
+    reduction, bounded memory."""
+    bad = (
+        lf.select(
+            (pl.col("CHROM") == pl.col("CHROM").shift(1)).alias("same"),
+            (pl.col("POS") < pl.col("POS").shift(1)).alias("descending"),
+        )
+        .select((pl.col("same") & pl.col("descending")).sum().alias("n_desc"))
+        .collect(engine="streaming")
+        .item()
+    )
+    if bad:
+        raise ValueError(
+            f"pvar is not sorted within contigs ({bad} descending steps); "
+            "gap fitting requires coordinate-sorted input"
+        )
 
 
 def _class_counts_from_df(df: pl.DataFrame) -> dict[str, int]:
@@ -729,6 +764,8 @@ def compute_pvar_stats(lf: pl.LazyFrame) -> dict:
     scan), so `pl.collect_all` executes each of those scans once, not six
     times, via polars' common-subplan elimination.
     """
+    assert_pvar_sorted(lf)
+
     contig_lf = _contig_stats_lazy(lf)
     gap_bins_lf = _gap_bins_lazy(lf)
     multi_lf = _multiallelic_rate_lazy(lf)

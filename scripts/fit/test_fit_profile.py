@@ -15,17 +15,20 @@ from fit_profile import (
     classify,
     _classify_df,
     _explode_alleles,
+    _gap_bins_lazy,
     _gap_edges,
     _multiallelic_rate_from_row,
     _multiallelic_rate_lazy,
     _payload_choices,
     _sfs_edges,
+    assert_pvar_sorted,
     class_mix_from_counts,
     compute_pvar_stats,
     fit_missing_rate_from_sites_vcf,
     fit_sfs,
     fit_sfs_from_sites_vcf,
     histogram,
+    histogram_lazy,
     main,
     read_pvar,
     read_sites_vcf,
@@ -240,6 +243,37 @@ def test_multiallelic_rate_counts_records_not_alleles():
     })
     n, n_multi = _multiallelic_rate_lazy(df.lazy()).collect().row(0)
     assert _multiallelic_rate_from_row(n, n_multi) == pytest.approx(1 / 3)
+
+
+# --------------------------------------------------------------------------
+# _gap_bins_lazy: shift+mask must match sort+window on sorted input, and
+# assert_pvar_sorted must guard the precondition that makes them equal.
+# --------------------------------------------------------------------------
+
+
+def test_gap_bins_matches_sorted_window_reference():
+    lf = pl.LazyFrame({
+        "CHROM": ["1","1","1","2","2"],
+        "POS":   [100, 250, 251, 5, 30],
+        "ID": ["."]*5, "REF": ["A"]*5, "ALT": ["T"]*5,
+    })
+    got = _gap_bins_lazy(lf).collect()
+    ref_gaps = (lf.sort(["CHROM","POS"])
+        .select(pl.col("POS").diff().over("CHROM").alias("gap"))
+        .filter(pl.col("gap").is_not_null() & (pl.col("gap") > 0)))
+    ref = histogram_lazy(ref_gaps, pl.col("gap"), _gap_edges()).collect()
+    # group_by("_bin") has no defined row order (confirmed non-deterministic
+    # across repeated runs even between two logically-identical plans), so
+    # sort by the bin index before comparing -- the invariant under test is
+    # bit-identical bin *counts*, not group_by iteration order.
+    assert got.sort("_bin").equals(ref.sort("_bin"))
+
+
+def test_assert_pvar_sorted_rejects_unsorted():
+    lf = pl.LazyFrame({"CHROM": ["1","1"], "POS": [200, 100],
+                       "ID": [".","."], "REF": ["A","A"], "ALT": ["T","T"]})
+    with pytest.raises(ValueError, match="not sorted"):
+        assert_pvar_sorted(lf)
 
 
 def test_read_pvar_skips_meta_and_reads_all_rows(tmp_path):
