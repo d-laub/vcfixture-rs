@@ -435,7 +435,7 @@ fn duplicate_contig_names_are_rejected() {
     );
 }
 
-/// `SampleStats::value_for` (`src/bulk/gen.rs`) hard-codes `AD` as a
+/// `SampleStats::value_for` (`src/bulk/generate.rs`) hard-codes `AD` as a
 /// 2-element `[n_ref, n_alt]` and `PL` as a fixed 3-element diploid
 /// likelihood triple -- correct only for `ploidy == 2`. `Profile::validate`
 /// only requires `ploidy >= 1`, so a ploidy-3 profile combined with a

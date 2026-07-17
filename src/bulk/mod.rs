@@ -5,11 +5,11 @@
 //! `docs/superpowers/specs/2026-07-16-bulk-generation-design.md`.
 //!
 //! [`BulkSpec`] is the public entry point: a builder over a [`Profile`] that
-//! ties the samplers ([`sample`]), the record generator ([`gen`]), the
+//! ties the samplers ([`sample`]), the record generator ([`generate`]), the
 //! streaming writer ([`writer`]), and the summary truth ([`summary`])
 //! together into one `write(path)` call.
 
-pub mod gen;
+pub mod generate;
 pub mod profile;
 pub mod sample;
 pub mod summary;
@@ -32,7 +32,7 @@ use noodles_vcf::{
     },
 };
 
-use gen::{block_rng, gen_record, to_record_buf, GenRecord};
+use generate::{block_rng, gen_record, to_record_buf, GenRecord};
 use profile::{ContigStat, Fitted};
 use sample::Samplers;
 use writer::BulkWriter;
@@ -75,7 +75,7 @@ pub enum Size {
 
 /// One generated record plus this call's phasing draw.
 ///
-/// [`GenRecord`] is Task 6's type ([`crate::bulk::gen`]) and out of scope to
+/// [`GenRecord`] is Task 6's type ([`crate::bulk::generate`]) and out of scope to
 /// modify here, and it has no `phased` field (phasing is a per-record
 /// decision only [`to_record_buf`] needs, not part of the site/genotype
 /// generation `gen_record` performs) — so it is tracked alongside, not
@@ -296,7 +296,7 @@ impl BulkSpec {
         }
 
         let fitted = &self.profile.fitted;
-        // `SampleStats::value_for` (`gen.rs`) hard-codes `AD`/`PL` values
+        // `SampleStats::value_for` (`generate.rs`) hard-codes `AD`/`PL` values
         // sized for exactly 2 allele calls per sample (diploid): `AD` is a
         // 2-element `[n_ref, n_alt]`, `PL` a fixed 3-element diploid
         // likelihood triple. A profile with `ploidy != 2` would declare a
@@ -780,8 +780,8 @@ fn distribute_by_density(fitted: &Fitted, contig_ids: &[String], total: u64) -> 
 
 /// The ordered FORMAT key list for one [`Payload`] preset.
 ///
-/// Must stay in sync with `gen::to_record_buf`'s own (private) `key_names`
-/// match — duplicated here rather than shared because `gen.rs` is out of
+/// Must stay in sync with `generate::to_record_buf`'s own (private) `key_names`
+/// match — duplicated here rather than shared because `generate.rs` is out of
 /// scope to modify for this task. `payload_presets_all_write_readable_files`
 /// (`tests/bulk.rs`) is the safety net: any drift would surface as a
 /// "missing FORMAT header record" write error, not a silent mismatch.
@@ -805,7 +805,7 @@ fn payload_keys(payload: &Payload) -> &'static [&'static str] {
 /// definition for free from `Map::from(key)`. `VAF`/`AF` (as a per-sample
 /// FORMAT field, not the INFO field), `F1R2`, `F2R1`, and `SB` are GATK/
 /// Mutect2 conventions, not VCF-reserved, so they need an explicit
-/// definition matching exactly what `gen::SampleStats::value_for` emits.
+/// definition matching exactly what `generate::SampleStats::value_for` emits.
 fn format_map(key: &str) -> Map<HeaderFormatMap> {
     match key {
         "VAF" | "AF" => Map::<HeaderFormatMap>::new(
