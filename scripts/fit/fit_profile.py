@@ -295,6 +295,41 @@ def _classify_expr(ref: pl.Expr, alt: pl.Expr) -> pl.Expr:
     )
 
 
+def _count_leading_meta_lines(path: str | Path) -> int:
+    """Count leading ``##`` metadata lines so scan_csv can `skip_lines` past
+    them instead of `comment_prefix='##'` (which forces polars to materialise
+    the whole file -- measured 6.2 GB / 3x slower on a 5.9 GB somatic pvar).
+
+    Handles the pvar's optional .zst compression: the meta block is a small
+    text prefix, so only the first chunk needs decompressing. The `.zst`
+    branch requires the optional `zstandard` package (not a hard dependency
+    of the `fit` env); it is only imported when a `.zst` path is passed.
+    """
+    p = str(path)
+    if p.endswith(".zst"):
+        import zstandard  # in the `fit` env
+
+        n = 0
+        with open(p, "rb") as raw:
+            dctx = zstandard.ZstdDecompressor()
+            with dctx.stream_reader(raw) as r:
+                buf = r.read(1 << 16).split(b"\n")
+                for line in buf:
+                    if line.startswith(b"##"):
+                        n += 1
+                    else:
+                        break
+        return n
+    n = 0
+    with open(p, "rb") as fh:
+        for line in fh:
+            if line.startswith(b"##"):
+                n += 1
+            else:
+                break
+    return n
+
+
 def read_pvar(path: str | Path) -> pl.LazyFrame:
     """Lazily scan a `.pvar` or `.pvar.zst` file, keeping only #CHROM/POS/ID/REF/ALT.
 
@@ -322,12 +357,17 @@ def read_pvar(path: str | Path) -> pl.LazyFrame:
     # "1" or "22" -- ContigStat.id is a String in src/bulk/profile.rs, and
     # letting polars infer it as an integer breaks every downstream
     # plink2 --chr argument (and str/int comparisons) built from it.
+    n_meta = _count_leading_meta_lines(path)
     lf = pl.scan_csv(
         str(path),
         separator="\t",
-        comment_prefix="##",
+        skip_lines=n_meta,
         schema_overrides={"#CHROM": pl.Utf8, "ID": pl.Utf8, "REF": pl.Utf8, "ALT": pl.Utf8},
     ).rename({"#CHROM": "CHROM"})
+    # ID is carried only to keep read_pvar/read_sites_vcf schemas identical
+    # for compute_pvar_stats; nothing reads it, and in this file it is "."
+    # (REF/ALT carry the wide strings), so dropping it saves ~0 memory --
+    # keep it for schema parity with read_sites_vcf's fabricated ID.
     return lf.select(["CHROM", "POS", "ID", "REF", "ALT"])
 
 

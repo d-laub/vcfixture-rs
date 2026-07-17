@@ -27,6 +27,7 @@ from fit_profile import (
     fit_sfs_from_sites_vcf,
     histogram,
     main,
+    read_pvar,
     read_sites_vcf,
 )
 
@@ -239,6 +240,23 @@ def test_multiallelic_rate_counts_records_not_alleles():
     })
     n, n_multi = _multiallelic_rate_lazy(df.lazy()).collect().row(0)
     assert _multiallelic_rate_from_row(n, n_multi) == pytest.approx(1 / 3)
+
+
+def test_read_pvar_skips_meta_and_reads_all_rows(tmp_path):
+    p = tmp_path / "t.pvar"
+    p.write_text(
+        "##fileformat=PVARv1.0\n"
+        "##contig=<ID=1>\n"
+        "#CHROM\tPOS\tID\tREF\tALT\n"
+        "1\t100\t.\tA\tG\n"
+        "1\t200\t.\tC\tT\n"
+        "2\t50\t.\tG\tA\n"
+    )
+    lf = read_pvar(p)
+    df = lf.collect()
+    assert df.height == 3
+    assert df["CHROM"].to_list() == ["1", "1", "2"]
+    assert df["POS"].to_list() == [100, 200, 50]
 
 
 def test_compute_pvar_stats_gives_two_class_and_two_indel_observations_per_multiallelic_site():
