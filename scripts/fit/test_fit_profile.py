@@ -21,6 +21,7 @@ from fit_profile import (
     _multiallelic_rate_lazy,
     _payload_choices,
     _sfs_edges,
+    _titv_lazy,
     assert_pvar_sorted,
     class_mix_from_counts,
     compute_pvar_stats,
@@ -243,6 +244,22 @@ def test_multiallelic_rate_counts_records_not_alleles():
     })
     n, n_multi = _multiallelic_rate_lazy(df.lazy()).collect().row(0)
     assert _multiallelic_rate_from_row(n, n_multi) == pytest.approx(1 / 3)
+
+
+# --------------------------------------------------------------------------
+# _titv_lazy: direct (REF,ALT) comparisons must match the
+# concat_str().is_in(TRANSITION_PAIRS) reference behavior.
+# --------------------------------------------------------------------------
+
+
+def test_titv_direct_matches_is_in_reference():
+    alleles = pl.LazyFrame({
+        "class": ["snp","snp","snp","snp","insertion"],
+        "REF":   ["A","G","C","A","A"],
+        "ALT":   ["G","A","T","C","AT"],  # A>G, G>A, C>T ts; A>C tv
+    })
+    got = _titv_lazy(alleles).collect().row(0)  # (n_snps, n_ts)
+    assert got == (4, 3)
 
 
 # --------------------------------------------------------------------------

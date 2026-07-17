@@ -83,8 +83,6 @@ INDEL_EDGES = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 10.0, 20.0, 50.0, 100.0, 1000.0]
 # Log-spaced bins over [1, 1e5] for inter-variant gaps (bp).
 GAP_LOW, GAP_HIGH, GAP_N_BINS = 1.0, 1e5, 24
 
-TRANSITION_PAIRS = frozenset({"AG", "GA", "CT", "TC"})
-
 
 # --------------------------------------------------------------------------
 # Schema-facing helpers (unit tested directly, see test_fit_profile.py)
@@ -722,10 +720,23 @@ def _multiallelic_rate_from_row(n: int, n_multi: int) -> float:
 
 
 def _titv_lazy(alleles: pl.LazyFrame) -> pl.LazyFrame:
-    """SNP count and transition count (both scalars) over a per-ALLELE frame."""
+    """SNP count and transition count (both scalars) over a per-ALLELE frame.
+
+    Transitions are the four purine<->purine / pyrimidine<->pyrimidine pairs,
+    expressed as direct (REF,ALT) comparisons rather than
+    `concat_str([REF,ALT]).is_in(TRANSITION_PAIRS)`: measured, the `is_in`
+    against a literal list costs ~10 GB extra at 348M rows (16.7 GB vs the
+    6.4 GB scan floor) for a bit-identical result.
+    """
     snps = alleles.filter(pl.col("class") == "snp")
-    pair = pl.concat_str([pl.col("REF"), pl.col("ALT")])
-    return snps.select(n_snps=pl.len(), n_ts=pair.is_in(TRANSITION_PAIRS).sum())
+    r, a = pl.col("REF"), pl.col("ALT")
+    is_ts = (
+        ((r == "A") & (a == "G"))
+        | ((r == "G") & (a == "A"))
+        | ((r == "C") & (a == "T"))
+        | ((r == "T") & (a == "C"))
+    )
+    return snps.select(n_snps=pl.len(), n_ts=is_ts.sum())
 
 
 def _titv_from_row(n_snps: int, n_ts: int) -> float:
