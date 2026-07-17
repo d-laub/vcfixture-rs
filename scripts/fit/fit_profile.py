@@ -1068,6 +1068,44 @@ def _fit_from_sites_vcf(args: argparse.Namespace) -> dict:
     )
 
 
+def _validate_with_rust(path: Path) -> None:
+    """Self-check a freshly-written profile against `Profile::validate`.
+
+    Runs ``cargo run -q --features bulk --bin validate-profile -- <path>``
+    (from the repo root, so it works regardless of the caller's cwd) --
+    the exact same `Profile::from_json` + `Profile::validate` a profile
+    goes through once the crate embeds it via ``include_str!``. This turns
+    a bad fit (e.g. `titv <= 0`, `ploidy == 0`, a NaN histogram bin) into
+    an immediate failure here instead of a much-later failure inside the
+    Rust crate.
+
+    Behavior:
+    - If ``cargo`` is not found on ``PATH`` (e.g. a Python-only sandbox
+      with no Rust toolchain), prints a warning and returns without
+      running anything -- this check is a courtesy, not a hard dependency
+      of fitting a profile.
+    - If the validator exits non-zero, raises ``SystemExit`` carrying its
+      stderr as the message, which aborts `main()` with exit status 1 and
+      prints that stderr for the caller to see.
+    - On success (exit 0), returns silently.
+    """
+    if shutil.which("cargo") is None:
+        warnings.warn(
+            f"cargo not found on PATH; skipping Rust validation of {path}",
+            stacklevel=2,
+        )
+        return
+    repo_root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        ["cargo", "run", "-q", "--features", "bulk", "--bin", "validate-profile", "--", str(path)],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit(f"validate-profile rejected {path}:\n{result.stderr}")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Fit a vcfixture bulk-generation profile JSON from a real cohort."
@@ -1162,6 +1200,7 @@ def main(argv: list[str] | None = None) -> None:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(profile, indent=2) + "\n")
     print(f"wrote {args.out}")
+    _validate_with_rust(args.out)
 
 
 if __name__ == "__main__":

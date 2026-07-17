@@ -55,5 +55,10 @@ name = "vcfixture"
 path = "src/bin/vcfixture.rs"
 required-features = ["cli"]
 
+[[bin]]
+name = "validate-profile"
+path = "src/bin/validate_profile.rs"
+required-features = ["bulk"]
+
 [package.metadata.docs.rs]
 all-features = true

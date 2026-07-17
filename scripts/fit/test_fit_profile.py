@@ -29,6 +29,7 @@ from fit_profile import (
 
 PLINK2_AVAILABLE = shutil.which("plink2") is not None
 BCFTOOLS_AVAILABLE = shutil.which("bcftools") is not None
+CARGO_AVAILABLE = shutil.which("cargo") is not None
 
 
 def test_histogram_weights_are_one_shorter_than_edges():
@@ -598,3 +599,31 @@ def test_end_to_end_sites_vcf_produces_a_valid_profile(tmp_path):
     assert p["fitted"]["phased_rate"] == pytest.approx(0.9)
     # AN == 100 == 2 * n_samples everywhere -> no missingness.
     assert p["fitted"]["missing_rate"] == pytest.approx(0.0)
+
+
+# --------------------------------------------------------------------------
+# validate-profile binary: CI gate for freshly-written profiles
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not CARGO_AVAILABLE, reason="cargo not installed")
+def test_validate_profile_binary_rejects_nan(tmp_path):
+    prof = build_profile(
+        name="bad", source="x", n_samples=10,
+        contigs=[{"id": "chr1", "n_variants": 100, "density_per_kb": 40.0}],
+        gap_dist={"edges": [1.0, 2.0], "weights": [1.0]},
+        sfs={"edges": [1.0, 2.0], "weights": [1.0]},
+        indel_length={"edges": [1.0, 2.0], "weights": [1.0]},
+        class_counts={n: 1 for n in CLASS_NAMES},
+        titv=2.0, multiallelic_rate=0.1, missing_rate=0.0,
+        phased_rate=1.0, ploidy=2, supplied=["ploidy"],
+    )
+    prof["fitted"]["variant_classes"]["snp"] = float("nan")  # poison
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps(prof))
+    r = subprocess.run(
+        ["cargo", "run", "--quiet", "--features", "bulk",
+         "--bin", "validate-profile", "--", str(p)],
+        capture_output=True, text=True,
+    )
+    assert r.returncode != 0, r.stdout + r.stderr
