@@ -219,17 +219,18 @@ struct SampleStats {
 impl SampleStats {
     fn new(alleles: &[i8], phased: bool) -> SampleStats {
         let sep = if phased { '|' } else { '/' };
-        let gt = alleles
-            .iter()
-            .map(|a| {
-                if *a < 0 {
-                    ".".to_string()
-                } else {
-                    a.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(&sep.to_string());
+        let mut gt = String::with_capacity(alleles.len() * 2);
+        for (i, a) in alleles.iter().enumerate() {
+            if i > 0 {
+                gt.push(sep);
+            }
+            if *a < 0 {
+                gt.push('.');
+            } else {
+                use std::fmt::Write as _;
+                let _ = write!(gt, "{a}");
+            }
+        }
 
         let n_ref = alleles.iter().filter(|&&a| a == 0).count() as i32;
         let n_alt = alleles.iter().filter(|&&a| a == 1).count() as i32;
@@ -337,6 +338,14 @@ mod tests {
         let xc: u64 = c.random();
         assert_eq!(xa, xb, "same (seed, block) must give the same stream");
         assert_ne!(xa, xc, "different block must give a different stream");
+    }
+
+    #[test]
+    fn sample_stats_gt_string_is_unchanged_by_buffer_reuse() {
+        assert_eq!(SampleStats::new(&[0, 1], true).gt, "0|1");
+        assert_eq!(SampleStats::new(&[1, 1], false).gt, "1/1");
+        assert_eq!(SampleStats::new(&[-1, 0], false).gt, "./0");
+        assert_eq!(SampleStats::new(&[0, 1, 1], true).gt, "0|1|1");
     }
 
     #[test]
