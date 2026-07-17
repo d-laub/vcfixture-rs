@@ -305,11 +305,12 @@ impl BulkSpec {
         // malformed file rather than an error. `Profile::validate` only
         // requires `ploidy >= 1`, so this must be checked here.
         let keys = payload_keys(&self.payload);
-        if (keys.contains(&"PL") || keys.contains(&"AD")) && fitted.ploidy != 2 {
+        let ploidy = self.profile.dialed.ploidy;
+        if (keys.contains(&"PL") || keys.contains(&"AD")) && ploidy != 2 {
             return Err(BulkError::Invalid(format!(
                 "payload {:?} declares PL and/or AD, which are hard-coded for \
                  diploid (ploidy 2) genotype calls, but the profile's ploidy is {}",
-                self.payload, fitted.ploidy
+                self.payload, ploidy
             )));
         }
 
@@ -436,7 +437,7 @@ impl BulkSpec {
             return Vec::new();
         }
 
-        let ploidy = fitted.ploidy;
+        let ploidy = self.profile.dialed.ploidy;
         let n_samples = self.n_samples;
         let seed = self.seed;
         let n_blocks = n_records.div_ceil(Self::BLOCK_SIZE);

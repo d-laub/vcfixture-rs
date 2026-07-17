@@ -405,10 +405,9 @@ const NONUNIFORM_DENSITY_PROFILE: &str = r#"
     "titv": 2.05,
     "multiallelic_rate": 0.0,
     "missing_rate": 0.0,
-    "phased_rate": 1.0,
-    "ploidy": 2
+    "phased_rate": 1.0
   },
-  "dialed": { "payload": "gt-only" }
+  "dialed": { "payload": "gt-only", "ploidy": 2 }
 }
 "#;
 
@@ -516,9 +515,8 @@ const TRIPLOID_PROFILE: &str = r#"
     "titv": 2.05,
     "multiallelic_rate": 0.0,
     "missing_rate": 0.0,
-    "phased_rate": 1.0,
-    "ploidy": 3
+    "phased_rate": 1.0
   },
-  "dialed": { "payload": "gt-only" }
+  "dialed": { "payload": "gt-only", "ploidy": 3 }
 }
 "#;

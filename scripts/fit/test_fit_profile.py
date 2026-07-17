@@ -69,9 +69,10 @@ def test_build_profile_emits_schema_valid_json():
     assert set(j) == {"name", "provenance", "fitted", "dialed"}
     assert set(j["fitted"]) == {
         "contigs", "gap_dist", "sfs", "variant_classes", "indel_length",
-        "titv", "multiallelic_rate", "missing_rate", "phased_rate", "ploidy",
+        "titv", "multiallelic_rate", "missing_rate", "phased_rate",
     }
     assert j["dialed"]["payload"] in {"gt-only", "gt-vaf", "gatk", "mutect2"}
+    assert j["dialed"]["ploidy"] == 2
     # provenance must be populated, never left as a placeholder
     assert j["provenance"]["n_samples_source"] == 10
 
@@ -269,7 +270,7 @@ def _replica_validate_profile(p: dict) -> None:
     assert abs(sum(classmix.values()) - 1.0) < 1e-6
     for rate in ("multiallelic_rate", "missing_rate", "phased_rate"):
         assert 0.0 <= p["fitted"][rate] <= 1.0
-    assert p["fitted"]["ploidy"] >= 1
+    assert p["dialed"]["ploidy"] >= 1
     assert len(p["fitted"]["contigs"]) >= 1
 
 

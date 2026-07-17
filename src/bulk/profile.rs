@@ -46,7 +46,6 @@ pub struct Fitted {
     pub multiallelic_rate: f64,
     pub missing_rate: f64,
     pub phased_rate: f64,
-    pub ploidy: u8,
 }
 
 /// Per-contig variant count and density, as observed in the source cohort.
@@ -79,6 +78,7 @@ pub struct ClassMix {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Dialed {
     pub payload: Payload,
+    pub ploidy: u8,
 }
 
 /// Which per-sample/per-record fields to synthesize.
@@ -116,7 +116,7 @@ impl Profile {
         self.fitted.sfs.validate()?;
         self.fitted.indel_length.validate()?;
         self.fitted.variant_classes.validate()?;
-        if self.fitted.ploidy == 0 {
+        if self.dialed.ploidy == 0 {
             return Err(BulkError::Invalid("ploidy must be >= 1".into()));
         }
         for (label, v) in [
@@ -218,7 +218,7 @@ mod tests {
         let p = Profile::builtin("germline-1kgp").unwrap();
         assert_eq!(p.name, "germline-1kgp");
         assert_eq!(p.dialed.payload, Payload::GtOnly);
-        assert_eq!(p.fitted.ploidy, 2);
+        assert_eq!(p.dialed.ploidy, 2);
         p.validate().unwrap();
     }
 
@@ -364,6 +364,12 @@ mod tests {
             symbolic: 0.0,
         };
         assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn ploidy_lives_in_dialed_not_fitted() {
+        let p = Profile::builtin("germline-1kgp").unwrap();
+        assert_eq!(p.dialed.ploidy, 2);
     }
 
     #[test]

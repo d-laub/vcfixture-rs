@@ -150,10 +150,10 @@
     "titv": 1.172982069565233,
     "multiallelic_rate": 0.0,
     "missing_rate": 0.0,
-    "phased_rate": 0.7739293027319499,
-    "ploidy": 2
+    "phased_rate": 0.7739293027319499
   },
   "dialed": {
-    "payload": "gt-vaf"
+    "payload": "gt-vaf",
+    "ploidy": 2
   }
 }

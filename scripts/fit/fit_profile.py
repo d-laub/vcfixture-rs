@@ -433,8 +433,9 @@ def build_profile(
     (`main()`, via lazy polars aggregations) before it ever reaches this
     function. Every field under "fitted" is otherwise derived from
     `class_counts`/`contigs`/the scalar rates passed in by the caller --
-    never hand-picked here. `dialed.payload` is the one deliberate
-    exception: it is a generation choice, not a fitted statistic.
+    never hand-picked here. `dialed.payload` and `dialed.ploidy` are the
+    deliberate exceptions: they are generation choices, not fitted
+    statistics.
     """
     if n_variants_source is None:
         n_variants_source = sum(c["n_variants"] for c in contigs)
@@ -449,7 +450,6 @@ def build_profile(
         "multiallelic_rate": multiallelic_rate,
         "missing_rate": missing_rate,
         "phased_rate": phased_rate,
-        "ploidy": ploidy,
     }
     return {
         "name": name,
@@ -461,7 +461,7 @@ def build_profile(
             "fit_tool_version": __version__,
         },
         "fitted": fitted,
-        "dialed": {"payload": payload},
+        "dialed": {"payload": payload, "ploidy": ploidy},
     }
 
 

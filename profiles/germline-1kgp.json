@@ -261,10 +261,10 @@
     "titv": 2.0563938643992925,
     "multiallelic_rate": 0.0,
     "missing_rate": 0.0001374522952447152,
-    "phased_rate": 1.0,
-    "ploidy": 2
+    "phased_rate": 1.0
   },
   "dialed": {
-    "payload": "gt-only"
+    "payload": "gt-only",
+    "ploidy": 2
   }
 }
