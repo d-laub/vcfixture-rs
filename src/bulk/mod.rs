@@ -462,7 +462,7 @@ impl BulkSpec {
                         // from the same block-local RNG, right after the
                         // record it applies to, so the block's stream stays
                         // a pure function of `(seed, block_idx)` alone.
-                        let phased = rng.gen::<f64>() < fitted.phased_rate;
+                        let phased = rng.random::<f64>() < fitted.phased_rate;
                         recs.push(Rec { g, phased });
                     }
                     (recs, local_pos)

@@ -64,10 +64,10 @@ impl HistSampler {
     /// `sfs` histogram's `[1, 2)` singleton bin, which must map to exactly
     /// `1`, never `2`).
     fn sample<R: Rng>(&self, rng: &mut R) -> f64 {
-        let u: f64 = rng.gen();
+        let u: f64 = rng.random();
         let bin = self.cdf.partition_point(|c| *c < u).min(self.cdf.len() - 1);
         let (lo, hi) = (self.edges[bin], self.edges[bin + 1]);
-        rng.gen_range(lo..hi)
+        rng.random_range(lo..hi)
     }
 }
 
@@ -166,7 +166,7 @@ impl Samplers {
 
     /// Draw a structural variant class from the fitted class mix.
     pub fn class<R: Rng>(&self, rng: &mut R) -> VariantClass {
-        let u: f64 = rng.gen();
+        let u: f64 = rng.random();
         let i = self.class_cdf.partition_point(|c| *c < u).min(5);
         [
             VariantClass::Snp,
@@ -180,7 +180,7 @@ impl Samplers {
 
     /// Draw a uniformly random base, one of `b"ACGT"`.
     pub fn base<R: Rng>(&self, rng: &mut R) -> u8 {
-        b"ACGT"[rng.gen_range(0..4)]
+        b"ACGT"[rng.random_range(0..4)]
     }
 
     /// Draw a SNP ALT base `!= ref_base`, with transitions drawn at
@@ -193,14 +193,14 @@ impl Samplers {
             b'T' => b'C',
             _ => b'A',
         };
-        if rng.gen::<f64>() < self.ti_frac {
+        if rng.random::<f64>() < self.ti_frac {
             transition
         } else {
             let transversions: [u8; 2] = match ref_base {
                 b'A' | b'G' => *b"CT",
                 _ => *b"AG",
             };
-            transversions[rng.gen_range(0..2)]
+            transversions[rng.random_range(0..2)]
         }
     }
 }
