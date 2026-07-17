@@ -1,7 +1,7 @@
 #![cfg(feature = "bulk")]
 
 use std::num::NonZero;
-use vcfixture::bulk::{BulkError, BulkSpec, Payload, Profile, Size};
+use vcfixture::bulk::{BulkError, BulkSpec, Format, Payload, Profile, Size};
 
 fn spec() -> BulkSpec {
     BulkSpec::new(Profile::builtin("germline-1kgp").unwrap())
@@ -183,6 +183,35 @@ fn target_size_lands_near_the_target() {
         "overshoot too large: {got} vs target {target} (max allowed {max_allowed}, \
          i.e. {MAX_OVERSHOOT_FRACTION} of target)"
     );
+}
+
+/// Guards the calibrate+promote rewrite of `resolve_target_counts`: two runs
+/// of the same seed and target must produce byte-identical output. This is
+/// weaker than asserting the resolved per-contig counts directly (no new
+/// `Summary` accessor needed for that), but it is sufficient to catch any
+/// nondeterminism the rewrite could introduce -- e.g. the corrective rounds
+/// depending on wall-clock-observed byte counts rather than purely on
+/// `(seed, contig, count)`.
+#[test]
+fn target_size_is_byte_identical_across_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = Profile::from_json(NONUNIFORM_DENSITY_PROFILE).unwrap();
+    let run = |name: &str| {
+        let out = dir.path().join(name);
+        BulkSpec::new(profile.clone())
+            .samples(4)
+            .contigs(["1", "2", "3"])
+            .format(Format::VcfGz)
+            .size(Size::Target(512 * 1024))
+            .seed(99)
+            .write(&out)
+            .unwrap();
+        std::fs::read(&out).unwrap()
+    };
+    let a = run("a.vcf.gz");
+    let b = run("b.vcf.gz");
+    assert!(a.len() as u64 >= 512 * 1024, "must reach target");
+    assert_eq!(a, b, "calibrate+promote must be byte-identical run to run");
 }
 
 #[test]

@@ -64,14 +64,17 @@ pub enum Size {
     /// Exactly `n` records for *each* requested contig.
     RecordsPerContig(u64),
     /// Grow the output until its compressed size is `>= n` bytes, then stop.
-    /// May overshoot, but never undershoot: each candidate is measured by
-    /// writing it to a temp file through the same writer, format, and
+    /// May overshoot, but never undershoot: the record count is calibrated
+    /// from two cheap byte measurements (fitting `bytes ~= b0 + k*records`),
+    /// corrected by a few slope-based rounds if needed, each of which writes
+    /// a real candidate to a temp file through the same writer, format, and
     /// compression settings — and the same (absent) mid-stream flush
     /// cadence — as the real write, so the measured size is exactly what
-    /// the real write produces, not an estimate. Per-contig counts are
-    /// split proportional to fitted per-contig variant count (`n_variants`),
-    /// like [`Size::Records`]. See [`BulkSpec::write`] and
-    /// [`BulkSpec::resolve_target_counts`].
+    /// the real write produces, not an estimate. The winning temp file is
+    /// then promoted (moved, not regenerated) onto the real destination.
+    /// Per-contig counts are split proportional to fitted per-contig
+    /// variant count (`n_variants`), like [`Size::Records`]. See
+    /// [`BulkSpec::write`] and [`BulkSpec::resolve_target_counts`].
     Target(u64),
 }
 
@@ -313,7 +316,14 @@ impl BulkSpec {
             Size::RecordsPerContig(n) => vec![n; self.contig_ids.len()],
             Size::Records(total) => distribute_by_n_variants(fitted, &self.contig_ids, total),
             Size::Target(target_bytes) => {
-                self.resolve_target_counts(&pool, &samplers, fitted, target_bytes)?
+                let (_counts, tmp, _bytes, summary) =
+                    self.resolve_target_counts(&pool, &samplers, fitted, target_bytes)?;
+                Self::promote_temp(tmp, path, self.format)?;
+                let json = summary.to_json()?;
+                let mut summary_path = path.as_os_str().to_os_string();
+                summary_path.push(".summary.json");
+                std::fs::write(&summary_path, json)?;
+                return Ok(summary);
             }
         };
 
@@ -467,37 +477,27 @@ impl BulkSpec {
         out
     }
 
-    /// Resolves [`Size::Target`] to per-contig record *counts* (not the
-    /// records themselves), generating candidates as it goes to measure
-    /// them.
+    /// Resolves [`Size::Target`] to per-contig record *counts*, the
+    /// already-written temp file those counts produced (byte length `>=
+    /// target_bytes`), its byte length, and its `Summary` — so the caller
+    /// ([`BulkSpec::write`]) can promote the temp straight to the real
+    /// destination instead of regenerating a third time.
     ///
-    /// This is the plan's "two-pass" approach, generalized to as many
-    /// rounds as needed: each round asks [`BulkSpec::measure_compressed_bytes`]
-    /// to generate a candidate `per_contig_count`'s worth of records —
-    /// **one contig at a time, dropping each before generating the next**
-    /// (see that method's doc) — and measure the exact compressed size that
-    /// candidate would produce, and checks it against the target. If short,
-    /// it extrapolates the additional records needed from the observed
-    /// bytes/record ratio (with a 15% margin so successive rounds converge
-    /// quickly rather than repeatedly undershooting) and retries.
-    ///
-    /// `total_records` for the bytes/record ratio is `per_contig_count`'s
-    /// own sum, not a count of anything actually held in memory:
-    /// [`BulkSpec::generate_contig`] always returns exactly the requested
-    /// number of records, so no re-measurement is needed to know it.
-    ///
-    /// Only the winning round's per-contig *counts* are returned.
-    /// [`BulkSpec::write`] regenerates from them (its own two-pass
-    /// span/write structure), rather than this function returning the
-    /// generated records directly, so that at most one contig's records —
-    /// never every contig's, and never a whole extra file's worth held
-    /// alongside the real write — are ever live at once. This is the fix
-    /// for the bug where an earlier version of this function generated
-    /// *every* contig's full record set up front (`Vec<Vec<Rec>>`) before
-    /// measuring: peak RSS tracked the *total* record count rather than the
-    /// largest single contig's, and a `--target-size 8MB` run (50,590
-    /// records) peaked at 357 MB and took 251s where a bounded run should
-    /// scale with the largest contig alone.
+    /// Two cheap calibration points (`1_000` and `2_000` records per
+    /// contig, measured bytes-only via [`BulkSpec::measure_compressed_bytes`])
+    /// fit `bytes ~= b0 + k*records` (`k` bytes/record, `b0` the fixed
+    /// header/index cost), which gives a direct count estimate for
+    /// `target_bytes` in one step rather than the old scheme's up-to-25
+    /// rounds of repeated doubling (each round generating every contig
+    /// *twice* to measure, then discarding the result). That estimate is
+    /// then corrected, at most [`MAX_CORRECTIONS`] times: each round writes
+    /// the current guess to a real temp file via [`BulkSpec::write_to_temp`]
+    /// (building the `Summary` for free, since this write is no longer a
+    /// throwaway measurement -- it may be the one promoted), and if it's
+    /// still short, tops up every contig's count proportionally (via
+    /// [`distribute_by_n_variants`], same as the initial split) using the
+    /// same fitted slope `k`, plus a 2% margin so rounds converge instead of
+    /// oscillating just under the target.
     ///
     /// Both the initial guess and each round's top-up are split
     /// proportional to each contig's fitted per-contig variant count
@@ -512,34 +512,119 @@ impl BulkSpec {
         samplers: &Samplers,
         fitted: &Fitted,
         target_bytes: u64,
-    ) -> Result<Vec<u64>, BulkError> {
-        const INITIAL_PER_CONTIG: u64 = 500;
-        const MAX_ROUNDS: usize = 25;
-
+    ) -> Result<(Vec<u64>, tempfile::NamedTempFile, u64, Summary), BulkError> {
         let n_contigs = self.contig_ids.len() as u64;
-        let mut per_contig_count =
-            distribute_by_n_variants(fitted, &self.contig_ids, INITIAL_PER_CONTIG * n_contigs);
 
-        for _round in 0..MAX_ROUNDS {
-            let bytes = self.measure_compressed_bytes(pool, samplers, fitted, &per_contig_count)?;
+        // Two calibration points; c2 = 2*c1 so the slope is well-conditioned.
+        let split1 = distribute_by_n_variants(fitted, &self.contig_ids, 1_000 * n_contigs);
+        let split2 = distribute_by_n_variants(fitted, &self.contig_ids, 2_000 * n_contigs);
+        let bytes1 = self.measure_compressed_bytes(pool, samplers, fitted, &split1)?;
+        let bytes2 = self.measure_compressed_bytes(pool, samplers, fitted, &split2)?;
 
+        let r1 = split1.iter().sum::<u64>() as f64;
+        let r2 = split2.iter().sum::<u64>() as f64;
+        // bytes ~= b0 + k*records ; k bytes/record, b0 the fixed header cost.
+        let k = ((bytes2 as f64 - bytes1 as f64) / (r2 - r1)).max(1e-9);
+        let b0 = bytes1 as f64 - k * r1;
+
+        // Direct count; never below the larger calibration (a known-good
+        // measurement) and never below 1 record/contig.
+        let want = (((target_bytes as f64 - b0) / k).ceil() as i64).max(r2 as i64) as u64;
+        let mut counts = distribute_by_n_variants(fitted, &self.contig_ids, want);
+
+        // Slope-based correction; converges in 1-2 rounds.
+        const MAX_CORRECTIONS: usize = 4;
+        for _ in 0..MAX_CORRECTIONS {
+            let (tmp, bytes, summary) = self.write_to_temp(pool, samplers, fitted, &counts)?;
             if bytes >= target_bytes {
-                return Ok(per_contig_count);
+                return Ok((counts, tmp, bytes, summary));
             }
-
-            let total_records: u64 = per_contig_count.iter().sum();
-            let bytes_per_record = (bytes as f64 / total_records.max(1) as f64).max(1.0);
             let shortfall = (target_bytes - bytes) as f64;
-            let extra = ((shortfall / bytes_per_record) * 1.15).ceil() as u64 + 1;
+            let extra = ((shortfall / k) * 1.02).ceil() as u64 + 1;
             let extra_split = distribute_by_n_variants(fitted, &self.contig_ids, extra);
-            for (c, e) in per_contig_count.iter_mut().zip(&extra_split) {
+            for (c, e) in counts.iter_mut().zip(&extra_split) {
                 *c += e;
             }
+            drop(tmp); // discard the under-target temp before regenerating
         }
 
         Err(BulkError::Invalid(format!(
-            "could not reach target size {target_bytes} bytes within {MAX_ROUNDS} rounds"
+            "could not reach target size {target_bytes} bytes within {MAX_CORRECTIONS} corrective rounds"
         )))
+    }
+
+    /// Like [`BulkSpec::measure_compressed_bytes`], but builds the
+    /// [`Summary`] during the write pass and returns the live temp file
+    /// instead of deleting it, so the caller can promote it to the real
+    /// destination via [`BulkSpec::promote_temp`]. Byte-exact: identical
+    /// header, records, and (absent) flush cadence as [`BulkSpec::write`].
+    fn write_to_temp(
+        &self,
+        pool: &rayon::ThreadPool,
+        samplers: &Samplers,
+        fitted: &Fitted,
+        per_contig_count: &[u64],
+    ) -> Result<(tempfile::NamedTempFile, u64, Summary), BulkError> {
+        let spans: Vec<u64> = self
+            .contig_ids
+            .iter()
+            .zip(per_contig_count)
+            .enumerate()
+            .map(|(i, (id, &n))| {
+                let recs = self.generate_contig(pool, samplers, fitted, id, i as u64, n);
+                contig_span(&recs)
+            })
+            .collect();
+
+        let header = self.build_header(&spans);
+        let tmp = tempfile::NamedTempFile::new()?;
+        let tmp_path = tmp.path().to_path_buf();
+
+        let mut w = BulkWriter::create(
+            &tmp_path,
+            self.format,
+            &header,
+            self.compression_level,
+            self.workers,
+        )?;
+        let mut summary = Summary::new(self.n_samples);
+        for (i, (id, &n)) in self.contig_ids.iter().zip(per_contig_count).enumerate() {
+            let recs = self.generate_contig(pool, samplers, fitted, id, i as u64, n);
+            for r in &recs {
+                let buf = to_record_buf(&r.g, self.payload.clone(), r.phased);
+                w.write(&header, &buf)?;
+                summary.observe(id, r.g.pos, r.g.class, &r.g.gts);
+            }
+        }
+        w.finish_and_index(&tmp_path)?;
+        let bytes = std::fs::metadata(&tmp_path)?.len();
+        Ok((tmp, bytes, summary))
+    }
+
+    /// Moves a written temp file (and, for BCF, its `.csi` companion) onto
+    /// the real destination. Rename when possible; falls back to copy across
+    /// filesystems (`TMPDIR` may differ from the output dir) via
+    /// [`move_file`]/`NamedTempFile::persist`.
+    fn promote_temp(
+        tmp: tempfile::NamedTempFile,
+        dest: &Path,
+        format: Format,
+    ) -> Result<(), BulkError> {
+        let tmp_path = tmp.path().to_path_buf();
+        if matches!(format, Format::Bcf) {
+            let mut src_csi = tmp_path.as_os_str().to_os_string();
+            src_csi.push(".csi");
+            let mut dst_csi = dest.as_os_str().to_os_string();
+            dst_csi.push(".csi");
+            move_file(Path::new(&src_csi), Path::new(&dst_csi))?;
+        }
+        match tmp.persist(dest) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                std::fs::copy(e.file.path(), dest)?;
+                Ok(())
+            }
+        }
     }
 
     /// Measures the exact compressed byte size that `per_contig_count`
@@ -632,6 +717,21 @@ pub fn parse_size(s: &str) -> Result<u64, BulkError> {
         .parse::<u64>()
         .map(|n| n * mult)
         .map_err(|_| BulkError::Invalid(format!("bad size: {s}")))
+}
+
+/// Moves `src` to `dst`: a rename when both are on the same filesystem
+/// (the common case, and atomic), falling back to copy-then-remove when
+/// they aren't (e.g. `TMPDIR` on a different filesystem than the output
+/// directory, where `rename` returns `EXDEV`). Used by
+/// [`BulkSpec::promote_temp`] for the `.csi` companion, which
+/// `NamedTempFile::persist` doesn't know how to move itself.
+fn move_file(src: &Path, dst: &Path) -> Result<(), BulkError> {
+    if std::fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(src, dst)?;
+    let _ = std::fs::remove_file(src);
+    Ok(())
 }
 
 /// The populated span of one contig's generated records — the maximum
