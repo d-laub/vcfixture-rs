@@ -12,6 +12,8 @@
 use crate::bulk::BulkError;
 
 const GERMLINE_1KGP: &str = include_str!("../../profiles/germline-1kgp.json");
+const GERMLINE_1KGP_UNPHASED: &str = include_str!("../../profiles/germline-1kgp-unphased.json");
+const SOMATIC_GDC: &str = include_str!("../../profiles/somatic-gdc.json");
 
 /// A named bundle of fitted statistics and dialed generation choices.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -94,6 +96,8 @@ impl Profile {
     pub fn builtin(name: &str) -> Result<Profile, BulkError> {
         let src = match name {
             "germline-1kgp" => GERMLINE_1KGP,
+            "germline-1kgp-unphased" => GERMLINE_1KGP_UNPHASED,
+            "somatic-gdc" => SOMATIC_GDC,
             other => return Err(BulkError::UnknownProfile(other.to_string())),
         };
         let p = Profile::from_json(src)?;
@@ -216,6 +220,71 @@ mod tests {
         assert_eq!(p.dialed.payload, Payload::GtOnly);
         assert_eq!(p.fitted.ploidy, 2);
         p.validate().unwrap();
+    }
+
+    #[test]
+    fn builtin_somatic_loads_and_validates() {
+        let p = Profile::builtin("somatic-gdc").unwrap();
+        assert_eq!(p.name, "somatic-gdc");
+        assert_eq!(p.dialed.payload, Payload::GtVaf);
+        p.validate().unwrap();
+        assert_eq!(p.provenance.n_samples_source, 16007);
+    }
+
+    #[test]
+    fn germline_profile_is_really_fitted_not_placeholder() {
+        let p = Profile::builtin("germline-1kgp").unwrap();
+        assert_eq!(p.provenance.n_samples_source, 3202);
+        assert!(!p.provenance.source.contains("PLACEHOLDER"));
+    }
+
+    #[test]
+    fn germline_sfs_is_empirical_not_neutral() {
+        // A neutral 1/x SFS gives ~12% singletons; the real *unphased* 1kGP callset is
+        // ~36%. This test is the guard that we fitted data rather than theory.
+        //
+        // It deliberately targets `germline-1kgp-unphased`, NOT `germline-1kgp`: the
+        // phased panel has a singleton fraction of 0.0 because phasing is precisely what
+        // removes unphaseable singletons. Pointing this guard at the phased profile would
+        // assert something no phased file can satisfy.
+        let p = Profile::builtin("germline-1kgp-unphased").unwrap();
+        let total: f64 = p.fitted.sfs.weights.iter().sum();
+        let singleton_frac = p.fitted.sfs.weights[0] / total;
+        assert!(
+            singleton_frac > 0.3,
+            "singleton fraction {singleton_frac} looks neutral, not empirical"
+        );
+    }
+
+    #[test]
+    fn germline_variants_differ_in_phasing() {
+        // The two germline profiles exist to capture a real trade-off that no single file
+        // provides: phased data has no singletons, unphased data has no phase.
+        let phased = Profile::builtin("germline-1kgp").unwrap();
+        let unphased = Profile::builtin("germline-1kgp-unphased").unwrap();
+        assert_eq!(phased.fitted.phased_rate, 1.0);
+        assert_eq!(unphased.fitted.phased_rate, 0.0);
+        assert_eq!(
+            phased.provenance.n_samples_source,
+            unphased.provenance.n_samples_source
+        );
+        let sf = |p: &Profile| p.fitted.sfs.weights[0] / p.fitted.sfs.weights.iter().sum::<f64>();
+        assert!(
+            sf(&phased) < 0.01,
+            "phased panel should have ~no singletons"
+        );
+        assert!(
+            sf(&unphased) > 0.3,
+            "unphased callset should be singleton-rich"
+        );
+    }
+
+    #[test]
+    fn builtin_unphased_germline_loads_and_validates() {
+        let p = Profile::builtin("germline-1kgp-unphased").unwrap();
+        assert_eq!(p.name, "germline-1kgp-unphased");
+        p.validate().unwrap();
+        assert_eq!(p.provenance.n_samples_source, 3202);
     }
 
     #[test]

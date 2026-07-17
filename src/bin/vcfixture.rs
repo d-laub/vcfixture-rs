@@ -22,7 +22,8 @@ struct Cli {
 enum Cmd {
     /// Generate a bulk BCF for benchmarking.
     Bulk {
-        /// Builtin profile name, or a path to a profile JSON.
+        /// Builtin profile name (germline-1kgp, germline-1kgp-unphased,
+        /// somatic-gdc), or a path to a profile JSON.
         #[arg(long, default_value = "germline-1kgp")]
         profile: String,
         /// Number of samples. Sample names are generated as `s0..s{n-1}`.

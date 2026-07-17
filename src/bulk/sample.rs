@@ -197,10 +197,15 @@ mod tests {
 
     #[test]
     fn sfs_reproduces_singleton_fraction() {
-        // The germline profile puts 47.6% of weight in the [1, 2) bin.
-        // This is the whole point of fitting an empirical SFS (a neutral 1/x
-        // SFS would give ~12%), so guard it.
-        let s = samplers();
+        // Targets `germline-1kgp-unphased`, not `germline-1kgp`: phasing
+        // drops unphaseable singletons, so the phased panel's SFS is ~0%
+        // singletons by construction (see
+        // `germline_variants_differ_in_phasing` in `profile.rs`). The raw
+        // unphased callset puts ~35.8% of weight in the [1, 2) bin -- this
+        // is the whole point of fitting an empirical SFS (a neutral 1/x SFS
+        // would give ~12%), so guard it here.
+        let p = Profile::builtin("germline-1kgp-unphased").unwrap();
+        let s = Samplers::new(&p.fitted).unwrap();
         let mut rng = ChaCha8Rng::seed_from_u64(3);
         let n = 20_000;
         let singletons = (0..n)
@@ -208,8 +213,8 @@ mod tests {
             .count();
         let frac = singletons as f64 / n as f64;
         assert!(
-            (frac - 0.476).abs() < 0.02,
-            "singleton fraction {frac} != ~0.476"
+            (frac - 0.358).abs() < 0.02,
+            "singleton fraction {frac} != ~0.358"
         );
     }
 
@@ -222,7 +227,7 @@ mod tests {
             .filter(|_| matches!(s.class(&mut rng), VariantClass::Snp))
             .count();
         let frac = snps as f64 / n as f64;
-        assert!((frac - 0.83).abs() < 0.02, "snp fraction {frac} != ~0.83");
+        assert!((frac - 0.87).abs() < 0.02, "snp fraction {frac} != ~0.87");
     }
 
     #[test]

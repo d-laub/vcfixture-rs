@@ -124,9 +124,18 @@ vcfixture bulk --profile germline-1kgp --samples 3202 \
 ```
 
 `--profile` accepts either a builtin profile name or a path to a profile JSON
-file, tried in that order. The only builtin profile currently shipped is
-`germline-1kgp`; pass a path (e.g. one produced by `pixi run fit`, or any
-JSON matching the `Profile` schema) to use anything else.
+file, tried in that order. Three builtin profiles are shipped:
+
+- `germline-1kgp` — fitted from the 1kGP phased panel.
+- `germline-1kgp-unphased` — fitted from the same cohort's raw unphased
+  GATK sites-only callset.
+- `somatic-gdc` — fitted from a merged 16,007-sample GDC cohort.
+
+Two germline profiles exist because phased and unphased data can't be one
+file: phasing drops unphaseable singletons, so the phased panel has no
+singletons, while the unphased callset has no phase. Pass a path (e.g. one
+produced by `pixi run fit`, or any JSON matching the `Profile` schema) to use
+anything else.
 
 Output is `<output>` plus a `.csi` index and a `<output>.summary.json` — a
 summary truth (per-contig record counts and position ranges, allele counts,
