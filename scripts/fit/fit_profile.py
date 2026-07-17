@@ -53,6 +53,7 @@ import argparse
 import atexit
 import datetime as _dt
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -846,17 +847,20 @@ def compute_pvar_stats(lf: pl.LazyFrame) -> dict:
 # RSS ~23 GiB (agent + plink2), ~11 GiB under the 32 GiB limit. The 30000 MiB
 # is a *virtual* reservation that only materializes what the data needs, so
 # it is harmless on smaller inputs. The polars stages elsewhere in this
-# script (~6.4 GiB) run before plink2, not concurrently.
-_PLINK2_MEMORY_MB = 30000
+# script (~19 GiB peak python RSS on the genome-wide fit) run before/between
+# the plink2 calls, not concurrently with plink2's bigstack.
+#
+# The default is tuned for a 32 GiB cgroup; override via the
+# VCFIXTURE_PLINK2_MEMORY_MB env var for a different job allocation.
+_PLINK2_MEMORY_MB = int(os.environ.get("VCFIXTURE_PLINK2_MEMORY_MB", "30000"))
 
 
 def _run_plink2(args: list[str]) -> None:
-    result = subprocess.run(
-        ["plink2", *args, "--memory", str(_PLINK2_MEMORY_MB)], capture_output=True, text=True
-    )
+    cmd = ["plink2", *args, "--memory", str(_PLINK2_MEMORY_MB)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(
-            f"plink2 {' '.join(args)} failed (exit {result.returncode}):\n"
+            f"plink2 {' '.join(cmd[1:])} failed (exit {result.returncode}):\n"
             f"{result.stdout}\n{result.stderr}"
         )
 
