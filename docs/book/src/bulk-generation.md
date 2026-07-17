@@ -73,9 +73,15 @@ lands on realistic data.
 
 ## Why genotypes are drawn i.i.d.
 
-Genotypes are drawn independently per sample from Hardy-Weinberg equilibrium
-at each site's sampled allele count — there is no linkage disequilibrium (LD)
-or haplotype structure between sites.
+Genotypes are drawn independently per site from Hardy-Weinberg equilibrium at
+each site's sampled allele count — there is no linkage disequilibrium (LD) or
+haplotype structure between sites. Within a site, the sampled allele count
+`ac` is placed exactly: `ac` alt alleles are assigned uniformly at random
+among that site's non-missing genotype slots (sampling without replacement),
+rather than drawing each slot independently at the implied frequency
+`ac / n_alleles` — the independent draw would re-randomise the realised
+allele count away from `ac` and destroy the fitted site-frequency spectrum on
+any single record.
 
 This follows directly from a controlled ablation: permuting sample labels
 independently at every variant (destroying LD while holding site-level

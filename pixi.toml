@@ -38,8 +38,9 @@ bcftools = "*"
 pytest = "*"
 
 [feature.fit.tasks]
-fit      = "python scripts/fit/fit_profile.py"
-test-fit = "pytest scripts/fit -q"
+fit           = "python scripts/fit/fit_profile.py"
+test-fit      = "pytest scripts/fit -q"
+test-fidelity = "pytest scripts/fit/test_fidelity.py -q"
 
 [environments]
 fit = ["fit"]

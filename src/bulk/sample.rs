@@ -2,8 +2,12 @@
 //!
 //! Every sampler draws i.i.d. from the [`crate::bulk::profile::Fitted`]
 //! distributions in a [`crate::bulk::profile::Profile`] — no LD, no
-//! haplotype copying, no coalescent simulation. Genotypes are independent
-//! draws under Hardy-Weinberg equilibrium; see
+//! haplotype copying, no coalescent simulation. This module draws each
+//! record's *target* allele count `ac` from the fitted SFS
+//! ([`Samplers::allele_count`]); [`crate::bulk::gen::gen_record`] then places
+//! exactly `ac` alt alleles among the record's genotypes (not an i.i.d.
+//! Bernoulli draw at the implied frequency — see that function's doc for
+//! why), which keeps genotypes HWE conditional on `ac`; see
 //! `docs/superpowers/specs/2026-07-16-bulk-generation-design.md`.
 //!
 //! [`Samplers::new`] precomputes cumulative weights once so that per-record

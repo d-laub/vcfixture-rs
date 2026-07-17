@@ -1,7 +1,22 @@
 //! Streaming per-record generation: draw a variant class and REF/ALT, draw
-//! genotypes i.i.d. from HWE (no LD, no haplotype copying, no coalescent
-//! simulation — see `docs/superpowers/specs/2026-07-16-bulk-generation-design.md`),
-//! and convert the result into a noodles [`RecordBuf`](noodles_vcf::variant::RecordBuf).
+//! genotypes (no LD, no haplotype copying, no coalescent simulation — see
+//! `docs/superpowers/specs/2026-07-16-bulk-generation-design.md`), and
+//! convert the result into a noodles [`RecordBuf`](noodles_vcf::variant::RecordBuf).
+//!
+//! Genotypes are drawn by **exact-AC placement**: a target allele count `ac`
+//! is drawn from the fitted SFS, and exactly `ac` alt alleles are placed
+//! uniformly at random among the record's non-missing slots (sampling
+//! without replacement), rather than drawing each slot i.i.d. Bernoulli at
+//! the implied frequency `ac / n_alleles`. The i.i.d. draw re-randomises the
+//! realised allele count away from `ac` (it becomes
+//! `Binomial(n_alleles, ac/n_alleles)`), which on any single record
+//! statistically destroys the very SFS the profile was fitted to reproduce —
+//! most visibly at low AC, where relative Binomial variance is largest.
+//! Exact-AC placement reproduces the fitted SFS by construction. Genotypes
+//! stay HWE conditional on the allele count (the standard population-
+//! genetics formulation: uniform placement of `ac` alleles over `2N` slots
+//! gives the hypergeometric, which is HWE asymptotically), and there is
+//! still no LD, since placement is independent per record.
 //!
 //! [`block_rng`] is the determinism guarantee for parallel generation: a
 //! block's RNG stream is a pure function of `(seed, block_idx)`, never of
@@ -20,7 +35,7 @@ use noodles_vcf::variant::RecordBuf;
 use crate::bulk::profile::{Fitted, Payload};
 use crate::bulk::sample::{Samplers, VariantClass};
 
-/// One generated variant: its site (REF/ALT/class) and its i.i.d.-HWE
+/// One generated variant: its site (REF/ALT/class) and its exact-AC-placed
 /// genotype draws, flattened as `n_samples * ploidy` allele calls.
 ///
 /// `ploidy` is not part of the Task 6 brief's interface sketch, but
@@ -55,8 +70,9 @@ pub fn block_rng(seed: u64, block_idx: u64) -> ChaCha8Rng {
 }
 
 /// Draws one variant record: a structural class, REF/ALT bases for that
-/// class, and `n_samples * ploidy` genotype calls drawn i.i.d. from HWE
-/// (never LD, haplotype copying, or coalescent simulation — see
+/// class, and `n_samples * ploidy` genotype calls, with exactly the drawn
+/// allele count `ac` placed among the non-missing slots (never LD, haplotype
+/// copying, or coalescent simulation — see
 /// `docs/superpowers/specs/2026-07-16-bulk-generation-design.md`).
 pub fn gen_record<R: Rng>(
     rng: &mut R,
@@ -72,19 +88,41 @@ pub fn gen_record<R: Rng>(
 
     let n_alleles = n_samples as u64 * ploidy as u64;
     let ac = s.allele_count(rng, n_alleles);
-    let p = ac as f64 / (n_alleles.max(1) as f64);
 
-    let gts: Vec<i8> = (0..n_alleles)
-        .map(|_| {
-            if rng.gen::<f64>() < fitted.missing_rate {
-                -1
-            } else if rng.gen::<f64>() < p {
-                1
-            } else {
-                0
-            }
-        })
-        .collect();
+    // `missing_rate` is fitted per-genotype (plink2 `--missing` counts a
+    // missing hardcall once per sample, not once per allele), so it must be
+    // drawn once per sample here too. Drawing it per-allele instead used to
+    // produce GT half-calls (e.g. `0/.`), which real callers (plink2
+    // `--make-pgen`) reject outright.
+    //
+    // Missingness is drawn FIRST, and the `ac` alt alleles are placed only
+    // among the resulting non-missing slots, below. VCF's AC/AN count alt
+    // alleles among *called* genotypes only, which is exactly what a re-fit
+    // measures (`plink2 --freq counts` / `INFO/AC`); placing alt alleles
+    // first and overwriting some with missing after the fact would silently
+    // shrink the realised AC below the drawn `ac`.
+    let mut gts: Vec<i8> = Vec::with_capacity(n_alleles as usize);
+    for _ in 0..n_samples {
+        let sample_missing = rng.gen::<f64>() < fitted.missing_rate;
+        for _ in 0..ploidy {
+            gts.push(if sample_missing { -1 } else { 0 });
+        }
+    }
+
+    // Exact-AC placement: place exactly `ac` alt alleles uniformly at random
+    // among the non-missing slots, without replacement (partial
+    // Fisher-Yates), rather than drawing each slot i.i.d. Bernoulli at the
+    // implied frequency `ac / n_alleles` — see the module doc for why the
+    // i.i.d. draw does not preserve the fitted SFS. `ac` can exceed the
+    // number of non-missing slots at high AC + high missing_rate; clamp
+    // rather than panic.
+    let mut idx: Vec<usize> = (0..n_alleles as usize).filter(|&i| gts[i] != -1).collect();
+    let ac_eff = (ac as usize).min(idx.len());
+    for i in 0..ac_eff {
+        let j = rng.gen_range(i..idx.len());
+        idx.swap(i, j);
+        gts[idx[i]] = 1;
+    }
 
     GenRecord {
         chrom: chrom.to_string(),
