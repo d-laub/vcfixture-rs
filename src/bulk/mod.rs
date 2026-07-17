@@ -131,7 +131,16 @@ impl BulkSpec {
     /// is achieved: rayon may compute blocks on any thread in any order,
     /// but [`Vec::from_par_iter`]/`.collect()` always assembles the results
     /// back in index order.
-    const BLOCK_SIZE: u64 = 500;
+    // `pub` (not just `pub(crate)`) so that `tests/bulk.rs` -- a separate
+    // crate compiled against the public API -- can reference the real
+    // constant instead of mirroring its value as a literal, which has
+    // already silently regressed this determinism test's vacuity guard
+    // twice in this branch (see `same_seed_gives_byte_identical_output_
+    // across_thread_counts` in `tests/bulk.rs`). `#[doc(hidden)]` keeps it
+    // out of rendered docs since it's an implementation detail, not part of
+    // the intended public interface.
+    #[doc(hidden)]
+    pub const BLOCK_SIZE: u64 = 500;
 
     /// `block_idx` is derived as `contig_idx * CONTIG_BLOCK_STRIDE +
     /// local_block`, so a contig's stream never depends on how many
@@ -163,6 +172,20 @@ impl BulkSpec {
     }
 
     /// Sets the sample count. Sample names are generated as `s0..s{n-1}`.
+    ///
+    /// # Coupling with the fitted site-frequency spectrum
+    ///
+    /// The profile's `fitted.sfs` histogram is fit against the *source*
+    /// cohort's native size (`profile.provenance.n_samples_source`) — its
+    /// edges are absolute allele counts observed in that cohort, not
+    /// frequencies. Requesting a different sample count here does not
+    /// clamp those absolute counts (which would silently saturate every
+    /// high-AC bin to "every genotype is alt" whenever `n < n_samples_source`);
+    /// instead each drawn allele count is rescaled to a frequency against
+    /// the source cohort's `AN` and re-applied to this run's `AN`, so the
+    /// realized alt-allele density matches the source cohort's regardless of
+    /// how many samples are requested. See [`crate::bulk::sample::Samplers::
+    /// allele_count`] for the exact rescaling formula.
     pub fn samples(mut self, n: usize) -> BulkSpec {
         self.n_samples = n;
         self
@@ -290,7 +313,12 @@ impl BulkSpec {
             )));
         }
 
-        let samplers = Samplers::new(fitted)?;
+        // The sfs histogram's edges are absolute allele counts against the
+        // *source* cohort's AN, not frequencies (see `BulkSpec::samples`'s
+        // doc comment); `Samplers::allele_count` needs that source AN to
+        // rescale a drawn count to whatever cohort size this run requests.
+        let an_source = 2 * self.profile.provenance.n_samples_source as u64;
+        let samplers = Samplers::new(fitted, an_source)?;
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(self.workers.get())
             .build()
@@ -331,19 +359,16 @@ impl BulkSpec {
                 writer.write(&header, &buf)?;
                 summary.observe(id, r.g.pos, r.g.class, &r.g.gts);
             }
-            // No `writer.flush()` here: `MultithreadedWriter` dispatches a
+            // No mid-stream flush here: `MultithreadedWriter` dispatches a
             // compressed bgzf block once its ~64 KiB staging buffer fills
-            // regardless, and `write()` never polls `compressed_bytes()`
-            // (only `Size::Target`'s `measure_compressed_bytes` needs an
-            // exact count, via a temp-file `finish_and_index`, not this live
-            // counter). A per-contig flush here would force a block boundary
-            // at every contig, which fragments and hurts compression, and —
-            // critically — makes this write's bgzf block layout differ from
-            // `measure_compressed_bytes`'s (which does not flush per
-            // contig), which was exactly the bug: `Size::Target` could
-            // measure a byte count that the real write would not reproduce.
-            // Removing this call makes the two structurally identical, so
-            // the measurement is now exact, not just close.
+            // regardless, and forcing one at every contig boundary would
+            // fragment the output and hurt compression. It would also make
+            // this write's bgzf block layout differ from
+            // `measure_compressed_bytes`'s (which likewise never flushes
+            // per contig) — exactly the bug `Size::Target` used to have:
+            // measuring a byte count the real write would not reproduce.
+            // Neither path flushing mid-stream keeps the two structurally
+            // identical, so the measurement stays exact, not just close.
         }
         writer.finish_and_index(path)?;
 
@@ -462,26 +487,32 @@ impl BulkSpec {
     /// them.
     ///
     /// This is the plan's "two-pass" approach, generalized to as many
-    /// rounds as needed: each round generates a candidate `per_contig` (the
-    /// *actual* records that would be written — not a proxy), writes it to
-    /// a temp file via the real [`BulkWriter`] (so measured bytes are
-    /// exactly what the real write would produce — same header, format,
-    /// compression level, and, since neither this nor
-    /// [`BulkSpec::write`] calls [`BulkWriter::flush`] mid-stream, the same
-    /// bgzf block layout too — so the `finish_and_index`'d temp file's size
-    /// on disk is exact, not an estimate), and checks it against the
-    /// target. If short, it extrapolates the additional records needed from
-    /// the observed bytes/record ratio (with a 15% margin so successive
-    /// rounds converge quickly rather than repeatedly undershooting) and
-    /// retries.
+    /// rounds as needed: each round asks [`BulkSpec::measure_compressed_bytes`]
+    /// to generate a candidate `per_contig_count`'s worth of records —
+    /// **one contig at a time, dropping each before generating the next**
+    /// (see that method's doc) — and measure the exact compressed size that
+    /// candidate would produce, and checks it against the target. If short,
+    /// it extrapolates the additional records needed from the observed
+    /// bytes/record ratio (with a 15% margin so successive rounds converge
+    /// quickly rather than repeatedly undershooting) and retries.
+    ///
+    /// `total_records` for the bytes/record ratio is `per_contig_count`'s
+    /// own sum, not a count of anything actually held in memory:
+    /// [`BulkSpec::generate_contig`] always returns exactly the requested
+    /// number of records, so no re-measurement is needed to know it.
     ///
     /// Only the winning round's per-contig *counts* are returned.
     /// [`BulkSpec::write`] regenerates from them (its own two-pass
     /// span/write structure), rather than this function returning the
-    /// generated records directly, so that at most one round's
-    /// `Vec<Vec<Rec>>` — not every round's data, and not a whole extra
-    /// file's worth of records held alongside the real write — is ever
-    /// live at once.
+    /// generated records directly, so that at most one contig's records —
+    /// never every contig's, and never a whole extra file's worth held
+    /// alongside the real write — are ever live at once. This is the fix
+    /// for the bug where an earlier version of this function generated
+    /// *every* contig's full record set up front (`Vec<Vec<Rec>>`) before
+    /// measuring: peak RSS tracked the *total* record count rather than the
+    /// largest single contig's, and a `--target-size 8MB` run (50,590
+    /// records) peaked at 357 MB and took 251s where a bounded run should
+    /// scale with the largest contig alone.
     ///
     /// Both the initial guess and each round's top-up are split
     /// proportional to each contig's fitted density via
@@ -504,21 +535,13 @@ impl BulkSpec {
             distribute_by_density(fitted, &self.contig_ids, INITIAL_PER_CONTIG * n_contigs);
 
         for _round in 0..MAX_ROUNDS {
-            let per_contig: Vec<Vec<Rec>> = self
-                .contig_ids
-                .iter()
-                .zip(&per_contig_count)
-                .enumerate()
-                .map(|(i, (id, &n))| self.generate_contig(pool, samplers, fitted, id, i as u64, n))
-                .collect();
-
-            let total_records: u64 = per_contig.iter().map(|r| r.len() as u64).sum();
-            let bytes = self.measure_compressed_bytes(&per_contig)?;
+            let bytes = self.measure_compressed_bytes(pool, samplers, fitted, &per_contig_count)?;
 
             if bytes >= target_bytes {
                 return Ok(per_contig_count);
             }
 
+            let total_records: u64 = per_contig_count.iter().sum();
             let bytes_per_record = (bytes as f64 / total_records.max(1) as f64).max(1.0);
             let shortfall = (target_bytes - bytes) as f64;
             let extra = ((shortfall / bytes_per_record) * 1.15).ceil() as u64 + 1;
@@ -533,18 +556,46 @@ impl BulkSpec {
         )))
     }
 
-    /// Writes a candidate `per_contig` to a throwaway temp file through the
-    /// real [`BulkWriter`] and returns its exact on-disk size after
-    /// `finish_and_index` — not the live `compressed_bytes()` counter,
-    /// which the writer documents as lagging until the writer is finished
-    /// (dispatch to the compression thread pool is asynchronous). Because
-    /// [`BulkSpec::write`] does not call [`BulkWriter::flush`] mid-stream
-    /// either, this temp-file write is structurally identical to the real
-    /// write — same header, same records, same (absent) flush cadence — so
-    /// the byte count returned here is exactly what the real write
-    /// produces for the same `per_contig`, not merely close to it.
-    fn measure_compressed_bytes(&self, per_contig: &[Vec<Rec>]) -> Result<u64, BulkError> {
-        let spans: Vec<u64> = per_contig.iter().map(|recs| contig_span(recs)).collect();
+    /// Measures the exact compressed byte size that `per_contig_count`
+    /// would produce, by actually generating and writing it to a throwaway
+    /// temp file through the real [`BulkWriter`] — **one contig at a time**,
+    /// exactly as [`BulkSpec::write`] does: a span pass that generates each
+    /// contig only long enough to learn its populated span before dropping
+    /// its records, then a write pass that regenerates each contig (a pure
+    /// function of `(seed, contig_idx, n_records)`, so byte-identical to the
+    /// span pass) and writes it immediately, dropping its records before
+    /// moving to the next contig. Peak memory here is therefore bounded by
+    /// the largest single contig's records, not the sum across every
+    /// contig — the same bound `write()` gives the real output, and the
+    /// fix for this function previously holding every contig's full record
+    /// set (`Vec<Vec<Rec>>`) live at once.
+    ///
+    /// The returned size is read back from `finish_and_index`'d file
+    /// metadata, not a live byte counter (dispatch to the compression
+    /// thread pool is asynchronous and would otherwise lag). Because
+    /// `write()` also never calls a mid-stream flush, this temp-file write
+    /// is structurally identical to the real write — same header, same
+    /// records, same (absent) flush cadence — so the byte count returned
+    /// here is exactly what the real write produces for this
+    /// `per_contig_count`, not merely close to it.
+    fn measure_compressed_bytes(
+        &self,
+        pool: &rayon::ThreadPool,
+        samplers: &Samplers,
+        fitted: &Fitted,
+        per_contig_count: &[u64],
+    ) -> Result<u64, BulkError> {
+        let spans: Vec<u64> = self
+            .contig_ids
+            .iter()
+            .zip(per_contig_count)
+            .enumerate()
+            .map(|(i, (id, &n))| {
+                let recs = self.generate_contig(pool, samplers, fitted, id, i as u64, n);
+                contig_span(&recs)
+            })
+            .collect();
+
         let header = self.build_header(&spans);
         let tmp = tempfile::NamedTempFile::new()?;
         let tmp_path = tmp.path().to_path_buf();
@@ -556,8 +607,9 @@ impl BulkSpec {
             self.compression_level,
             self.workers,
         )?;
-        for recs in per_contig {
-            for r in recs {
+        for (i, (id, &n)) in self.contig_ids.iter().zip(per_contig_count).enumerate() {
+            let recs = self.generate_contig(pool, samplers, fitted, id, i as u64, n);
+            for r in &recs {
                 let buf = to_record_buf(&r.g, self.payload.clone(), r.phased);
                 w.write(&header, &buf)?;
             }

@@ -27,25 +27,30 @@ fn records_per_contig_is_exact() {
 
 #[test]
 fn same_seed_gives_byte_identical_output_across_thread_counts() {
-    // `BulkSpec::BLOCK_SIZE` (private; `src/bulk/mod.rs`) is currently 500
-    // records — the granularity at which `generate_contig`'s rayon
-    // `into_par_iter` has anything to reorder. At `RecordsPerContig(50)`
-    // (the value this test used before this fix), `50.div_ceil(500) == 1`
-    // block per contig: there is nothing for rayon to reorder, so both
-    // parallel paths (this crate's own block-level rayon split, and the
-    // writer's bgzf multithreaded compression, which also scales with
-    // `workers`) are structurally incapable of failing regardless of
-    // whether determinism actually holds. `RECORDS_PER_CONTIG` below is
-    // sized well past that boundary, and the assertions further down pin
-    // both dimensions of scale down so a future edit can't silently shrink
-    // this test back into vacuity. See `src/bulk/writer.rs`'s
-    // `output_is_byte_identical_regardless_of_worker_count` for the same
-    // idiom applied to the writer's own compression layer.
+    // `BulkSpec::BLOCK_SIZE` (`src/bulk/mod.rs`) is currently 500 records —
+    // the granularity at which `generate_contig`'s rayon `into_par_iter` has
+    // anything to reorder. At `RecordsPerContig(50)` (the value this test
+    // used before this fix), `50.div_ceil(500) == 1` block per contig: there
+    // is nothing for rayon to reorder, so both parallel paths (this crate's
+    // own block-level rayon split, and the writer's bgzf multithreaded
+    // compression, which also scales with `workers`) are structurally
+    // incapable of failing regardless of whether determinism actually
+    // holds. `RECORDS_PER_CONTIG` below is sized well past that boundary,
+    // and the assertions further down pin both dimensions of scale down so
+    // a future edit can't silently shrink this test back into vacuity.
+    //
+    // This guard reads `BulkSpec::BLOCK_SIZE` directly rather than mirroring
+    // its value as a local literal: a mirrored literal would silently stop
+    // catching a vacuous test the moment the real constant changed (it
+    // already regressed twice in this branch), since the guard would keep
+    // comparing against its own stale copy instead of the source of truth.
+    // See `src/bulk/writer.rs`'s `output_is_byte_identical_regardless_of_
+    // worker_count` for the same idiom applied to the writer's own
+    // compression layer.
     const RECORDS_PER_CONTIG: u64 = 2_500;
-    const BLOCK_SIZE_LOWER_BOUND: u64 = 500; // BulkSpec::BLOCK_SIZE, mirrored here
     const MAX_BUF_SIZE: u64 = 65_498; // bgzf's uncompressed staging buffer size
 
-    let blocks_per_contig = RECORDS_PER_CONTIG.div_ceil(BLOCK_SIZE_LOWER_BOUND);
+    let blocks_per_contig = RECORDS_PER_CONTIG.div_ceil(BulkSpec::BLOCK_SIZE);
     assert!(
         blocks_per_contig > 1,
         "test is vacuous: {RECORDS_PER_CONTIG} records/contig gives only \
@@ -153,15 +158,30 @@ fn declared_contig_length_equals_populated_span() {
 
 #[test]
 fn target_size_lands_near_the_target() {
+    // `Size::Target`'s overshoot is a *proportional* margin (the 15% top-up
+    // margin in `BulkSpec::resolve_target_counts`, observed on the order of
+    // ~9.4% in practice -- a 4 MB target overshot by +377,520 bytes, i.e.
+    // ~9.0%), not a fixed byte budget. An absolute cap (e.g. `target + 256
+    // KiB`) only looks like it bounds the real behavior at whatever target
+    // size makes the two coincide -- 256 KiB happens to be 50% of the 512
+    // KiB target this test used to use, which is why that version of this
+    // assertion passed without actually checking proportionality. Bound it
+    // as a percentage of `target` instead, comfortably above the ~9.4%
+    // observed overshoot so this doesn't flake, but still tight enough to
+    // catch a regression back toward unbounded overshoot.
+    const MAX_OVERSHOOT_FRACTION: f64 = 0.25;
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.bcf");
     let target = 512 * 1024;
     spec().size(Size::Target(target)).write(&path).unwrap();
     let got = std::fs::metadata(&path).unwrap().len();
     assert!(got >= target, "got {got} < target {target}");
+    let max_allowed = target + (target as f64 * MAX_OVERSHOOT_FRACTION) as u64;
     assert!(
-        got < target + 256 * 1024,
-        "overshoot too large: {got} vs {target}"
+        got < max_allowed,
+        "overshoot too large: {got} vs target {target} (max allowed {max_allowed}, \
+         i.e. {MAX_OVERSHOOT_FRACTION} of target)"
     );
 }
 

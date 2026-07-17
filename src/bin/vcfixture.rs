@@ -27,6 +27,13 @@ enum Cmd {
         #[arg(long, default_value = "germline-1kgp")]
         profile: String,
         /// Number of samples. Sample names are generated as `s0..s{n-1}`.
+        /// The profile's fitted site-frequency spectrum is measured against
+        /// its own source cohort size (`provenance.n_samples_source`, e.g.
+        /// 3202 for the 1kGP profiles); requesting a different sample count
+        /// here does not change that -- each drawn allele count is rescaled
+        /// to a frequency against the source cohort and reapplied to this
+        /// run's cohort size, so alt-allele density stays realistic
+        /// regardless of how many samples you ask for.
         #[arg(long, default_value_t = 1)]
         samples: usize,
         /// Output contig names, in the order they will be written.

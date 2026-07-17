@@ -280,6 +280,17 @@ pub fn to_record_buf(r: &GenRecord, payload: Payload, phased: bool) -> RecordBuf
     let keys: Keys = key_names.iter().map(|k| k.to_string()).collect();
 
     let ploidy = r.ploidy as usize;
+    // `GenRecord` is a flat `pub` struct, so nothing prevents a caller from
+    // constructing one with `ploidy: 0` or a `gts.len()` that isn't a
+    // multiple of `ploidy`. `checked_div`'s `unwrap_or(0)` below silently
+    // turns that into a zero-sample (or truncated) record rather than
+    // failing, so assert the invariant explicitly first -- in debug/test
+    // builds this fails fast instead of silently mis-encoding.
+    debug_assert!(
+        ploidy > 0 && r.gts.len() % ploidy == 0,
+        "ploidy must be > 0 and evenly divide gts.len() (ploidy={ploidy}, gts.len()={})",
+        r.gts.len()
+    );
     let n_samples = r.gts.len().checked_div(ploidy).unwrap_or(0);
 
     let values: Vec<Vec<Option<Value>>> = (0..n_samples)
@@ -310,7 +321,8 @@ mod tests {
 
     fn fixture() -> (Profile, Samplers) {
         let p = Profile::builtin("germline-1kgp").unwrap();
-        let s = Samplers::new(&p.fitted).unwrap();
+        let an_source = 2 * p.provenance.n_samples_source as u64;
+        let s = Samplers::new(&p.fitted, an_source).unwrap();
         (p, s)
     }
 
