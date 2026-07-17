@@ -7,3 +7,4 @@
 - [Ground truth](./ground-truth.md)
 - [Rendering and writing](./rendering-and-writing.md)
 - [Property testing](./property-testing.md)
+- [Bulk generation](bulk-generation.md)

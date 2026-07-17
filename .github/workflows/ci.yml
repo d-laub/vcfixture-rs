@@ -61,3 +61,4 @@ jobs:
           cargo run --example symbolic
           cargo run --example writing
           cargo run --example proptest_fuzz --features proptest
+          cargo run --example bulk --features bulk

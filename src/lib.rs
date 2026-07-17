@@ -46,6 +46,9 @@
 #[cfg(feature = "proptest")]
 pub mod strategies;
 
+#[cfg(feature = "bulk")]
+pub mod bulk;
+
 pub mod allele;
 pub mod build;
 pub mod error;
