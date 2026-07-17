@@ -674,7 +674,13 @@ def _gap_bins_lazy(lf: pl.LazyFrame) -> pl.LazyFrame:
 def assert_pvar_sorted(lf: pl.LazyFrame) -> None:
     """Fail if any within-contig POS is out of order (the precondition
     `_gap_bins_lazy` relies on after dropping its sort). Streams: one boolean
-    reduction, bounded memory."""
+    reduction, bounded memory.
+
+    Caveat: this checks only descending POS between *adjacent same-contig*
+    rows. It does not detect a contig split into non-contiguous blocks
+    (interleaved contigs), which would also break the sort-free gap path --
+    plink2 always emits contig-grouped pvar, so that case does not arise
+    for our inputs."""
     bad = (
         lf.select(
             (pl.col("CHROM") == pl.col("CHROM").shift(1)).alias("same"),
@@ -1217,9 +1223,9 @@ def _validate_with_rust(path: Path) -> None:
     (from the repo root, so it works regardless of the caller's cwd) --
     the exact same `Profile::from_json` + `Profile::validate` a profile
     goes through once the crate embeds it via ``include_str!``. This turns
-    a bad fit (e.g. `titv <= 0`, `ploidy == 0`, a NaN histogram bin) into
-    an immediate failure here instead of a much-later failure inside the
-    Rust crate.
+    a bad fit (e.g. `ploidy == 0`, a rate like `missing_rate` outside
+    [0, 1], a NaN histogram bin) into an immediate failure here instead of
+    a much-later failure inside the Rust crate.
 
     Behavior:
     - If ``cargo`` is not found on ``PATH`` (e.g. a Python-only sandbox
