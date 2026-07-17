@@ -16,7 +16,6 @@ from fit_profile import (
     _multiallelic_rate_from_row,
     _multiallelic_rate_lazy,
     _sfs_edges,
-    _split_alt_cts,
     class_mix_from_counts,
     compute_pvar_stats,
     fit_missing_rate_from_sites_vcf,
@@ -108,14 +107,6 @@ def test_histogram_does_not_warn_when_all_values_in_range():
 # --------------------------------------------------------------------------
 # Multiallelic ALT: per-allele split (the "Critical" finding)
 # --------------------------------------------------------------------------
-
-
-def test_split_alt_cts_parses_plink2s_comma_joined_column():
-    # This is exactly the string plink2 `--freq counts` emits for a
-    # multiallelic site's ALT_CTS -- passing it straight into
-    # np.asarray(..., dtype=float) is what crashed fit_sfs() before the fix.
-    assert _split_alt_cts(["1,1"]) == [1.0, 1.0]
-    assert _split_alt_cts(["2,1", "3", "3"]) == [2.0, 1.0, 3.0, 3.0]
 
 
 def test_fit_sfs_regression_comma_joined_alt_cts_no_longer_crashes(monkeypatch, tmp_path):

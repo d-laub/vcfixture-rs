@@ -751,28 +751,6 @@ def _pfile_args(pgen_prefix: str | Path, vzs: bool) -> list[str]:
     return args
 
 
-def _split_alt_cts(alt_cts: Sequence[str] | pl.Series) -> list[float]:
-    """Parse plink2 `--freq counts` ALT_CTS into one count per ALT allele.
-
-    For a multiallelic site, plink2's `.acount` keeps `ALT` and `ALT_CTS`
-    comma-joined and positionally aligned (e.g. `ALT="G,T"`,
-    `ALT_CTS="1,1"`): the i-th count belongs to the i-th ALT allele. This
-    splits that alignment into one float observation per allele, matching
-    the per-allele split `_explode_alleles` does for classification.
-
-    This is the small-scale, eager reference implementation (`Series` in,
-    `list[float]` out) -- fine for a handful of rows (as in the unit tests
-    below), but NOT how `fit_sfs` computes the real `sfs` histogram: a
-    1kGP-scale `.acount` has one row per pvar record (up to ~350M for the
-    somatic cohort), so materializing every count into a Python list would
-    reproduce the exact OOM `read_pvar` used to cause. `fit_sfs` instead
-    performs the equivalent split+explode lazily via `pl.scan_csv` and only
-    collects the tiny, bucketized `histogram_lazy` result.
-    """
-    s = pl.Series("ALT_CTS", list(alt_cts), dtype=pl.Utf8)
-    return s.str.split(",").explode(empty_as_null=False).cast(pl.Float64).to_list()
-
-
 def _sfs_from_ac(lf: pl.LazyFrame, ac_col: str, n_samples: int) -> dict:
     """Reduce a LazyFrame's per-allele allele-count column to the finalized `sfs` histogram.
 
@@ -803,11 +781,11 @@ def fit_sfs(
     the site-frequency-spectrum input the `sfs` histogram is fit from. For
     multiallelic sites plink2 keeps ALT_CTS comma-joined (aligned with the
     equally comma-joined ALT column); this splits that into one count per
-    allele, exactly like `_split_alt_cts`, but does so lazily via
-    `pl.scan_csv` + `histogram_lazy` and returns the finalized histogram
-    directly -- the `.acount` file has one row per pvar record (up to ~350M
-    for the somatic cohort), so collecting every count into a Python list
-    (the old behavior) would materialize hundreds of millions of floats.
+    allele, lazily via `pl.scan_csv` + `histogram_lazy`, and returns the
+    finalized histogram directly -- the `.acount` file has one row per pvar
+    record (up to ~350M for the somatic cohort), so collecting every count
+    into a Python list first would materialize hundreds of millions of
+    floats.
 
     The temporary directory holding `.acount` is deleted once this function
     returns, so the full lazy-scan-to-histogram pipeline (including the
@@ -922,7 +900,12 @@ def fit_phased_rate(
                     if "|" in gt:
                         n_phased += 1
                     n_total += 1
-        return n_phased / n_total if n_total else 1.0
+        if n_total == 0:
+            raise ValueError(
+                "no genotype calls found in the phase-sampling window; "
+                "cannot estimate phased_rate"
+            )
+        return n_phased / n_total
 
 
 # --------------------------------------------------------------------------
@@ -1053,10 +1036,6 @@ def _fit_from_sites_vcf(args: argparse.Namespace) -> dict:
     if not contigs:
         raise ValueError("no variants found for the requested contig(s)")
 
-    # A lazy row count of the PASS + contig-filtered frame, not a
-    # Python-side sum over `contigs` -- see the brief's provenance note.
-    n_variants_source = int(lf.select(pl.len()).collect(engine="streaming").item())
-
     sfs = fit_sfs_from_sites_vcf(lf, args.n_samples)
     missing_rate = fit_missing_rate_from_sites_vcf(lf, args.n_samples)
 
@@ -1075,7 +1054,6 @@ def _fit_from_sites_vcf(args: argparse.Namespace) -> dict:
         phased_rate=args.phased_rate,
         ploidy=args.ploidy,
         payload=args.payload,
-        n_variants_source=n_variants_source,
     )
 
 

@@ -24,11 +24,14 @@ writes the first one:
   variant density, the inter-variant gap distribution, the site-frequency
   spectrum (allele-count histogram), variant-class mix, indel-length
   distribution, Ti/Tv, multiallelic rate, missing rate, phased rate, and
-  ploidy. Every value here is computed from the source (`--pgen` or
-  `--sites-vcf`) -- with the one exception of `phased_rate` under
+  ploidy. Most of these are computed from the source (`--pgen` or
+  `--sites-vcf`), but two are supplied rather than measured, on both paths:
+  `ploidy`, which is always taken verbatim from `--ploidy` (default `2`) and
+  is never derived from either source; and `phased_rate` under
   `--sites-vcf`, which is passed verbatim via `--phased-rate` since a
-  sites-only source has no genotypes to fit it from. The script never
-  hand-picks any other `fitted` value.
+  sites-only source has no genotypes to fit it from (`--pgen` *does* fit
+  `phased_rate` from the source). The script never hand-picks any other
+  `fitted` value.
 - **`dialed`** — generation choices independent of any fit. Today that's just
   `payload` (the FORMAT-field preset: `gt-only`, `gt-vaf`, `gatk`, or
   `mutect2`), which cannot be inferred from either source (neither carries
@@ -69,8 +72,7 @@ apply and must not be conflated:
   these three, computed by `compute_pvar_stats`. `fit_sfs` mirrors this on
   the plink2 side: `plink2 --freq counts` keeps `ALT_CTS` comma-joined and
   positionally aligned with `ALT` (e.g. `ALT="G,T"`, `ALT_CTS="1,1"`), and
-  `_split_alt_cts` splits that into one allele-count observation per
-  `sfs` input.
+  splits that lazily into one allele-count observation per `sfs` input.
 
 A biallelic-only pvar is unaffected either way -- splitting a single-allele
 ALT is a no-op.
@@ -126,15 +128,20 @@ to derive the cohort size from) and `--phased-rate` (no genotypes to count
 phased/unphased calls from); both are rejected if passed with `--pgen`,
 which fits both automatically instead.
 
-## Re-fitting the two committed profiles
+## Re-fitting the three committed profiles
 
 ```bash
-# germline-1kgp (3,202 samples; gt-only is 1kGP-faithful)
+# germline-1kgp (3,202 samples; gt-only is 1kGP-faithful). Restricted to the
+# 25 primary-assembly contigs: an unrestricted fit over the full callset
+# pulls in 2,587 HLA/decoy/alt contigs carrying 2.48% of variants and
+# inflates the JSON 54x -- profiles are `include_str!`'d into the binary, so
+# that bloat ships in every build.
 pixi run -e fit fit -- \
     --pgen /carter/users/dlaub/data/1kGP/plink2/hg38.norm \
     --name germline-1kgp \
     --out profiles/germline-1kgp.json \
-    --payload gt-only
+    --payload gt-only \
+    --contigs 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 X Y MT
 
 # somatic-gdc (16,007 samples; note the source .pvar is uncompressed,
 # not .pvar.zst -- the prefix is the same either way)
@@ -143,12 +150,29 @@ pixi run -e fit fit -- \
     --name somatic-gdc \
     --out profiles/somatic-gdc.json \
     --payload gt-vaf
+
+# germline-1kgp-unphased (3,202 samples; sites-only path). Source is a
+# PASS-filtered, split-multiallelic, sites-only VCF (chr21+chr22) built by
+# `bcftools concat` from the 1000 Genomes raw GATK
+# `*.recalibrated_variants.annotated.vcf.gz` files -- the only available
+# source of a realistic 1kGP allele-frequency spectrum, since the phased
+# panel above has 0% singletons (phasing drops unphaseable singletons).
+# `--phased-rate 0.0` is not a guess: it was measured at exactly 0.000000
+# over 7,950,566 real genotype calls from the same callset's raw
+# (genotype-bearing) VCF -- raw GATK output contains no `|` separators at
+# all.
+pixi run -e fit fit -- \
+    --sites-vcf /carter/users/dlaub/data/1kGP/unphased/annot/1kGP.unphased.chr21_22.sites.vcf.gz \
+    --n-samples 3202 --phased-rate 0.0 \
+    --name germline-1kgp-unphased --payload gt-only \
+    --out profiles/germline-1kgp-unphased.json
 ```
 
-Re-fitting new data is the same one command with a different `--pgen` prefix.
-The output must be committed to `profiles/` -- `Profile::builtin` embeds it
-at compile time via `include_str!`, so the crate only ever reads the
-committed JSON, never `/carter` at build or run time.
+Re-fitting new data is the same one command with a different `--pgen`/
+`--sites-vcf` source. The output must be committed to `profiles/` --
+`Profile::builtin` embeds it at compile time via `include_str!`, so the
+crate only ever reads the committed JSON, never `/carter` at build or run
+time.
 
 ## Tests
 
@@ -168,3 +192,14 @@ multiallelic crash this script used to hit) -- those are marked
 `--sites-vcf` end-to-end tests build a small bgzipped+tabix-indexed sites
 VCF with `bcftools view -Oz` + `bcftools index -t` and are marked
 `@pytest.mark.skipif(not BCFTOOLS_AVAILABLE, ...)`.
+
+`test-fit` deliberately excludes `test_fidelity.py` (`--ignore`), even
+though its only skip guard is `plink2` availability, which the `fit`
+environment satisfies. That test generates a full 3,202-sample BCF via
+`cargo run --release` and re-fits it -- real work on the order of tens of
+seconds, not the "small synthetic inputs" this suite is otherwise scoped
+to. Run it explicitly instead:
+
+```bash
+pixi run -e fit test-fidelity
+```
