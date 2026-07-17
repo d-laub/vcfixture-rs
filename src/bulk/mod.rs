@@ -545,6 +545,16 @@ impl BulkSpec {
             for (c, e) in counts.iter_mut().zip(&extra_split) {
                 *c += e;
             }
+            // `write_to_temp` may have left a `<tmp_path>.csi` companion
+            // (Bcf only) that `NamedTempFile`'s `Drop` does not know about;
+            // best-effort clean it up, mirroring
+            // `BulkSpec::measure_compressed_bytes`, so repeated corrective
+            // rounds don't litter the temp dir.
+            if matches!(self.format, Format::Bcf) {
+                let mut csi_path = tmp.path().as_os_str().to_os_string();
+                csi_path.push(".csi");
+                let _ = std::fs::remove_file(csi_path);
+            }
             drop(tmp); // discard the under-target temp before regenerating
         }
 
