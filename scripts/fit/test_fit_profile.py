@@ -508,6 +508,25 @@ def test_main_rejects_phased_rate_with_pgen(tmp_path):
         )
 
 
+def test_main_rejects_phase_sample_mb_with_sites_vcf(tmp_path):
+    # --phase-sample-mb only affects the pgen path's phased_rate window
+    # sampling; under --sites-vcf, phased_rate comes verbatim from
+    # --phased-rate, so a hand-supplied --phase-sample-mb would be silently
+    # meaningless -- reject it like --n-samples/--phased-rate are rejected
+    # under --pgen.
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "--sites-vcf", "unused.vcf.gz",
+                "--n-samples", "100",
+                "--phased-rate", "0.5",
+                "--phase-sample-mb", "2.0",
+                "--name", "x",
+                "--out", str(tmp_path / "out.json"),
+            ]
+        )
+
+
 # --------------------------------------------------------------------------
 # End-to-end: --sites-vcf through main() produces a schema-valid profile
 # --------------------------------------------------------------------------

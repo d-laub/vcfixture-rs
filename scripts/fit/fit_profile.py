@@ -50,8 +50,10 @@ committed profiles.
 from __future__ import annotations
 
 import argparse
+import atexit
 import datetime as _dt
 import json
+import shutil
 import subprocess
 import tempfile
 import warnings
@@ -364,11 +366,17 @@ def read_sites_vcf(path: str | Path, contigs: Iterable[str] | None = None) -> pl
     that file whenever a caller eventually collects it, so the directory
     must outlive this function's return -- a context manager would delete
     the TSV out from under the returned frame the moment `read_sites_vcf`
-    returns. The directory is intentionally left for the OS's normal temp
-    cleanup; this script runs once per `fit` invocation, not as a long-lived
-    process.
+    returns. Instead, cleanup is registered with `atexit`: the directory is
+    removed when the process exits, which is exactly the returned
+    `LazyFrame`'s lifetime (this script runs once per `fit` invocation, not
+    as a long-lived process), so nothing needs to collect the frame early
+    just to let the directory be deleted, and a real run's hundreds-of-MB
+    TSV no longer lingers in the system temp dir waiting for the OS to age
+    it out.
     """
-    tsv_path = Path(tempfile.mkdtemp()) / "sites.tsv"
+    d = tempfile.mkdtemp()
+    atexit.register(shutil.rmtree, d, ignore_errors=True)
+    tsv_path = Path(d) / "sites.tsv"
     args = ["query", "-i", 'FILTER="PASS"', "-f", "%CHROM\t%POS\t%REF\t%ALT\t%AC\t%AN\n"]
     if contigs:
         args += ["-r", ",".join(contigs)]
@@ -706,31 +714,24 @@ def _run_plink2(args: list[str]) -> None:
         )
 
 
-def _run_bcftools(args: list[str], stdout_path: str | Path | None = None) -> None:
+def _run_bcftools(args: list[str], stdout_path: str | Path) -> None:
     """Shell out to `bcftools`, mirroring `_run_plink2`'s error-handling style.
 
-    When `stdout_path` is given, bcftools' stdout is streamed directly to
-    that file by the subprocess itself (`stdout=<file handle>`), never
-    captured through a Python string first -- `read_sites_vcf` passes a TSV
-    output path here for exactly the reason `read_pvar`'s docstring
-    explains at length: a 1kGP-scale sites-only VCF's PASS records can be
-    tens of millions of rows, and `subprocess.run(capture_output=True)`
+    bcftools' stdout is streamed directly to `stdout_path` by the subprocess
+    itself (`stdout=<file handle>`), never captured through a Python string
+    first -- required (not optional) for exactly the reason `read_pvar`'s
+    docstring explains at length: a 1kGP-scale sites-only VCF's PASS records
+    can be tens of millions of rows, and `subprocess.run(capture_output=True)`
     would materialize the whole TSV as one Python string before polars ever
-    saw it.
+    saw it. Every caller streams to a file, so there is no in-memory-capture
+    mode to keep around.
     """
-    if stdout_path is not None:
-        with open(stdout_path, "wb") as out_fh:
-            result = subprocess.run(["bcftools", *args], stdout=out_fh, stderr=subprocess.PIPE)
-        stdout_msg = ""
-        stderr_msg = result.stderr.decode(errors="replace")
-    else:
-        result = subprocess.run(["bcftools", *args], capture_output=True, text=True)
-        stdout_msg = result.stdout
-        stderr_msg = result.stderr
+    with open(stdout_path, "wb") as out_fh:
+        result = subprocess.run(["bcftools", *args], stdout=out_fh, stderr=subprocess.PIPE)
     if result.returncode != 0:
         raise RuntimeError(
             f"bcftools {' '.join(args)} failed (exit {result.returncode}):\n"
-            f"{stdout_msg}\n{stderr_msg}"
+            f"{result.stderr.decode(errors='replace')}"
         )
 
 
@@ -1115,10 +1116,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--phase-sample-mb",
         type=float,
-        default=1.0,
+        default=None,
         help=(
-            "window size (Mb), from the first fitted contig's start, used to "
-            "estimate phased_rate (--pgen only)"
+            "window size (Mb, default 1.0), from the first fitted contig's "
+            "start, used to estimate phased_rate (--pgen only)"
         ),
     )
     parser.add_argument(
@@ -1149,6 +1150,12 @@ def main(argv: list[str] | None = None) -> None:
             )
         if not (0.0 <= args.phased_rate <= 1.0):
             parser.error(f"--phased-rate must be in [0, 1], got {args.phased_rate}")
+        if args.phase_sample_mb is not None:
+            parser.error(
+                "--phase-sample-mb is only valid with --pgen (it only affects "
+                "the phased_rate window sampled from genotypes; --sites-vcf's "
+                "phased_rate comes from --phased-rate instead)"
+            )
     else:
         if args.n_samples is not None:
             parser.error(
@@ -1158,6 +1165,8 @@ def main(argv: list[str] | None = None) -> None:
             parser.error(
                 "--phased-rate is only valid with --sites-vcf (--pgen fits it from genotypes)"
             )
+        if args.phase_sample_mb is None:
+            args.phase_sample_mb = 1.0
 
     profile = _fit_from_sites_vcf(args) if args.sites_vcf else _fit_from_pgen(args)
 
