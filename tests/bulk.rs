@@ -436,24 +436,18 @@ fn duplicate_contig_names_are_rejected() {
 
 /// `SampleStats::value_for` (`src/bulk/generate.rs`) hard-codes `AD` as a
 /// 2-element `[n_ref, n_alt]` and `PL` as a fixed 3-element diploid
-/// likelihood triple -- correct only for `ploidy == 2`. `Profile::validate`
-/// only requires `ploidy >= 1`, so a ploidy-3 profile combined with a
-/// payload that declares `PL`/`AD` (`Gatk`, `Mutect2`) must be rejected
-/// rather than silently emitting genotype-likelihood/allele-depth fields
-/// whose cardinality doesn't match the declared ploidy.
+/// likelihood triple -- correct only for `ploidy == 2`. A ploidy-3 profile
+/// combined with a payload that declares `PL`/`AD` (`Gatk`, `Mutect2`) must
+/// be rejected by `Profile::validate` at parse time, rather than silently
+/// emitting genotype-likelihood/allele-depth fields whose cardinality
+/// doesn't match the declared ploidy.
 #[test]
 fn non_diploid_profile_rejects_payloads_declaring_pl_or_ad() {
-    let profile = Profile::from_json(TRIPLOID_PROFILE).unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let mut profile = Profile::from_json(TRIPLOID_PROFILE).unwrap();
 
     for payload in [Payload::Gatk, Payload::Mutect2] {
-        let path = dir.path().join(format!("{payload:?}.bcf"));
-        let result = BulkSpec::new(profile.clone())
-            .samples(4)
-            .contigs(["chr1"])
-            .payload(payload.clone())
-            .size(Size::RecordsPerContig(10))
-            .write(&path);
+        profile.dialed.payload = payload.clone();
+        let result = profile.validate();
         assert!(
             matches!(result, Err(BulkError::Invalid(_))),
             "payload {payload:?} declares PL/AD, which are diploid-only; \
@@ -464,15 +458,20 @@ fn non_diploid_profile_rejects_payloads_declaring_pl_or_ad() {
 
 /// The flip side of the guard above: a non-diploid profile combined with a
 /// payload that does *not* declare `PL`/`AD` (`GtOnly`, `GtVaf`) must still
-/// write successfully -- the guard is specific to the fields that are
-/// actually hard-coded for diploid, not a blanket rejection of non-diploid
-/// profiles.
+/// pass `validate()` and write successfully -- the guard is specific to the
+/// fields that are actually hard-coded for diploid, not a blanket rejection
+/// of non-diploid profiles.
 #[test]
 fn non_diploid_profile_accepts_payloads_without_pl_or_ad() {
-    let profile = Profile::from_json(TRIPLOID_PROFILE).unwrap();
+    let mut profile = Profile::from_json(TRIPLOID_PROFILE).unwrap();
     let dir = tempfile::tempdir().unwrap();
 
     for payload in [Payload::GtOnly, Payload::GtVaf] {
+        profile.dialed.payload = payload.clone();
+        profile
+            .validate()
+            .unwrap_or_else(|e| panic!("payload {payload:?} must not need ploidy 2: {e}"));
+
         let path = dir.path().join(format!("{payload:?}.bcf"));
         let s = BulkSpec::new(profile.clone())
             .samples(4)

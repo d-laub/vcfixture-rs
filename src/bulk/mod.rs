@@ -296,24 +296,6 @@ impl BulkSpec {
         }
 
         let fitted = &self.profile.fitted;
-        // `SampleStats::value_for` (`generate.rs`) hard-codes `AD`/`PL` values
-        // sized for exactly 2 allele calls per sample (diploid): `AD` is a
-        // 2-element `[n_ref, n_alt]`, `PL` a fixed 3-element diploid
-        // likelihood triple. A profile with `ploidy != 2` would declare a
-        // `Number=G` FORMAT field but emit values that don't actually match
-        // that ploidy's genotype-likelihood cardinality, producing a
-        // malformed file rather than an error. `Profile::validate` only
-        // requires `ploidy >= 1`, so this must be checked here.
-        let keys = payload_keys(&self.payload);
-        let ploidy = self.profile.dialed.ploidy;
-        if (keys.contains(&"PL") || keys.contains(&"AD")) && ploidy != 2 {
-            return Err(BulkError::Invalid(format!(
-                "payload {:?} declares PL and/or AD, which are hard-coded for \
-                 diploid (ploidy 2) genotype calls, but the profile's ploidy is {}",
-                self.payload, ploidy
-            )));
-        }
-
         // The sfs histogram's edges are absolute allele counts against the
         // *source* cohort's AN, not frequencies (see `BulkSpec::samples`'s
         // doc comment); `Samplers::allele_count` needs that source AN to

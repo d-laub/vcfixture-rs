@@ -93,6 +93,14 @@ pub enum Payload {
     Mutect2,
 }
 
+impl Payload {
+    /// True if this preset emits AD or PL, both hard-coded diploid in
+    /// `generate::SampleStats`.
+    pub(crate) fn needs_diploid(&self) -> bool {
+        matches!(self, Payload::Gatk | Payload::Mutect2)
+    }
+}
+
 impl Profile {
     /// Load a profile bundled with the crate by name.
     pub fn builtin(name: &str) -> Result<Profile, BulkError> {
@@ -120,6 +128,13 @@ impl Profile {
         self.fitted.variant_classes.validate()?;
         if self.dialed.ploidy == 0 {
             return Err(BulkError::Invalid("ploidy must be >= 1".into()));
+        }
+        if self.dialed.payload.needs_diploid() && self.dialed.ploidy != 2 {
+            return Err(BulkError::Invalid(format!(
+                "payload {:?} emits AD and/or PL, which are hard-coded for \
+                 diploid (ploidy 2) calls, but ploidy is {}",
+                self.dialed.payload, self.dialed.ploidy
+            )));
         }
         for (label, v) in [
             ("multiallelic_rate", self.fitted.multiallelic_rate),
@@ -389,5 +404,17 @@ mod tests {
         let p: Payload = serde_json::from_str(json).unwrap();
         assert_eq!(p, Payload::Mutect2);
         assert_eq!(serde_json::to_string(&p).unwrap(), json);
+    }
+
+    #[test]
+    fn validate_rejects_diploid_payload_with_nondiploid_ploidy() {
+        let mut p = Profile::builtin("germline-1kgp").unwrap();
+        p.dialed.payload = Payload::Gatk;
+        p.dialed.ploidy = 3;
+        let err = p.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("diploid"),
+            "expected a diploid-ploidy rejection, got: {err:?}"
+        );
     }
 }
