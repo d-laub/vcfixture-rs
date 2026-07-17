@@ -2,6 +2,11 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_only:
+        description: "Skip bump/tag/GitHub-release; just publish the current Cargo.toml version to crates.io. Use to recover when a prior run bumped and tagged but failed before publishing."
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -32,6 +37,7 @@ jobs:
       # fold the Cargo.lock sync into the single bump commit.
       - name: Bump version
         id: cz
+        if: ${{ !inputs.publish_only }}
         uses: commitizen-tools/commitizen-action@0.23.1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -41,11 +47,13 @@ jobs:
       # commitizen-action is a Docker action running as root, so the objects and
       # files it writes are root-owned and unwritable by the runner user.
       - name: Reclaim workspace ownership
+        if: ${{ !inputs.publish_only }}
         run: sudo chown -R "$(id -u):$(id -g)" .
 
       # commitizen bumps Cargo.toml but not Cargo.lock; sync it and amend it into
       # the bump commit so the committed lockfile is never stale.
       - name: Sync lockfile and push
+        if: ${{ !inputs.publish_only }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -57,6 +65,7 @@ jobs:
           git push origin "v${{ steps.cz.outputs.version }}"
 
       - name: Create GitHub release
+        if: ${{ !inputs.publish_only }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

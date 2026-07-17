@@ -28,3 +28,8 @@ docs/book/book/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Transient changelog slice written by the release workflow (commitizen
+# changelog_increment_filename). Ignored so `cargo publish` doesn't see a dirty
+# tree or bundle it into the package.
+.release-notes.md
