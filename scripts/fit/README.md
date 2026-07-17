@@ -1,8 +1,19 @@
 # `scripts/fit/`
 
-`fit_profile.py` turns a real plink2 pgen/pvar cohort into a `vcfixture` bulk-generation
+`fit_profile.py` turns a real cohort into a `vcfixture` bulk-generation
 profile JSON (`profiles/*.json`), the file `Profile::builtin` embeds via
-`include_str!` in `src/bulk/profile.rs`.
+`include_str!` in `src/bulk/profile.rs`. It supports two mutually exclusive
+input modes:
+
+- **`--pgen`** — a plink2 fileset with genotypes. `n_samples`, `sfs`,
+  `missing_rate`, and `phased_rate` are all fitted from it.
+- **`--sites-vcf`** — a sites-only VCF/BCF with no genotype columns at all
+  (only `INFO/AC`/`INFO/AN`), e.g. the 1000 Genomes raw GATK callset -- the
+  only available source of a realistic 1kGP allele-frequency spectrum (the
+  phased panel already fit has 0% singletons, since phasing drops
+  unphaseable singletons). `n_samples` and `phased_rate` cannot be derived
+  from a sites-only file and must be passed explicitly via `--n-samples`
+  and `--phased-rate`.
 
 ## What it does
 
@@ -13,23 +24,36 @@ writes the first one:
   variant density, the inter-variant gap distribution, the site-frequency
   spectrum (allele-count histogram), variant-class mix, indel-length
   distribution, Ti/Tv, multiallelic rate, missing rate, phased rate, and
-  ploidy. Every value here is computed from `--pgen`; the script never
-  hand-picks a `fitted` value.
+  ploidy. Every value here is computed from the source (`--pgen` or
+  `--sites-vcf`) -- with the one exception of `phased_rate` under
+  `--sites-vcf`, which is passed verbatim via `--phased-rate` since a
+  sites-only source has no genotypes to fit it from. The script never
+  hand-picks any other `fitted` value.
 - **`dialed`** — generation choices independent of any fit. Today that's just
   `payload` (the FORMAT-field preset: `gt-only`, `gt-vaf`, `gatk`, or
-  `mutect2`), which cannot be inferred from a pgen (pgen stores genotypes
-  only, no per-record FORMAT payload) and is instead passed via `--payload`.
+  `mutect2`), which cannot be inferred from either source (neither carries
+  a per-record FORMAT payload) and is instead passed via `--payload`.
 
 `provenance` (source path, sample/variant counts, fit date, tool version) is
 always populated from the real run -- never left as a placeholder.
 
-Internally: `polars.scan_csv` (lazy, streaming) reads the pvar for contigs,
-gaps, variant classification, indel lengths, Ti/Tv, and multiallelic rate;
-`plink2 --freq counts` supplies the site-frequency spectrum; `plink2
---missing` supplies the missing-call rate; a bounded VCF export
-(`--phase-sample-mb`, default 1 Mb from the first fitted contig) supplies an
-estimate of the phased-call rate, since pgen has no direct phase-fraction
-report.
+Internally, for `--pgen`: `polars.scan_csv` (lazy, streaming) reads the pvar
+for contigs, gaps, variant classification, indel lengths, Ti/Tv, and
+multiallelic rate; `plink2 --freq counts` supplies the site-frequency
+spectrum; `plink2 --missing` supplies the missing-call rate; a bounded VCF
+export (`--phase-sample-mb`, default 1 Mb from the first fitted contig)
+supplies an estimate of the phased-call rate, since pgen has no direct
+phase-fraction report.
+
+For `--sites-vcf`: `bcftools query -i 'FILTER="PASS"'` reads
+`CHROM/POS/REF/ALT/AC/AN` (dropping VQSR-tranche/`LowQual` records, which
+make up ~14-16% of the raw 1kGP callset) into the same lazy pipeline that
+computes contigs/gaps/classification/indel-lengths/Ti-Tv/multiallelic-rate
+for `--pgen` (`compute_pvar_stats` is shared, unduplicated, between both
+paths). The site-frequency spectrum is built directly from `INFO/AC`
+(multiallelics are already split into one row per ALT allele upstream, so
+no explode step is needed); the missing rate is derived from `INFO/AN`
+relative to `2 * --n-samples`.
 
 **Multiallelic records.** plink2 pvar retains multiallelic sites natively
 (it does NOT auto-split them the way `bcftools norm -m-` would), so `ALT`
@@ -70,6 +94,7 @@ the crate is the JSON schema in `src/bulk/profile.rs`.
 ## Usage
 
 ```bash
+# --pgen: genotyped plink2 fileset
 pixi run -e fit fit -- \
     --pgen <plink2 prefix> \
     --name <profile-name> \
@@ -77,11 +102,29 @@ pixi run -e fit fit -- \
     [--payload gt-only|gt-vaf|gatk|mutect2] \
     [--contigs chr1 chr2 ...] \
     [--ploidy 2]
+
+# --sites-vcf: sites-only VCF/BCF, no genotypes
+pixi run -e fit fit -- \
+    --sites-vcf <path/to/sites.vcf.gz> \
+    --name <profile-name> \
+    --out profiles/<profile-name>.json \
+    --n-samples <cohort size> \
+    --phased-rate <fixed rate in [0, 1]> \
+    [--payload gt-only|gt-vaf|gatk|mutect2] \
+    [--contigs chr1 chr2 ...] \
+    [--ploidy 2]
 ```
+
+`--pgen` and `--sites-vcf` are mutually exclusive; exactly one is required.
 
 `--pgen` is a plink2 fileset *prefix*: the script expects
 `<prefix>.pgen`, `<prefix>.psam`, and either `<prefix>.pvar.zst` or
 `<prefix>.pvar`.
+
+`--sites-vcf` requires `--n-samples` (a sites-only VCF has no sample columns
+to derive the cohort size from) and `--phased-rate` (no genotypes to count
+phased/unphased calls from); both are rejected if passed with `--pgen`,
+which fits both automatically instead.
 
 ## Re-fitting the two committed profiles
 
@@ -115,10 +158,13 @@ pixi run -e fit test-fit
 
 The test suite (`test_fit_profile.py`) exercises only the small synthetic
 inputs it constructs inline -- it never touches `/carter` and requires no
-network access. Most tests need only `polars`/`numpy` (no `plink2`); a
-handful of end-to-end tests build a tiny synthetic multiallelic VCF, convert
-it with `plink2 --make-pgen`, and run it through the full extraction
-pipeline (the gold-standard regression coverage for the multiallelic
-crash this script used to hit) -- those are marked
+network access. Most tests need only `polars`/`numpy` (no `plink2`/
+`bcftools`); a handful of end-to-end tests build a tiny synthetic
+multiallelic VCF, convert it with `plink2 --make-pgen`, and run it through
+the full extraction pipeline (the gold-standard regression coverage for the
+multiallelic crash this script used to hit) -- those are marked
 `@pytest.mark.skipif(not PLINK2_AVAILABLE, ...)` and skip cleanly wherever
-`plink2` is not on `PATH`, such as CI.
+`plink2` is not on `PATH`, such as CI. Similarly, `read_sites_vcf` and
+`--sites-vcf` end-to-end tests build a small bgzipped+tabix-indexed sites
+VCF with `bcftools view -Oz` + `bcftools index -t` and are marked
+`@pytest.mark.skipif(not BCFTOOLS_AVAILABLE, ...)`.

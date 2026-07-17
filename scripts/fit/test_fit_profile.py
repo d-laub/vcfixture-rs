@@ -19,12 +19,16 @@ from fit_profile import (
     _split_alt_cts,
     class_mix_from_counts,
     compute_pvar_stats,
+    fit_missing_rate_from_sites_vcf,
     fit_sfs,
+    fit_sfs_from_sites_vcf,
     histogram,
     main,
+    read_sites_vcf,
 )
 
 PLINK2_AVAILABLE = shutil.which("plink2") is not None
+BCFTOOLS_AVAILABLE = shutil.which("bcftools") is not None
 
 
 def test_histogram_weights_are_one_shorter_than_edges():
@@ -333,3 +337,235 @@ def test_fit_sfs_preserves_positional_alignment_between_alt_and_alt_cts(tmp_path
     sfs = fit_sfs(prefix, n_samples=3)
     assert sfs["edges"] == [1.0, 2.0, 4.0, 6.0]
     assert sfs["weights"] == pytest.approx([0.25, 0.75, 0.0])
+
+
+# --------------------------------------------------------------------------
+# read_sites_vcf(): the sites-only-VCF input path (task 9b)
+# --------------------------------------------------------------------------
+
+
+def _write_sites_vcf(tmp_path):
+    """Small bgzipped+tabix-indexed sites-only VCF fixture with a PASS/VQSR mix.
+
+    Two contigs (numeric-looking ids, to exercise the CHROM-stays-string
+    contract) each carry one PASS record and one non-PASS record that must
+    be dropped -- one VQSR-tranche, one LowQual, matching the two FILTER
+    values actually seen on the real 1kGP raw callset.
+    """
+    vcf_path = tmp_path / "sites.vcf"
+    vcf_path.write_text(
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=21>\n"
+        "##contig=<ID=22>\n"
+        '##INFO=<ID=AC,Number=A,Type=Integer,Description="Allele count">\n'
+        '##INFO=<ID=AN,Number=1,Type=Integer,Description="Total alleles">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+        "21\t100\t.\tA\tG\t.\tPASS\tAC=1;AN=100\n"
+        "21\t200\t.\tC\tT\t.\tVQSRTrancheSNP99.80to100.00\tAC=5;AN=100\n"
+        "22\t150\t.\tG\tA\t.\tPASS\tAC=50;AN=100\n"
+        "22\t250\t.\tT\tC\t.\tLowQual\tAC=2;AN=100\n"
+    )
+    gz_path = tmp_path / "sites.vcf.gz"
+    subprocess.run(
+        ["bcftools", "view", "-Oz", "-o", str(gz_path), str(vcf_path)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["bcftools", "index", "-t", str(gz_path)], check=True, capture_output=True)
+    return gz_path
+
+
+@pytest.mark.skipif(not BCFTOOLS_AVAILABLE, reason="bcftools not installed")
+def test_read_sites_vcf_drops_non_pass_records(tmp_path):
+    vcf_path = _write_sites_vcf(tmp_path)
+    df = read_sites_vcf(vcf_path).collect()
+    # Only the two PASS records (21:100, 22:150) survive; the
+    # VQSRTranche/LowQual records must not reach the profile.
+    assert sorted(df["POS"].to_list()) == [100, 150]
+    assert set(df["AC"].to_list()) == {1, 50}
+
+
+@pytest.mark.skipif(not BCFTOOLS_AVAILABLE, reason="bcftools not installed")
+def test_read_sites_vcf_keeps_numeric_looking_contig_ids_as_strings(tmp_path):
+    vcf_path = _write_sites_vcf(tmp_path)
+    df = read_sites_vcf(vcf_path).collect()
+    assert df["CHROM"].dtype == pl.Utf8
+    assert set(df["CHROM"].to_list()) == {"21", "22"}
+
+
+@pytest.mark.skipif(not BCFTOOLS_AVAILABLE, reason="bcftools not installed")
+def test_read_sites_vcf_returns_a_lazyframe(tmp_path):
+    # Guards the memory contract documented in read_sites_vcf's docstring:
+    # callers must be able to reduce this before collecting, at real
+    # (tens-of-millions-of-rows) scale.
+    vcf_path = _write_sites_vcf(tmp_path)
+    lf = read_sites_vcf(vcf_path)
+    assert isinstance(lf, pl.LazyFrame)
+
+
+# --------------------------------------------------------------------------
+# fit_missing_rate_from_sites_vcf(): AN -> missing_rate arithmetic
+# --------------------------------------------------------------------------
+
+
+def test_fit_missing_rate_from_sites_vcf_full_an_gives_zero():
+    # AN == 2 * n_samples everywhere -> no missingness.
+    lf = pl.DataFrame({"AN": [20, 20, 20]}).lazy()
+    assert fit_missing_rate_from_sites_vcf(lf, n_samples=10) == pytest.approx(0.0)
+
+
+def test_fit_missing_rate_from_sites_vcf_half_an_gives_half():
+    # AN == n_samples everywhere (half of 2 * n_samples) -> 50% missing.
+    lf = pl.DataFrame({"AN": [10, 10, 10]}).lazy()
+    assert fit_missing_rate_from_sites_vcf(lf, n_samples=10) == pytest.approx(0.5)
+
+
+def test_fit_sfs_from_sites_vcf_uses_the_shared_sfs_edges():
+    # n_samples=3 -> _sfs_edges(3) == [1.0, 2.0, 4.0, 6.0]. AC values
+    # [1, 1, 2, 3]: the two 1s land in [1, 2), the 2 and 3 land in [2, 4).
+    lf = pl.DataFrame({"AC": [1, 1, 2, 3]}).lazy()
+    sfs = fit_sfs_from_sites_vcf(lf, n_samples=3)
+    assert sfs["edges"] == _sfs_edges(3)
+    assert sfs["weights"] == pytest.approx([0.5, 0.5, 0.0])
+
+
+# --------------------------------------------------------------------------
+# CLI validation: --pgen / --sites-vcf are mutually exclusive, and
+# --n-samples / --phased-rate are required with (and only with) --sites-vcf.
+# --------------------------------------------------------------------------
+
+
+def test_main_rejects_pgen_and_sites_vcf_together(tmp_path):
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "--pgen", "unused-prefix",
+                "--sites-vcf", "unused.vcf.gz",
+                "--name", "x",
+                "--out", str(tmp_path / "out.json"),
+            ]
+        )
+
+
+def test_main_rejects_sites_vcf_without_n_samples(tmp_path):
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "--sites-vcf", "unused.vcf.gz",
+                "--phased-rate", "0.5",
+                "--name", "x",
+                "--out", str(tmp_path / "out.json"),
+            ]
+        )
+
+
+def test_main_rejects_sites_vcf_without_phased_rate(tmp_path):
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "--sites-vcf", "unused.vcf.gz",
+                "--n-samples", "100",
+                "--name", "x",
+                "--out", str(tmp_path / "out.json"),
+            ]
+        )
+
+
+def test_main_rejects_out_of_range_phased_rate_with_sites_vcf(tmp_path):
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "--sites-vcf", "unused.vcf.gz",
+                "--n-samples", "100",
+                "--phased-rate", "1.5",
+                "--name", "x",
+                "--out", str(tmp_path / "out.json"),
+            ]
+        )
+
+
+def test_main_rejects_n_samples_with_pgen(tmp_path):
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "--pgen", "unused-prefix",
+                "--n-samples", "100",
+                "--name", "x",
+                "--out", str(tmp_path / "out.json"),
+            ]
+        )
+
+
+def test_main_rejects_phased_rate_with_pgen(tmp_path):
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "--pgen", "unused-prefix",
+                "--phased-rate", "0.5",
+                "--name", "x",
+                "--out", str(tmp_path / "out.json"),
+            ]
+        )
+
+
+# --------------------------------------------------------------------------
+# End-to-end: --sites-vcf through main() produces a schema-valid profile
+# --------------------------------------------------------------------------
+
+
+def _write_sites_vcf_for_e2e(tmp_path):
+    """A single-contig fixture shaped so `compute_pvar_stats` can run to
+    completion on the PASS-only records: three well-separated PASS
+    positions (nonzero gaps for `gap_dist`) with one transition and one
+    transversion (both a Ti and a Tv observation for `titv`) plus one
+    deletion (a non-empty `indel_length` histogram), and one VQSR-tranche
+    and one LowQual record that must be dropped.
+    """
+    vcf_path = tmp_path / "sites_e2e.vcf"
+    vcf_path.write_text(
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=21>\n"
+        '##INFO=<ID=AC,Number=A,Type=Integer,Description="Allele count">\n'
+        '##INFO=<ID=AN,Number=1,Type=Integer,Description="Total alleles">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+        "21\t100\t.\tA\tG\t.\tPASS\tAC=1;AN=100\n"          # SNP transition
+        "21\t150\t.\tC\tT\t.\tVQSRTrancheSNP99.80to100.00\tAC=5;AN=100\n"
+        "21\t200\t.\tG\tT\t.\tPASS\tAC=50;AN=100\n"         # SNP transversion
+        "21\t250\t.\tT\tC\t.\tLowQual\tAC=2;AN=100\n"
+        "21\t300\t.\tAT\tA\t.\tPASS\tAC=3;AN=100\n"         # deletion, length 1
+    )
+    gz_path = tmp_path / "sites_e2e.vcf.gz"
+    subprocess.run(
+        ["bcftools", "view", "-Oz", "-o", str(gz_path), str(vcf_path)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["bcftools", "index", "-t", str(gz_path)], check=True, capture_output=True)
+    return gz_path
+
+
+@pytest.mark.skipif(not BCFTOOLS_AVAILABLE, reason="bcftools not installed")
+def test_end_to_end_sites_vcf_produces_a_valid_profile(tmp_path):
+    vcf_path = _write_sites_vcf_for_e2e(tmp_path)
+    out_path = tmp_path / "profile.json"
+    main(
+        [
+            "--sites-vcf", str(vcf_path),
+            "--name", "sitestest",
+            "--out", str(out_path),
+            "--n-samples", "50",
+            "--phased-rate", "0.9",
+        ]
+    )
+
+    p = json.loads(out_path.read_text())
+    _replica_validate_profile(p)
+    assert p["provenance"]["source"] == str(vcf_path)
+    assert p["provenance"]["n_samples_source"] == 50
+    # 3 PASS records survive (POS 100, 200, 300) out of 5 raw records.
+    assert p["provenance"]["n_variants_source"] == 3
+    # phased_rate is taken verbatim from --phased-rate: no genotypes exist
+    # to fit it from.
+    assert p["fitted"]["phased_rate"] == pytest.approx(0.9)
+    # AN == 100 == 2 * n_samples everywhere -> no missingness.
+    assert p["fitted"]["missing_rate"] == pytest.approx(0.0)

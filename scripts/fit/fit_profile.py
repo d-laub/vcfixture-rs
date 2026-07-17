@@ -1,30 +1,47 @@
 #!/usr/bin/env python
-"""Fit a vcfixture bulk-generation ``Profile`` JSON from real plink2 pgen/pvar data.
+"""Fit a vcfixture bulk-generation ``Profile`` JSON from real cohort data.
 
 This script is the only place that turns a real cohort (1kGP high-coverage
-pgen, GDC somatic pgen, ...) into the committed profile JSON consumed by the
-Rust bulk generator (see ``src/bulk/profile.rs``). It is never imported by
-Rust and has no contract other than that JSON schema.
+pgen, GDC somatic pgen, a sites-only VCF such as the 1000 Genomes raw GATK
+callset, ...) into the committed profile JSON consumed by the Rust bulk
+generator (see ``src/bulk/profile.rs``). It is never imported by Rust and
+has no contract other than that JSON schema.
+
+Two mutually exclusive input modes are supported: ``--pgen`` (a plink2
+fileset with genotypes, from which ``n_samples``, ``sfs``, ``missing_rate``,
+and ``phased_rate`` are all fitted) and ``--sites-vcf`` (a sites-only
+VCF/BCF with no genotype columns at all, only ``INFO/AC``/``INFO/AN`` --
+``n_samples`` and ``phased_rate`` cannot be derived from it and must be
+passed explicitly via ``--n-samples``/``--phased-rate``).
 
 The profile schema deliberately separates ``fitted`` (statistics measured
-from ``--pgen``) from ``dialed`` (generation choices, e.g. FORMAT payload,
+from the source) from ``dialed`` (generation choices, e.g. FORMAT payload,
 that are picked by the user and never claimed to be measured). Every value
 this script writes under ``fitted`` is derived from the source data passed
-in; nothing here should ever be a hand-picked literal.
+in (or, for ``phased_rate`` under ``--sites-vcf``, passed explicitly since
+no genotypes exist to fit it from); nothing here should ever be a
+hand-picked literal presented as measured.
 
 Every statistic in this module is computed as a *lazy* polars aggregation
 whose collected result is small (a handful of rows, a histogram, a scalar)
--- never the full pvar/`.acount` frame. Real cohorts are 75M (1kGP germline)
-to 350M (somatic) rows with variable-length REF/ALT strings; materializing
-that as an eager `pl.DataFrame` or a Python list is what used to OOM-kill
-this script well before it finished (see git history / the design doc for
-the measured 20+ GB RSS). Keep every new statistic lazy end-to-end: build a
-`pl.LazyFrame` pipeline, and only `.collect()` a bounded-size result.
+-- never the full pvar/`.acount`/sites-VCF-TSV frame. Real cohorts are 75M
+(1kGP germline) to 350M (somatic) pvar rows, or tens of millions of
+sites-only VCF records per chromosome, with variable-length REF/ALT
+strings; materializing that as an eager `pl.DataFrame` or a Python list is
+what used to OOM-kill this script well before it finished (see git history
+/ the design doc for the measured 20+ GB RSS). Keep every new statistic
+lazy end-to-end: build a `pl.LazyFrame` pipeline, and only `.collect()` a
+bounded-size result.
 
 Usage
 -----
     pixi run -e fit fit -- \\
         --pgen /path/to/prefix --name germline-1kgp --out profiles/germline-1kgp.json
+
+    pixi run -e fit fit -- \\
+        --sites-vcf /path/to/sites.vcf.gz --name germline-1kgp-sites \\
+        --out profiles/germline-1kgp-sites.json \\
+        --n-samples 3202 --phased-rate 0.999
 
 See ``scripts/fit/README.md`` for the exact commands used to fit the two
 committed profiles.
@@ -302,6 +319,82 @@ def read_pvar(path: str | Path) -> pl.LazyFrame:
         schema_overrides={"#CHROM": pl.Utf8, "ID": pl.Utf8, "REF": pl.Utf8, "ALT": pl.Utf8},
     ).rename({"#CHROM": "CHROM"})
     return lf.select(["CHROM", "POS", "ID", "REF", "ALT"])
+
+
+def read_sites_vcf(path: str | Path, contigs: Iterable[str] | None = None) -> pl.LazyFrame:
+    """Lazily read a sites-only VCF/BCF's PASS records via `bcftools query`.
+
+    This is the sites-only-VCF analogue of `read_pvar`, for cohorts with no
+    genotype columns at all -- e.g. the 1000 Genomes raw GATK callset, the
+    only available source of a realistic 1kGP allele-frequency spectrum
+    (the phased panel already fit has 0% singletons, since phasing drops
+    unphaseable singletons). It carries `INFO/AC` and `INFO/AN` instead of
+    per-sample calls. It is also VQSR-tranched: ~14-16% of raw records carry
+    a `VQSRTrancheSNP99.80to100.00` / `VQSRTrancheINDEL99.00to100.00` /
+    `LowQual` FILTER, so the `bcftools query -i 'FILTER="PASS"'` below is the
+    cleaning step here, not an optimization -- those records must never
+    reach the profile.
+
+    `bcftools query` streams its TSV output directly to a file on disk (via
+    `_run_bcftools`'s `stdout_path`), never through a materialized Python
+    string, and this function returns an *unmaterialized* `pl.LazyFrame`
+    scanning that file -- exactly the memory contract `read_pvar`'s
+    docstring documents at length, for the same reason: a 1kGP-chromosome
+    sites-only VCF is ~337 MB with tens of millions of PASS records, and a
+    prior version of this script was OOM-killed at 20.8 GB for eagerly
+    materializing data at this scale. Callers must keep every downstream
+    statistic expressed as a lazy aggregation and only collect small,
+    bounded results -- never call `.collect()` on the frame returned here
+    without first reducing it.
+
+    Returns columns `CHROM (Utf8), POS (Int64), ID (Utf8), REF (Utf8), ALT
+    (Utf8), AC (Int64), AN (Int64)`. `ID` is always the literal `"."` --
+    sites-only callsets carry no meaningful per-record ID, but `pvar`'s
+    schema (and `compute_pvar_stats`, which this frame is fed into via
+    `.select(["CHROM", "POS", "ID", "REF", "ALT"])`) has one, so a
+    placeholder keeps the two readers' output interchangeable there.
+    Multiallelic sites are assumed already split into separate biallelic
+    rows upstream (true of the 1kGP raw callset), each with its own scalar
+    `AC` and a shared `AN` -- unlike `read_pvar`'s comma-joined `ALT`, no
+    `_explode_alleles` step is needed or possible here.
+
+    The TSV lives in a directory made with `tempfile.mkdtemp()`, not a
+    `tempfile.TemporaryDirectory()` context manager, deliberately: this
+    function hands back an *unresolved* `LazyFrame` that still needs to scan
+    that file whenever a caller eventually collects it, so the directory
+    must outlive this function's return -- a context manager would delete
+    the TSV out from under the returned frame the moment `read_sites_vcf`
+    returns. The directory is intentionally left for the OS's normal temp
+    cleanup; this script runs once per `fit` invocation, not as a long-lived
+    process.
+    """
+    tsv_path = Path(tempfile.mkdtemp()) / "sites.tsv"
+    args = ["query", "-i", 'FILTER="PASS"', "-f", "%CHROM\t%POS\t%REF\t%ALT\t%AC\t%AN\n"]
+    if contigs:
+        args += ["-r", ",".join(contigs)]
+    args.append(str(path))
+    _run_bcftools(args, stdout_path=tsv_path)
+
+    # CHROM must stay a string for the same reason as read_pvar's #CHROM:
+    # numeric-looking contig ids like "1"/"22" must not be inferred as
+    # integers -- ContigStat.id is a String in src/bulk/profile.rs.
+    lf = pl.scan_csv(
+        str(tsv_path),
+        separator="\t",
+        has_header=False,
+        new_columns=["CHROM", "POS", "REF", "ALT", "AC", "AN"],
+        schema_overrides={
+            "CHROM": pl.Utf8,
+            "POS": pl.Int64,
+            "REF": pl.Utf8,
+            "ALT": pl.Utf8,
+            "AC": pl.Int64,
+            "AN": pl.Int64,
+        },
+    )
+    return lf.with_columns(pl.lit(".").alias("ID")).select(
+        ["CHROM", "POS", "ID", "REF", "ALT", "AC", "AN"]
+    )
 
 
 def build_profile(
@@ -613,6 +706,34 @@ def _run_plink2(args: list[str]) -> None:
         )
 
 
+def _run_bcftools(args: list[str], stdout_path: str | Path | None = None) -> None:
+    """Shell out to `bcftools`, mirroring `_run_plink2`'s error-handling style.
+
+    When `stdout_path` is given, bcftools' stdout is streamed directly to
+    that file by the subprocess itself (`stdout=<file handle>`), never
+    captured through a Python string first -- `read_sites_vcf` passes a TSV
+    output path here for exactly the reason `read_pvar`'s docstring
+    explains at length: a 1kGP-scale sites-only VCF's PASS records can be
+    tens of millions of rows, and `subprocess.run(capture_output=True)`
+    would materialize the whole TSV as one Python string before polars ever
+    saw it.
+    """
+    if stdout_path is not None:
+        with open(stdout_path, "wb") as out_fh:
+            result = subprocess.run(["bcftools", *args], stdout=out_fh, stderr=subprocess.PIPE)
+        stdout_msg = ""
+        stderr_msg = result.stderr.decode(errors="replace")
+    else:
+        result = subprocess.run(["bcftools", *args], capture_output=True, text=True)
+        stdout_msg = result.stdout
+        stderr_msg = result.stderr
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"bcftools {' '.join(args)} failed (exit {result.returncode}):\n"
+            f"{stdout_msg}\n{stderr_msg}"
+        )
+
+
 def _pfile_args(pgen_prefix: str | Path, vzs: bool) -> list[str]:
     """Build the `--pfile` argument list, adding plink2's `vzs` marker when needed.
 
@@ -649,6 +770,24 @@ def _split_alt_cts(alt_cts: Sequence[str] | pl.Series) -> list[float]:
     """
     s = pl.Series("ALT_CTS", list(alt_cts), dtype=pl.Utf8)
     return s.str.split(",").explode(empty_as_null=False).cast(pl.Float64).to_list()
+
+
+def _sfs_from_ac(lf: pl.LazyFrame, ac_col: str, n_samples: int) -> dict:
+    """Reduce a LazyFrame's per-allele allele-count column to the finalized `sfs` histogram.
+
+    The shared tail of both `fit_sfs` (plink2 `.acount`'s split `ALT_CTS`)
+    and `fit_sfs_from_sites_vcf` (a sites-only VCF's `INFO/AC`, already one
+    scalar count per allele since multiallelics are pre-split upstream) --
+    both need only the same `_sfs_edges` + `histogram_lazy` reduction, so
+    this factors it out rather than duplicating it. `lf` must already carry
+    one row per allele observation in `ac_col`; the caller is responsible
+    for whatever split/explode got it there. Stays lazy end-to-end except
+    for the final `.collect()`, whose result is bounded by the number of
+    histogram bins, not the number of input rows.
+    """
+    edges = _sfs_edges(n_samples)
+    binned = histogram_lazy(lf, pl.col(ac_col), edges).collect(engine="streaming")
+    return _finalize_histogram_from_binned(binned, edges)
 
 
 def fit_sfs(
@@ -694,7 +833,6 @@ def fit_sfs(
         if contigs:
             args += ["--chr", ",".join(contigs)]
         _run_plink2(args)
-        edges = _sfs_edges(n_samples)
         lf = pl.scan_csv(
             f"{out_prefix}.acount", separator="\t", schema_overrides={"ALT_CTS": pl.Utf8}
         )
@@ -703,8 +841,7 @@ def fit_sfs(
             .explode("ALT_CTS", empty_as_null=False)
             .select(pl.col("ALT_CTS").cast(pl.Float64))
         )
-        binned = histogram_lazy(alt_cts, pl.col("ALT_CTS"), edges).collect(engine="streaming")
-        return _finalize_histogram_from_binned(binned, edges)
+        return _sfs_from_ac(alt_cts, "ALT_CTS", n_samples)
 
 
 def fit_missing_rate(
@@ -787,6 +924,49 @@ def fit_phased_rate(
         return n_phased / n_total if n_total else 1.0
 
 
+# --------------------------------------------------------------------------
+# Sites-only VCF (bcftools, no genotypes): the two genotype-derived stats
+# that a sites-only source can still support from INFO/AC and INFO/AN.
+# `phased_rate` has no such substitute -- there are no genotype calls at
+# all to inspect -- so it is taken verbatim from `--phased-rate` in `main`.
+# --------------------------------------------------------------------------
+
+
+def fit_sfs_from_sites_vcf(lf: pl.LazyFrame, n_samples: int) -> dict:
+    """Build the fitted `sfs` histogram from a `read_sites_vcf` frame's `AC` column.
+
+    Unlike the pgen path (`fit_sfs`), a sites-only VCF's `INFO/AC` is
+    already one scalar count per allele -- multiallelic sites are pre-split
+    upstream (true of the 1kGP raw callset) -- so no split/explode step is
+    needed before handing it to the shared `_sfs_from_ac` reduction. Uses
+    the same `_sfs_edges(n_samples)` edges as the pgen path, so profiles
+    fitted from either source stay directly comparable.
+    """
+    return _sfs_from_ac(lf.select(pl.col("AC").cast(pl.Float64)), "AC", n_samples)
+
+
+def fit_missing_rate_from_sites_vcf(lf: pl.LazyFrame, n_samples: int) -> float:
+    """Estimate the missing rate from a `read_sites_vcf` frame's `AN` column.
+
+    A sites-only VCF has no per-sample hardcalls to count missing directly
+    the way `fit_missing_rate`'s plink2 `.vmiss` does, but `INFO/AN` -- the
+    number of alleles actually called at each site -- gives the same rate
+    indirectly: at full ploidy-2 calling every site would have
+    `AN == 2 * n_samples`, so the shortfall from that maximum, averaged
+    over all sites, is the missing rate. Computed as a single lazy
+    `.mean()` aggregation collecting one scalar, never the full `AN`
+    column. Clamped to `[0, 1]`, since a mean `AN` above `2 * n_samples`
+    (e.g. from a mismatched `--n-samples`) would otherwise yield a negative
+    rate.
+    """
+    row = lf.select(mean_an=pl.col("AN").mean()).collect(engine="streaming").row(0)
+    mean_an = row[0]
+    if mean_an is None:
+        return 0.0
+    rate = 1.0 - (mean_an / (2 * n_samples))
+    return min(1.0, max(0.0, rate))
+
+
 def _read_n_samples(psam_path: Path) -> int:
     n = 0
     with open(psam_path) as fh:
@@ -802,14 +982,118 @@ def _read_n_samples(psam_path: Path) -> int:
 # --------------------------------------------------------------------------
 
 
+def _fit_from_pgen(args: argparse.Namespace) -> dict:
+    """Fit a profile from a plink2 pgen/pvar/psam fileset (the original, genotyped path)."""
+    prefix = str(args.pgen)
+    psam_path = Path(f"{prefix}.psam")
+    pvar_path = Path(f"{prefix}.pvar.zst")
+    vzs = pvar_path.exists()
+    if not vzs:
+        pvar_path = Path(f"{prefix}.pvar")
+    if not pvar_path.exists():
+        raise FileNotFoundError(f"no .pvar or .pvar.zst found for prefix {prefix}")
+
+    n_samples = _read_n_samples(psam_path)
+
+    lf = read_pvar(pvar_path)
+    if args.contigs:
+        lf = lf.filter(pl.col("CHROM").is_in(args.contigs))
+
+    stats = compute_pvar_stats(lf)
+    contigs = stats["contigs"]
+    if not contigs:
+        raise ValueError("no variants found for the requested contig(s)")
+    contig_ids = [c["id"] for c in contigs]
+
+    chr_filter = contig_ids if args.contigs else None
+    sfs = fit_sfs(args.pgen, n_samples, contigs=chr_filter, vzs=vzs)
+    missing_rate = fit_missing_rate(args.pgen, contigs=chr_filter, vzs=vzs)
+
+    first_contig = contigs[0]
+    pos_min = int(stats["contig_pos_min"][first_contig["id"]])
+    phased_rate = fit_phased_rate(
+        args.pgen,
+        contig=first_contig["id"],
+        pos_min=pos_min,
+        window_bp=int(args.phase_sample_mb * 1_000_000),
+        vzs=vzs,
+    )
+
+    return build_profile(
+        name=args.name,
+        source=prefix,
+        n_samples=n_samples,
+        contigs=contigs,
+        gap_dist=stats["gap_dist"],
+        sfs=sfs,
+        indel_length=stats["indel_length"],
+        class_counts=stats["class_counts"],
+        titv=stats["titv"],
+        multiallelic_rate=stats["multiallelic_rate"],
+        missing_rate=missing_rate,
+        phased_rate=phased_rate,
+        ploidy=args.ploidy,
+        payload=args.payload,
+    )
+
+
+def _fit_from_sites_vcf(args: argparse.Namespace) -> dict:
+    """Fit a profile from a sites-only VCF: no genotypes, so `--n-samples` and
+    `--phased-rate` (validated as required in `main` before this runs) stand
+    in for what `_fit_from_pgen` derives from the pgen fileset itself.
+    """
+    lf = read_sites_vcf(args.sites_vcf, contigs=args.contigs)
+
+    # compute_pvar_stats is the shared stats core (contigs, gap_dist,
+    # variant_classes, indel_length, titv, multiallelic_rate) -- it only
+    # needs the CHROM/POS/ID/REF/ALT columns `read_pvar` also produces.
+    stats = compute_pvar_stats(lf.select(["CHROM", "POS", "ID", "REF", "ALT"]))
+    contigs = stats["contigs"]
+    if not contigs:
+        raise ValueError("no variants found for the requested contig(s)")
+
+    # A lazy row count of the PASS + contig-filtered frame, not a
+    # Python-side sum over `contigs` -- see the brief's provenance note.
+    n_variants_source = int(lf.select(pl.len()).collect(engine="streaming").item())
+
+    sfs = fit_sfs_from_sites_vcf(lf, args.n_samples)
+    missing_rate = fit_missing_rate_from_sites_vcf(lf, args.n_samples)
+
+    return build_profile(
+        name=args.name,
+        source=str(args.sites_vcf),
+        n_samples=args.n_samples,
+        contigs=contigs,
+        gap_dist=stats["gap_dist"],
+        sfs=sfs,
+        indel_length=stats["indel_length"],
+        class_counts=stats["class_counts"],
+        titv=stats["titv"],
+        multiallelic_rate=stats["multiallelic_rate"],
+        missing_rate=missing_rate,
+        phased_rate=args.phased_rate,
+        ploidy=args.ploidy,
+        payload=args.payload,
+        n_variants_source=n_variants_source,
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Fit a vcfixture bulk-generation profile JSON from plink2 pgen/pvar data."
+        description="Fit a vcfixture bulk-generation profile JSON from a real cohort."
     )
-    parser.add_argument(
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument(
         "--pgen",
-        required=True,
         help="plink2 fileset prefix (expects <prefix>.pgen/.psam/.pvar[.zst])",
+    )
+    source_group.add_argument(
+        "--sites-vcf",
+        help=(
+            "sites-only VCF/BCF path (no genotype columns; requires "
+            "--n-samples and --phased-rate, since neither is derivable "
+            "from a sites-only file)"
+        ),
     )
     parser.add_argument("--name", required=True, help="profile name, e.g. germline-1kgp")
     parser.add_argument("--out", required=True, type=Path, help="output profile JSON path")
@@ -832,67 +1116,50 @@ def main(argv: list[str] | None = None) -> None:
         "--phase-sample-mb",
         type=float,
         default=1.0,
-        help="window size (Mb), from the first fitted contig's start, used to estimate phased_rate",
+        help=(
+            "window size (Mb), from the first fitted contig's start, used to "
+            "estimate phased_rate (--pgen only)"
+        ),
+    )
+    parser.add_argument(
+        "--n-samples",
+        type=int,
+        default=None,
+        help="cohort size (required with --sites-vcf; derived from --pgen's .psam otherwise)",
+    )
+    parser.add_argument(
+        "--phased-rate",
+        type=float,
+        default=None,
+        help=(
+            "fixed phased_rate in [0, 1] (required with --sites-vcf, which "
+            "has no genotypes to count phased/unphased calls from; fitted "
+            "automatically from --pgen otherwise)"
+        ),
     )
     args = parser.parse_args(argv)
 
-    prefix = str(args.pgen)
-    psam_path = Path(f"{prefix}.psam")
-    pvar_path = Path(f"{prefix}.pvar.zst")
-    vzs = pvar_path.exists()
-    if not vzs:
-        pvar_path = Path(f"{prefix}.pvar")
-    if not pvar_path.exists():
-        raise FileNotFoundError(f"no .pvar or .pvar.zst found for prefix {prefix}")
+    if args.sites_vcf:
+        if args.n_samples is None:
+            parser.error("--sites-vcf requires --n-samples (not derivable from a sites-only VCF)")
+        if args.phased_rate is None:
+            parser.error(
+                "--sites-vcf requires --phased-rate "
+                "(no genotypes to count phased/unphased calls from)"
+            )
+        if not (0.0 <= args.phased_rate <= 1.0):
+            parser.error(f"--phased-rate must be in [0, 1], got {args.phased_rate}")
+    else:
+        if args.n_samples is not None:
+            parser.error(
+                "--n-samples is only valid with --sites-vcf (--pgen derives it from .psam)"
+            )
+        if args.phased_rate is not None:
+            parser.error(
+                "--phased-rate is only valid with --sites-vcf (--pgen fits it from genotypes)"
+            )
 
-    n_samples = _read_n_samples(psam_path)
-
-    lf = read_pvar(pvar_path)
-    if args.contigs:
-        lf = lf.filter(pl.col("CHROM").is_in(args.contigs))
-
-    stats = compute_pvar_stats(lf)
-    contigs = stats["contigs"]
-    if not contigs:
-        raise ValueError("no variants found for the requested contig(s)")
-    contig_ids = [c["id"] for c in contigs]
-
-    gap_dist = stats["gap_dist"]
-    class_counts = stats["class_counts"]
-    indel_length = stats["indel_length"]
-    titv = stats["titv"]
-    multiallelic_rate = stats["multiallelic_rate"]
-
-    chr_filter = contig_ids if args.contigs else None
-    sfs = fit_sfs(args.pgen, n_samples, contigs=chr_filter, vzs=vzs)
-    missing_rate = fit_missing_rate(args.pgen, contigs=chr_filter, vzs=vzs)
-
-    first_contig = contigs[0]
-    pos_min = int(stats["contig_pos_min"][first_contig["id"]])
-    phased_rate = fit_phased_rate(
-        args.pgen,
-        contig=first_contig["id"],
-        pos_min=pos_min,
-        window_bp=int(args.phase_sample_mb * 1_000_000),
-        vzs=vzs,
-    )
-
-    profile = build_profile(
-        name=args.name,
-        source=prefix,
-        n_samples=n_samples,
-        contigs=contigs,
-        gap_dist=gap_dist,
-        sfs=sfs,
-        indel_length=indel_length,
-        class_counts=class_counts,
-        titv=titv,
-        multiallelic_rate=multiallelic_rate,
-        missing_rate=missing_rate,
-        phased_rate=phased_rate,
-        ploidy=args.ploidy,
-        payload=args.payload,
-    )
+    profile = _fit_from_sites_vcf(args) if args.sites_vcf else _fit_from_pgen(args)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(profile, indent=2) + "\n")
