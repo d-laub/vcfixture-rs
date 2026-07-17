@@ -65,8 +65,16 @@ import polars as pl
 
 __version__ = "0.1.0"
 
-# Must match the field names of `ClassMix` in src/bulk/profile.rs exactly.
+# Enforced against the Rust enums by test_fit_profile.py
 CLASS_NAMES = ("snp", "insertion", "deletion", "mnp", "complex", "symbolic")
+
+# Enforced against the Rust enums by test_fit_profile.py
+_PAYLOAD_CHOICES = ("gt-only", "gt-vaf", "gatk", "mutect2")
+
+
+def _payload_choices() -> tuple[str, ...]:
+    return _PAYLOAD_CHOICES
+
 
 # ~90% of indels are <= 6 bp (see the design spec), so resolve that range
 # finely and taper off for the long tail.
@@ -1128,7 +1136,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--payload",
         default="gt-only",
-        choices=["gt-only", "gt-vaf", "gatk", "mutect2"],
+        choices=_PAYLOAD_CHOICES,
         help="dialed FORMAT preset (not fitted from data; see src/bulk/profile.rs::Payload)",
     )
     parser.add_argument(

@@ -1,7 +1,9 @@
 import json
+import re
 import shutil
 import subprocess
 import warnings
+from pathlib import Path
 
 import polars as pl
 import pytest
@@ -16,6 +18,7 @@ from fit_profile import (
     _gap_edges,
     _multiallelic_rate_from_row,
     _multiallelic_rate_lazy,
+    _payload_choices,
     _sfs_edges,
     class_mix_from_counts,
     compute_pvar_stats,
@@ -30,6 +33,29 @@ from fit_profile import (
 PLINK2_AVAILABLE = shutil.which("plink2") is not None
 BCFTOOLS_AVAILABLE = shutil.which("bcftools") is not None
 CARGO_AVAILABLE = shutil.which("cargo") is not None
+
+_PROFILE_RS = Path(__file__).resolve().parents[2] / "src" / "bulk" / "profile.rs"
+
+
+def _rust_classmix_fields() -> list[str]:
+    src = _PROFILE_RS.read_text()
+    block = re.search(r"pub struct ClassMix \{(.*?)\}", src, re.S).group(1)
+    return re.findall(r"pub (\w+): f64", block)
+
+
+def _rust_payload_variants() -> list[str]:
+    src = _PROFILE_RS.read_text()
+    block = re.search(r"pub enum Payload \{(.*?)\}", src, re.S).group(1)
+    camel = re.findall(r"\b([A-Z]\w+),", block)
+    return [re.sub(r"(?<!^)(?=[A-Z])", "-", c).lower() for c in camel]
+
+
+def test_class_names_match_rust_classmix():
+    assert list(CLASS_NAMES) == _rust_classmix_fields()
+
+
+def test_payload_choices_match_rust_enum():
+    assert sorted(_payload_choices()) == sorted(_rust_payload_variants())
 
 
 def test_histogram_weights_are_one_shorter_than_edges():
