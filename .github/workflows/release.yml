@@ -17,7 +17,7 @@ jobs:
           # Push the bump commit + tag as an admin identity that bypasses the
           # `main` ruleset (PR + required status checks). The default
           # GITHUB_TOKEN is not a bypass actor, so its push to main is rejected.
-          token: ${{ secrets.RELEASE_PAT }}
+          token: ${{ secrets.GH_ACTIONS }}
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
