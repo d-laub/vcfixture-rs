@@ -826,9 +826,34 @@ def compute_pvar_stats(lf: pl.LazyFrame) -> dict:
 # plink2 subprocess helpers
 # --------------------------------------------------------------------------
 
+# plink2 sizes its working-memory ("bigstack") off the *node's* physical RAM
+# as reported by the OS, not off the cgroup it is actually confined to -- on
+# a shared SLURM node with e.g. a 32 GiB per-job cgroup but ~1 TB of node
+# RAM, plink2 auto-detects ~half the node total (~500 GB) and plans huge
+# genotype blocks accordingly. Running `--freq counts` genome-wide (348M
+# variants x 16k samples) it then grew resident memory past the cgroup limit
+# (~23 GiB) and was OOM-killed. Every plink2 call here is block-processed
+# (`--freq`/`--missing`/`--export vcf`), so `--memory` only changes the block
+# size, never the output -- capping it keeps resident memory bounded.
+#
+# The cap must be large enough, not just small: plink2's bigstack is a
+# sparsely-resident bump allocator. For 348M variants it *reserves* ~23 GiB
+# up front for the (worst-case-sized) variant index, but only ~15 GiB ever
+# becomes resident. Caps below that reservation fail early with plink2's own
+# "Out of memory" -- measured on this fileset: 8000/16000/20000/26000 MiB all
+# fail (26000 leaves < 2.8 GiB, too little for the ~2.8 GiB pgen block),
+# while 30000 MiB succeeds with plink2 RSS ~15 GiB and total job-cgroup anon
+# RSS ~23 GiB (agent + plink2), ~11 GiB under the 32 GiB limit. The 30000 MiB
+# is a *virtual* reservation that only materializes what the data needs, so
+# it is harmless on smaller inputs. The polars stages elsewhere in this
+# script (~6.4 GiB) run before plink2, not concurrently.
+_PLINK2_MEMORY_MB = 30000
+
 
 def _run_plink2(args: list[str]) -> None:
-    result = subprocess.run(["plink2", *args], capture_output=True, text=True)
+    result = subprocess.run(
+        ["plink2", *args, "--memory", str(_PLINK2_MEMORY_MB)], capture_output=True, text=True
+    )
     if result.returncode != 0:
         raise RuntimeError(
             f"plink2 {' '.join(args)} failed (exit {result.returncode}):\n"
