@@ -1,3 +1,36 @@
+## v0.3.0 (2026-07-18)
+
+### Feat
+
+- **bulk**: add provenance.supplied naming non-measured fields (#9)
+- **release**: add publish_only dispatch input to recover failed publishes
+
+### Fix
+
+- **fit**: make plink2 memory cap overridable, correct comment (#7)
+- **fit**: re-fit somatic-gdc genome-wide (#7)
+- **fit**: cap plink2 --memory so it respects the cgroup (#7)
+- **fit**: count edges[-1] in single-bin histograms (#10)
+- **bulk**: clean up BCF .csi temp on corrective-round drop (#8)
+- **bulk**: split records by n_variants, not density_per_kb (#10)
+- **bulk**: reject non-diploid AD/PL payloads at validate time (#10)
+- **release**: gitignore .release-notes.md so cargo publish sees a clean tree
+
+### Refactor
+
+- **bulk**: move ploidy from fitted to dialed (#9)
+- **bulk**: rename module gen -> generate (#6)
+
+### Perf
+
+- **fit**: collect pvar-stat plans sequentially, not collect_all (#7)
+- **fit**: compute Ti/Tv by direct base compares, not is_in (#7)
+- **fit**: compute gaps by shift+mask, not sort+window (#7)
+- **fit**: scan pvar with skip_lines, not comment_prefix (#7)
+- **bulk**: calibrate byte target in 2 points, promote the file (#8)
+- **bulk**: rejection-sample sparse alt placement (#10)
+- **bulk**: build GT into a reused String, not Vec<String>+join (#10)
+
 ## v0.2.0 (2026-07-17)
 
 ### Feat
