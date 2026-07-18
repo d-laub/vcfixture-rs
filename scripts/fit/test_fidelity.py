@@ -60,12 +60,14 @@ def _refit(bcf: Path, tmp: Path) -> dict:
 
 
 def test_generated_output_refits_to_its_source_profile():
-    original = json.loads(PROFILE.read_text())["fitted"]
+    original_full = json.loads(PROFILE.read_text())
+    original = original_full["fitted"]
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         bcf = tmp / "gen.bcf"
         _generate(bcf, samples=3202, per_contig=2000)
-        refit = _refit(bcf, tmp)["fitted"]
+        refit_full = _refit(bcf, tmp)
+        refit = refit_full["fitted"]
 
         # Ti/Tv is a single scalar and the most direct sampler check.
         assert abs(refit["titv"] - original["titv"]) < 0.15, \
@@ -86,4 +88,4 @@ def test_generated_output_refits_to_its_source_profile():
         b = refit["sfs"]["weights"][0] / sum(refit["sfs"]["weights"])
         assert abs(a - b) < 0.06, f"singleton fraction {b} != {a}"
 
-        assert refit["ploidy"] == original["ploidy"]
+        assert refit_full["dialed"]["ploidy"] == original_full["dialed"]["ploidy"]

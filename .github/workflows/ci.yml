@@ -62,3 +62,9 @@ jobs:
           cargo run --example writing
           cargo run --example proptest_fuzz --features proptest
           cargo run --example bulk --features bulk
+      - name: validate committed profiles through Rust
+        run: |
+          cargo build --features bulk --bin validate-profile
+          for f in profiles/*.json; do
+            cargo run --quiet --features bulk --bin validate-profile -- "$f"
+          done

@@ -32,6 +32,8 @@ pub struct Provenance {
     pub n_variants_source: u64,
     pub fitted_on: String,
     pub fit_tool_version: String,
+    #[serde(default)]
+    pub supplied: Vec<String>,
 }
 
 /// Statistics estimated from a real cohort. Never hand-pick values here.
@@ -46,7 +48,6 @@ pub struct Fitted {
     pub multiallelic_rate: f64,
     pub missing_rate: f64,
     pub phased_rate: f64,
-    pub ploidy: u8,
 }
 
 /// Per-contig variant count and density, as observed in the source cohort.
@@ -79,6 +80,7 @@ pub struct ClassMix {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Dialed {
     pub payload: Payload,
+    pub ploidy: u8,
 }
 
 /// Which per-sample/per-record fields to synthesize.
@@ -89,6 +91,14 @@ pub enum Payload {
     GtVaf,
     Gatk,
     Mutect2,
+}
+
+impl Payload {
+    /// True if this preset emits AD or PL, both hard-coded diploid in
+    /// `generate::SampleStats`.
+    pub(crate) fn needs_diploid(&self) -> bool {
+        matches!(self, Payload::Gatk | Payload::Mutect2)
+    }
 }
 
 impl Profile {
@@ -116,8 +126,15 @@ impl Profile {
         self.fitted.sfs.validate()?;
         self.fitted.indel_length.validate()?;
         self.fitted.variant_classes.validate()?;
-        if self.fitted.ploidy == 0 {
+        if self.dialed.ploidy == 0 {
             return Err(BulkError::Invalid("ploidy must be >= 1".into()));
+        }
+        if self.dialed.payload.needs_diploid() && self.dialed.ploidy != 2 {
+            return Err(BulkError::Invalid(format!(
+                "payload {:?} emits AD and/or PL, which are hard-coded for \
+                 diploid (ploidy 2) calls, but ploidy is {}",
+                self.dialed.payload, self.dialed.ploidy
+            )));
         }
         for (label, v) in [
             ("multiallelic_rate", self.fitted.multiallelic_rate),
@@ -218,7 +235,7 @@ mod tests {
         let p = Profile::builtin("germline-1kgp").unwrap();
         assert_eq!(p.name, "germline-1kgp");
         assert_eq!(p.dialed.payload, Payload::GtOnly);
-        assert_eq!(p.fitted.ploidy, 2);
+        assert_eq!(p.dialed.ploidy, 2);
         p.validate().unwrap();
     }
 
@@ -367,10 +384,37 @@ mod tests {
     }
 
     #[test]
+    fn ploidy_lives_in_dialed_not_fitted() {
+        let p = Profile::builtin("germline-1kgp").unwrap();
+        assert_eq!(p.dialed.ploidy, 2);
+    }
+
+    #[test]
+    fn sites_only_profile_marks_phased_rate_supplied() {
+        // germline-1kgp-unphased is fitted from a sites-only VCF, so
+        // phased_rate and n_samples are supplied, not measured.
+        let p = Profile::builtin("germline-1kgp-unphased").unwrap();
+        assert!(p.provenance.supplied.contains(&"ploidy".to_string()));
+        assert!(p.provenance.supplied.contains(&"phased_rate".to_string()));
+    }
+
+    #[test]
     fn payload_round_trips_through_serde() {
         let json = r#""mutect2""#;
         let p: Payload = serde_json::from_str(json).unwrap();
         assert_eq!(p, Payload::Mutect2);
         assert_eq!(serde_json::to_string(&p).unwrap(), json);
+    }
+
+    #[test]
+    fn validate_rejects_diploid_payload_with_nondiploid_ploidy() {
+        let mut p = Profile::builtin("germline-1kgp").unwrap();
+        p.dialed.payload = Payload::Gatk;
+        p.dialed.ploidy = 3;
+        let err = p.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("diploid"),
+            "expected a diploid-ploidy rejection, got: {err:?}"
+        );
     }
 }

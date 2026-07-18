@@ -1,7 +1,7 @@
 #![cfg(feature = "bulk")]
 
 use std::num::NonZero;
-use vcfixture::bulk::{BulkError, BulkSpec, Payload, Profile, Size};
+use vcfixture::bulk::{BulkError, BulkSpec, Format, Payload, Profile, Size};
 
 fn spec() -> BulkSpec {
     BulkSpec::new(Profile::builtin("germline-1kgp").unwrap())
@@ -183,6 +183,35 @@ fn target_size_lands_near_the_target() {
         "overshoot too large: {got} vs target {target} (max allowed {max_allowed}, \
          i.e. {MAX_OVERSHOOT_FRACTION} of target)"
     );
+}
+
+/// Guards the calibrate+promote rewrite of `resolve_target_counts`: two runs
+/// of the same seed and target must produce byte-identical output. This is
+/// weaker than asserting the resolved per-contig counts directly (no new
+/// `Summary` accessor needed for that), but it is sufficient to catch any
+/// nondeterminism the rewrite could introduce -- e.g. the corrective rounds
+/// depending on wall-clock-observed byte counts rather than purely on
+/// `(seed, contig, count)`.
+#[test]
+fn target_size_is_byte_identical_across_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = Profile::from_json(NONUNIFORM_DENSITY_PROFILE).unwrap();
+    let run = |name: &str| {
+        let out = dir.path().join(name);
+        BulkSpec::new(profile.clone())
+            .samples(4)
+            .contigs(["1", "2", "3"])
+            .format(Format::VcfGz)
+            .size(Size::Target(512 * 1024))
+            .seed(99)
+            .write(&out)
+            .unwrap();
+        std::fs::read(&out).unwrap()
+    };
+    let a = run("a.vcf.gz");
+    let b = run("b.vcf.gz");
+    assert!(a.len() as u64 >= 512 * 1024, "must reach target");
+    assert_eq!(a, b, "calibrate+promote must be byte-identical run to run");
 }
 
 #[test]
@@ -405,10 +434,9 @@ const NONUNIFORM_DENSITY_PROFILE: &str = r#"
     "titv": 2.05,
     "multiallelic_rate": 0.0,
     "missing_rate": 0.0,
-    "phased_rate": 1.0,
-    "ploidy": 2
+    "phased_rate": 1.0
   },
-  "dialed": { "payload": "gt-only" }
+  "dialed": { "payload": "gt-only", "ploidy": 2 }
 }
 "#;
 
@@ -435,26 +463,20 @@ fn duplicate_contig_names_are_rejected() {
     );
 }
 
-/// `SampleStats::value_for` (`src/bulk/gen.rs`) hard-codes `AD` as a
+/// `SampleStats::value_for` (`src/bulk/generate.rs`) hard-codes `AD` as a
 /// 2-element `[n_ref, n_alt]` and `PL` as a fixed 3-element diploid
-/// likelihood triple -- correct only for `ploidy == 2`. `Profile::validate`
-/// only requires `ploidy >= 1`, so a ploidy-3 profile combined with a
-/// payload that declares `PL`/`AD` (`Gatk`, `Mutect2`) must be rejected
-/// rather than silently emitting genotype-likelihood/allele-depth fields
-/// whose cardinality doesn't match the declared ploidy.
+/// likelihood triple -- correct only for `ploidy == 2`. A ploidy-3 profile
+/// combined with a payload that declares `PL`/`AD` (`Gatk`, `Mutect2`) must
+/// be rejected by `Profile::validate` at parse time, rather than silently
+/// emitting genotype-likelihood/allele-depth fields whose cardinality
+/// doesn't match the declared ploidy.
 #[test]
 fn non_diploid_profile_rejects_payloads_declaring_pl_or_ad() {
-    let profile = Profile::from_json(TRIPLOID_PROFILE).unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let mut profile = Profile::from_json(TRIPLOID_PROFILE).unwrap();
 
     for payload in [Payload::Gatk, Payload::Mutect2] {
-        let path = dir.path().join(format!("{payload:?}.bcf"));
-        let result = BulkSpec::new(profile.clone())
-            .samples(4)
-            .contigs(["chr1"])
-            .payload(payload.clone())
-            .size(Size::RecordsPerContig(10))
-            .write(&path);
+        profile.dialed.payload = payload.clone();
+        let result = profile.validate();
         assert!(
             matches!(result, Err(BulkError::Invalid(_))),
             "payload {payload:?} declares PL/AD, which are diploid-only; \
@@ -465,15 +487,20 @@ fn non_diploid_profile_rejects_payloads_declaring_pl_or_ad() {
 
 /// The flip side of the guard above: a non-diploid profile combined with a
 /// payload that does *not* declare `PL`/`AD` (`GtOnly`, `GtVaf`) must still
-/// write successfully -- the guard is specific to the fields that are
-/// actually hard-coded for diploid, not a blanket rejection of non-diploid
-/// profiles.
+/// pass `validate()` and write successfully -- the guard is specific to the
+/// fields that are actually hard-coded for diploid, not a blanket rejection
+/// of non-diploid profiles.
 #[test]
 fn non_diploid_profile_accepts_payloads_without_pl_or_ad() {
-    let profile = Profile::from_json(TRIPLOID_PROFILE).unwrap();
+    let mut profile = Profile::from_json(TRIPLOID_PROFILE).unwrap();
     let dir = tempfile::tempdir().unwrap();
 
     for payload in [Payload::GtOnly, Payload::GtVaf] {
+        profile.dialed.payload = payload.clone();
+        profile
+            .validate()
+            .unwrap_or_else(|e| panic!("payload {payload:?} must not need ploidy 2: {e}"));
+
         let path = dir.path().join(format!("{payload:?}.bcf"));
         let s = BulkSpec::new(profile.clone())
             .samples(4)
@@ -516,9 +543,8 @@ const TRIPLOID_PROFILE: &str = r#"
     "titv": 2.05,
     "multiallelic_rate": 0.0,
     "missing_rate": 0.0,
-    "phased_rate": 1.0,
-    "ploidy": 3
+    "phased_rate": 1.0
   },
-  "dialed": { "payload": "gt-only" }
+  "dialed": { "payload": "gt-only", "ploidy": 3 }
 }
 "#;

@@ -5,11 +5,11 @@
 //! `docs/superpowers/specs/2026-07-16-bulk-generation-design.md`.
 //!
 //! [`BulkSpec`] is the public entry point: a builder over a [`Profile`] that
-//! ties the samplers ([`sample`]), the record generator ([`gen`]), the
+//! ties the samplers ([`sample`]), the record generator ([`generate`]), the
 //! streaming writer ([`writer`]), and the summary truth ([`summary`])
 //! together into one `write(path)` call.
 
-pub mod gen;
+pub mod generate;
 pub mod profile;
 pub mod sample;
 pub mod summary;
@@ -32,7 +32,7 @@ use noodles_vcf::{
     },
 };
 
-use gen::{block_rng, gen_record, to_record_buf, GenRecord};
+use generate::{block_rng, gen_record, to_record_buf, GenRecord};
 use profile::{ContigStat, Fitted};
 use sample::Samplers;
 use writer::BulkWriter;
@@ -57,25 +57,30 @@ pub enum BulkError {
 /// How many records to generate, and how that maps onto per-contig counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Size {
-    /// Exactly `n` records total, split across contigs proportional to each
-    /// contig's fitted density (see [`resolve_contig_stat`]).
+    /// Exactly `n` records total, split across contigs proportional to
+    /// fitted per-contig variant count (`n_variants`) (see
+    /// [`resolve_contig_stat`]).
     Records(u64),
     /// Exactly `n` records for *each* requested contig.
     RecordsPerContig(u64),
     /// Grow the output until its compressed size is `>= n` bytes, then stop.
-    /// May overshoot, but never undershoot: each candidate is measured by
-    /// writing it to a temp file through the same writer, format, and
+    /// May overshoot, but never undershoot: the record count is calibrated
+    /// from two cheap byte measurements (fitting `bytes ~= b0 + k*records`),
+    /// corrected by a few slope-based rounds if needed, each of which writes
+    /// a real candidate to a temp file through the same writer, format, and
     /// compression settings — and the same (absent) mid-stream flush
     /// cadence — as the real write, so the measured size is exactly what
-    /// the real write produces, not an estimate. Per-contig counts are
-    /// split proportional to fitted density, like [`Size::Records`]. See
+    /// the real write produces, not an estimate. The winning temp file is
+    /// then promoted (moved, not regenerated) onto the real destination.
+    /// Per-contig counts are split proportional to fitted per-contig
+    /// variant count (`n_variants`), like [`Size::Records`]. See
     /// [`BulkSpec::write`] and [`BulkSpec::resolve_target_counts`].
     Target(u64),
 }
 
 /// One generated record plus this call's phasing draw.
 ///
-/// [`GenRecord`] is Task 6's type ([`crate::bulk::gen`]) and out of scope to
+/// [`GenRecord`] is Task 6's type ([`crate::bulk::generate`]) and out of scope to
 /// modify here, and it has no `phased` field (phasing is a per-record
 /// decision only [`to_record_buf`] needs, not part of the site/genotype
 /// generation `gen_record` performs) — so it is tracked alongside, not
@@ -296,23 +301,6 @@ impl BulkSpec {
         }
 
         let fitted = &self.profile.fitted;
-        // `SampleStats::value_for` (`gen.rs`) hard-codes `AD`/`PL` values
-        // sized for exactly 2 allele calls per sample (diploid): `AD` is a
-        // 2-element `[n_ref, n_alt]`, `PL` a fixed 3-element diploid
-        // likelihood triple. A profile with `ploidy != 2` would declare a
-        // `Number=G` FORMAT field but emit values that don't actually match
-        // that ploidy's genotype-likelihood cardinality, producing a
-        // malformed file rather than an error. `Profile::validate` only
-        // requires `ploidy >= 1`, so this must be checked here.
-        let keys = payload_keys(&self.payload);
-        if (keys.contains(&"PL") || keys.contains(&"AD")) && fitted.ploidy != 2 {
-            return Err(BulkError::Invalid(format!(
-                "payload {:?} declares PL and/or AD, which are hard-coded for \
-                 diploid (ploidy 2) genotype calls, but the profile's ploidy is {}",
-                self.payload, fitted.ploidy
-            )));
-        }
-
         // The sfs histogram's edges are absolute allele counts against the
         // *source* cohort's AN, not frequencies (see `BulkSpec::samples`'s
         // doc comment); `Samplers::allele_count` needs that source AN to
@@ -326,9 +314,16 @@ impl BulkSpec {
 
         let counts: Vec<u64> = match self.size {
             Size::RecordsPerContig(n) => vec![n; self.contig_ids.len()],
-            Size::Records(total) => distribute_by_density(fitted, &self.contig_ids, total),
+            Size::Records(total) => distribute_by_n_variants(fitted, &self.contig_ids, total),
             Size::Target(target_bytes) => {
-                self.resolve_target_counts(&pool, &samplers, fitted, target_bytes)?
+                let (_counts, tmp, _bytes, summary) =
+                    self.resolve_target_counts(&pool, &samplers, fitted, target_bytes)?;
+                Self::promote_temp(tmp, path, self.format)?;
+                let json = summary.to_json()?;
+                let mut summary_path = path.as_os_str().to_os_string();
+                summary_path.push(".summary.json");
+                std::fs::write(&summary_path, json)?;
+                return Ok(summary);
             }
         };
 
@@ -436,7 +431,7 @@ impl BulkSpec {
             return Vec::new();
         }
 
-        let ploidy = fitted.ploidy;
+        let ploidy = self.profile.dialed.ploidy;
         let n_samples = self.n_samples;
         let seed = self.seed;
         let n_blocks = n_records.div_ceil(Self::BLOCK_SIZE);
@@ -462,7 +457,7 @@ impl BulkSpec {
                         // from the same block-local RNG, right after the
                         // record it applies to, so the block's stream stays
                         // a pure function of `(seed, block_idx)` alone.
-                        let phased = rng.gen::<f64>() < fitted.phased_rate;
+                        let phased = rng.random::<f64>() < fitted.phased_rate;
                         recs.push(Rec { g, phased });
                     }
                     (recs, local_pos)
@@ -482,78 +477,164 @@ impl BulkSpec {
         out
     }
 
-    /// Resolves [`Size::Target`] to per-contig record *counts* (not the
-    /// records themselves), generating candidates as it goes to measure
-    /// them.
+    /// Resolves [`Size::Target`] to per-contig record *counts*, the
+    /// already-written temp file those counts produced (byte length `>=
+    /// target_bytes`), its byte length, and its `Summary` — so the caller
+    /// ([`BulkSpec::write`]) can promote the temp straight to the real
+    /// destination instead of regenerating a third time.
     ///
-    /// This is the plan's "two-pass" approach, generalized to as many
-    /// rounds as needed: each round asks [`BulkSpec::measure_compressed_bytes`]
-    /// to generate a candidate `per_contig_count`'s worth of records —
-    /// **one contig at a time, dropping each before generating the next**
-    /// (see that method's doc) — and measure the exact compressed size that
-    /// candidate would produce, and checks it against the target. If short,
-    /// it extrapolates the additional records needed from the observed
-    /// bytes/record ratio (with a 15% margin so successive rounds converge
-    /// quickly rather than repeatedly undershooting) and retries.
-    ///
-    /// `total_records` for the bytes/record ratio is `per_contig_count`'s
-    /// own sum, not a count of anything actually held in memory:
-    /// [`BulkSpec::generate_contig`] always returns exactly the requested
-    /// number of records, so no re-measurement is needed to know it.
-    ///
-    /// Only the winning round's per-contig *counts* are returned.
-    /// [`BulkSpec::write`] regenerates from them (its own two-pass
-    /// span/write structure), rather than this function returning the
-    /// generated records directly, so that at most one contig's records —
-    /// never every contig's, and never a whole extra file's worth held
-    /// alongside the real write — are ever live at once. This is the fix
-    /// for the bug where an earlier version of this function generated
-    /// *every* contig's full record set up front (`Vec<Vec<Rec>>`) before
-    /// measuring: peak RSS tracked the *total* record count rather than the
-    /// largest single contig's, and a `--target-size 8MB` run (50,590
-    /// records) peaked at 357 MB and took 251s where a bounded run should
-    /// scale with the largest contig alone.
+    /// Two cheap calibration points (`1_000` and `2_000` records per
+    /// contig, measured bytes-only via [`BulkSpec::measure_compressed_bytes`])
+    /// fit `bytes ~= b0 + k*records` (`k` bytes/record, `b0` the fixed
+    /// header/index cost), which gives a direct count estimate for
+    /// `target_bytes` in one step rather than the old scheme's up-to-25
+    /// rounds of repeated doubling (each round generating every contig
+    /// *twice* to measure, then discarding the result). That estimate is
+    /// then corrected, at most [`MAX_CORRECTIONS`] times: each round writes
+    /// the current guess to a real temp file via [`BulkSpec::write_to_temp`]
+    /// (building the `Summary` for free, since this write is no longer a
+    /// throwaway measurement -- it may be the one promoted), and if it's
+    /// still short, tops up every contig's count proportionally (via
+    /// [`distribute_by_n_variants`], same as the initial split) using the
+    /// same fitted slope `k`, plus a 2% margin so rounds converge instead of
+    /// oscillating just under the target.
     ///
     /// Both the initial guess and each round's top-up are split
-    /// proportional to each contig's fitted density via
-    /// [`distribute_by_density`] — the same helper [`Size::Records`] uses —
-    /// rather than an even split, so `Size::Target`'s per-contig realism
-    /// matches `Size::Records`'s. This is pure arithmetic on already-fitted
-    /// statistics (no new randomness), so it does not affect determinism.
+    /// proportional to each contig's fitted per-contig variant count
+    /// (`n_variants`) via [`distribute_by_n_variants`] — the same helper
+    /// [`Size::Records`] uses — rather than an even split, so
+    /// `Size::Target`'s per-contig realism matches `Size::Records`'s. This
+    /// is pure arithmetic on already-fitted statistics (no new randomness),
+    /// so it does not affect determinism.
     fn resolve_target_counts(
         &self,
         pool: &rayon::ThreadPool,
         samplers: &Samplers,
         fitted: &Fitted,
         target_bytes: u64,
-    ) -> Result<Vec<u64>, BulkError> {
-        const INITIAL_PER_CONTIG: u64 = 500;
-        const MAX_ROUNDS: usize = 25;
-
+    ) -> Result<(Vec<u64>, tempfile::NamedTempFile, u64, Summary), BulkError> {
         let n_contigs = self.contig_ids.len() as u64;
-        let mut per_contig_count =
-            distribute_by_density(fitted, &self.contig_ids, INITIAL_PER_CONTIG * n_contigs);
 
-        for _round in 0..MAX_ROUNDS {
-            let bytes = self.measure_compressed_bytes(pool, samplers, fitted, &per_contig_count)?;
+        // Two calibration points; c2 = 2*c1 so the slope is well-conditioned.
+        let split1 = distribute_by_n_variants(fitted, &self.contig_ids, 1_000 * n_contigs);
+        let split2 = distribute_by_n_variants(fitted, &self.contig_ids, 2_000 * n_contigs);
+        let bytes1 = self.measure_compressed_bytes(pool, samplers, fitted, &split1)?;
+        let bytes2 = self.measure_compressed_bytes(pool, samplers, fitted, &split2)?;
 
+        let r1 = split1.iter().sum::<u64>() as f64;
+        let r2 = split2.iter().sum::<u64>() as f64;
+        // bytes ~= b0 + k*records ; k bytes/record, b0 the fixed header cost.
+        let k = ((bytes2 as f64 - bytes1 as f64) / (r2 - r1)).max(1e-9);
+        let b0 = bytes1 as f64 - k * r1;
+
+        // Direct count; never below the larger calibration (a known-good
+        // measurement) and never below 1 record/contig.
+        let want = (((target_bytes as f64 - b0) / k).ceil() as i64).max(r2 as i64) as u64;
+        let mut counts = distribute_by_n_variants(fitted, &self.contig_ids, want);
+
+        // Slope-based correction; converges in 1-2 rounds.
+        const MAX_CORRECTIONS: usize = 4;
+        for _ in 0..MAX_CORRECTIONS {
+            let (tmp, bytes, summary) = self.write_to_temp(pool, samplers, fitted, &counts)?;
             if bytes >= target_bytes {
-                return Ok(per_contig_count);
+                return Ok((counts, tmp, bytes, summary));
             }
-
-            let total_records: u64 = per_contig_count.iter().sum();
-            let bytes_per_record = (bytes as f64 / total_records.max(1) as f64).max(1.0);
             let shortfall = (target_bytes - bytes) as f64;
-            let extra = ((shortfall / bytes_per_record) * 1.15).ceil() as u64 + 1;
-            let extra_split = distribute_by_density(fitted, &self.contig_ids, extra);
-            for (c, e) in per_contig_count.iter_mut().zip(&extra_split) {
+            let extra = ((shortfall / k) * 1.02).ceil() as u64 + 1;
+            let extra_split = distribute_by_n_variants(fitted, &self.contig_ids, extra);
+            for (c, e) in counts.iter_mut().zip(&extra_split) {
                 *c += e;
             }
+            // `write_to_temp` may have left a `<tmp_path>.csi` companion
+            // (Bcf only) that `NamedTempFile`'s `Drop` does not know about;
+            // best-effort clean it up, mirroring
+            // `BulkSpec::measure_compressed_bytes`, so repeated corrective
+            // rounds don't litter the temp dir.
+            if matches!(self.format, Format::Bcf) {
+                let mut csi_path = tmp.path().as_os_str().to_os_string();
+                csi_path.push(".csi");
+                let _ = std::fs::remove_file(csi_path);
+            }
+            drop(tmp); // discard the under-target temp before regenerating
         }
 
         Err(BulkError::Invalid(format!(
-            "could not reach target size {target_bytes} bytes within {MAX_ROUNDS} rounds"
+            "could not reach target size {target_bytes} bytes within {MAX_CORRECTIONS} corrective rounds"
         )))
+    }
+
+    /// Like [`BulkSpec::measure_compressed_bytes`], but builds the
+    /// [`Summary`] during the write pass and returns the live temp file
+    /// instead of deleting it, so the caller can promote it to the real
+    /// destination via [`BulkSpec::promote_temp`]. Byte-exact: identical
+    /// header, records, and (absent) flush cadence as [`BulkSpec::write`].
+    fn write_to_temp(
+        &self,
+        pool: &rayon::ThreadPool,
+        samplers: &Samplers,
+        fitted: &Fitted,
+        per_contig_count: &[u64],
+    ) -> Result<(tempfile::NamedTempFile, u64, Summary), BulkError> {
+        let spans: Vec<u64> = self
+            .contig_ids
+            .iter()
+            .zip(per_contig_count)
+            .enumerate()
+            .map(|(i, (id, &n))| {
+                let recs = self.generate_contig(pool, samplers, fitted, id, i as u64, n);
+                contig_span(&recs)
+            })
+            .collect();
+
+        let header = self.build_header(&spans);
+        let tmp = tempfile::NamedTempFile::new()?;
+        let tmp_path = tmp.path().to_path_buf();
+
+        let mut w = BulkWriter::create(
+            &tmp_path,
+            self.format,
+            &header,
+            self.compression_level,
+            self.workers,
+        )?;
+        let mut summary = Summary::new(self.n_samples);
+        for (i, (id, &n)) in self.contig_ids.iter().zip(per_contig_count).enumerate() {
+            let recs = self.generate_contig(pool, samplers, fitted, id, i as u64, n);
+            for r in &recs {
+                let buf = to_record_buf(&r.g, self.payload.clone(), r.phased);
+                w.write(&header, &buf)?;
+                summary.observe(id, r.g.pos, r.g.class, &r.g.gts);
+            }
+        }
+        w.finish_and_index(&tmp_path)?;
+        let bytes = std::fs::metadata(&tmp_path)?.len();
+        Ok((tmp, bytes, summary))
+    }
+
+    /// Moves a written temp file (and, for BCF, its `.csi` companion) onto
+    /// the real destination. Rename when possible; falls back to copy across
+    /// filesystems (`TMPDIR` may differ from the output dir) via
+    /// [`move_file`]/`NamedTempFile::persist`.
+    fn promote_temp(
+        tmp: tempfile::NamedTempFile,
+        dest: &Path,
+        format: Format,
+    ) -> Result<(), BulkError> {
+        let tmp_path = tmp.path().to_path_buf();
+        if matches!(format, Format::Bcf) {
+            let mut src_csi = tmp_path.as_os_str().to_os_string();
+            src_csi.push(".csi");
+            let mut dst_csi = dest.as_os_str().to_os_string();
+            dst_csi.push(".csi");
+            move_file(Path::new(&src_csi), Path::new(&dst_csi))?;
+        }
+        match tmp.persist(dest) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                std::fs::copy(e.file.path(), dest)?;
+                Ok(())
+            }
+        }
     }
 
     /// Measures the exact compressed byte size that `per_contig_count`
@@ -648,6 +729,21 @@ pub fn parse_size(s: &str) -> Result<u64, BulkError> {
         .map_err(|_| BulkError::Invalid(format!("bad size: {s}")))
 }
 
+/// Moves `src` to `dst`: a rename when both are on the same filesystem
+/// (the common case, and atomic), falling back to copy-then-remove when
+/// they aren't (e.g. `TMPDIR` on a different filesystem than the output
+/// directory, where `rename` returns `EXDEV`). Used by
+/// [`BulkSpec::promote_temp`] for the `.csi` companion, which
+/// `NamedTempFile::persist` doesn't know how to move itself.
+fn move_file(src: &Path, dst: &Path) -> Result<(), BulkError> {
+    if std::fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(src, dst)?;
+    let _ = std::fs::remove_file(src);
+    Ok(())
+}
+
 /// The populated span of one contig's generated records — the maximum
 /// position among them, or `1` if the contig has zero records. Positions
 /// are strictly increasing within a contig (see
@@ -726,15 +822,23 @@ fn normalize_contig_id(id: &str) -> String {
 }
 
 /// Splits `total` records across `contig_ids` proportional to each
-/// contig's fitted density (via [`resolve_contig_stat`]), using the
-/// largest-remainder method so the per-contig counts sum to exactly
-/// `total`. Falls back to an even split if every resolved weight is zero
-/// (a degenerate profile), rather than dividing by zero.
-fn distribute_by_density(fitted: &Fitted, contig_ids: &[String], total: u64) -> Vec<u64> {
+/// contig's fitted per-contig variant count (`n_variants`, via
+/// [`resolve_contig_stat`]), using the largest-remainder method so the
+/// per-contig counts sum to exactly `total`. Falls back to an even split if
+/// every resolved weight is zero (a degenerate profile), rather than
+/// dividing by zero.
+///
+/// Weighting by `n_variants` rather than `density_per_kb`: output density is
+/// a *global* `1/mean(gap)` draw (`gap_dist` is not fit per contig), so a
+/// per-contig fitted density is never actually reproduced by this split --
+/// and an outlier contig (e.g. MT at ~350/kb, ~12x the rest) would skew the
+/// split for a statistic the output doesn't even follow. `n_variants`, by
+/// contrast, reproduces the source's real per-contig variant distribution.
+fn distribute_by_n_variants(fitted: &Fitted, contig_ids: &[String], total: u64) -> Vec<u64> {
     let weights: Vec<f64> = contig_ids
         .iter()
         .enumerate()
-        .map(|(i, id)| resolve_contig_stat(fitted, i, id).density_per_kb.max(0.0))
+        .map(|(i, id)| resolve_contig_stat(fitted, i, id).n_variants as f64)
         .collect();
     let weight_sum: f64 = weights.iter().sum();
     let n = contig_ids.len() as u64;
@@ -780,8 +884,8 @@ fn distribute_by_density(fitted: &Fitted, contig_ids: &[String], total: u64) -> 
 
 /// The ordered FORMAT key list for one [`Payload`] preset.
 ///
-/// Must stay in sync with `gen::to_record_buf`'s own (private) `key_names`
-/// match — duplicated here rather than shared because `gen.rs` is out of
+/// Must stay in sync with `generate::to_record_buf`'s own (private) `key_names`
+/// match — duplicated here rather than shared because `generate.rs` is out of
 /// scope to modify for this task. `payload_presets_all_write_readable_files`
 /// (`tests/bulk.rs`) is the safety net: any drift would surface as a
 /// "missing FORMAT header record" write error, not a silent mismatch.
@@ -805,7 +909,7 @@ fn payload_keys(payload: &Payload) -> &'static [&'static str] {
 /// definition for free from `Map::from(key)`. `VAF`/`AF` (as a per-sample
 /// FORMAT field, not the INFO field), `F1R2`, `F2R1`, and `SB` are GATK/
 /// Mutect2 conventions, not VCF-reserved, so they need an explicit
-/// definition matching exactly what `gen::SampleStats::value_for` emits.
+/// definition matching exactly what `generate::SampleStats::value_for` emits.
 fn format_map(key: &str) -> Map<HeaderFormatMap> {
     match key {
         "VAF" | "AF" => Map::<HeaderFormatMap>::new(
@@ -829,5 +933,37 @@ fn format_map(key: &str) -> Map<HeaderFormatMap> {
             "Per-sample component statistics for Fisher strand bias",
         ),
         other => Map::<HeaderFormatMap>::from(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A profile where n_variants order != density order, so the two split
+    // strategies give different answers.
+    const DISCRIMINATING_PROFILE: &str = r#"{
+      "name": "disc", "provenance": {"source":"x","n_samples_source":10,
+        "n_variants_source":11000,"fitted_on":"2026-01-01","fit_tool_version":"t",
+        "supplied":["ploidy"]},
+      "fitted": { "contigs": [
+          { "id": "big", "n_variants": 10000, "density_per_kb": 10.0 },
+          { "id": "small", "n_variants": 1000, "density_per_kb": 90.0 }
+        ],
+        "gap_dist": {"edges":[1.0,2.0],"weights":[1.0]},
+        "sfs": {"edges":[1.0,2.0],"weights":[1.0]},
+        "variant_classes": {"snp":1.0,"insertion":0.0,"deletion":0.0,"mnp":0.0,"complex":0.0,"symbolic":0.0},
+        "indel_length": {"edges":[1.0,2.0],"weights":[1.0]},
+        "titv": 2.0, "multiallelic_rate": 0.0, "missing_rate": 0.0, "phased_rate": 1.0
+      },
+      "dialed": { "payload": "gt-only", "ploidy": 2 }
+    }"#;
+
+    #[test]
+    fn records_split_follows_n_variants_not_density() {
+        let p = Profile::from_json(DISCRIMINATING_PROFILE).unwrap();
+        let ids = vec!["big".to_string(), "small".to_string()];
+        let counts = distribute_by_n_variants(&p.fitted, &ids, 11_000);
+        assert_eq!(counts, vec![10_000, 1_000]);
     }
 }

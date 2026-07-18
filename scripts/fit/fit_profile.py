@@ -53,6 +53,7 @@ import argparse
 import atexit
 import datetime as _dt
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -65,8 +66,16 @@ import polars as pl
 
 __version__ = "0.1.0"
 
-# Must match the field names of `ClassMix` in src/bulk/profile.rs exactly.
+# Enforced against the Rust enums by test_fit_profile.py
 CLASS_NAMES = ("snp", "insertion", "deletion", "mnp", "complex", "symbolic")
+
+# Enforced against the Rust enums by test_fit_profile.py
+_PAYLOAD_CHOICES = ("gt-only", "gt-vaf", "gatk", "mutect2")
+
+
+def _payload_choices() -> tuple[str, ...]:
+    return _PAYLOAD_CHOICES
+
 
 # ~90% of indels are <= 6 bp (see the design spec), so resolve that range
 # finely and taper off for the long tail.
@@ -74,8 +83,6 @@ INDEL_EDGES = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 10.0, 20.0, 50.0, 100.0, 1000.0]
 
 # Log-spaced bins over [1, 1e5] for inter-variant gaps (bp).
 GAP_LOW, GAP_HIGH, GAP_N_BINS = 1.0, 1e5, 24
-
-TRANSITION_PAIRS = frozenset({"AG", "GA", "CT", "TC"})
 
 
 # --------------------------------------------------------------------------
@@ -168,15 +175,21 @@ def _bucket_index_expr(value: pl.Expr, edges: Sequence[float]) -> pl.Expr:
     """
     edges = _validate_edges(edges)
     n_bins = len(edges) - 1
+    if n_bins == 1:
+        # single bin is closed on both ends, matching numpy.histogram
+        return (
+            pl.when((value >= edges[0]) & (value <= edges[1]))
+            .then(pl.lit(0, dtype=pl.Int64))
+            .otherwise(None)
+        )
     expr = pl.when((value >= edges[0]) & (value < edges[1])).then(pl.lit(0, dtype=pl.Int64))
     for i in range(1, n_bins - 1):
         expr = expr.when((value >= edges[i]) & (value < edges[i + 1])).then(
             pl.lit(i, dtype=pl.Int64)
         )
-    if n_bins > 1:
-        expr = expr.when((value >= edges[-2]) & (value <= edges[-1])).then(
-            pl.lit(n_bins - 1, dtype=pl.Int64)
-        )
+    expr = expr.when((value >= edges[-2]) & (value <= edges[-1])).then(
+        pl.lit(n_bins - 1, dtype=pl.Int64)
+    )
     return expr.otherwise(None)
 
 
@@ -287,6 +300,41 @@ def _classify_expr(ref: pl.Expr, alt: pl.Expr) -> pl.Expr:
     )
 
 
+def _count_leading_meta_lines(path: str | Path) -> int:
+    """Count leading ``##`` metadata lines so scan_csv can `skip_lines` past
+    them instead of `comment_prefix='##'` (which forces polars to materialise
+    the whole file -- measured 6.2 GB / 3x slower on a 5.9 GB somatic pvar).
+
+    Handles the pvar's optional .zst compression: the meta block is a small
+    text prefix, so only the first chunk needs decompressing. The `.zst`
+    branch requires the optional `zstandard` package (not a hard dependency
+    of the `fit` env); it is only imported when a `.zst` path is passed.
+    """
+    p = str(path)
+    if p.endswith(".zst"):
+        import zstandard  # in the `fit` env
+
+        n = 0
+        with open(p, "rb") as raw:
+            dctx = zstandard.ZstdDecompressor()
+            with dctx.stream_reader(raw) as r:
+                buf = r.read(1 << 16).split(b"\n")
+                for line in buf:
+                    if line.startswith(b"##"):
+                        n += 1
+                    else:
+                        break
+        return n
+    n = 0
+    with open(p, "rb") as fh:
+        for line in fh:
+            if line.startswith(b"##"):
+                n += 1
+            else:
+                break
+    return n
+
+
 def read_pvar(path: str | Path) -> pl.LazyFrame:
     """Lazily scan a `.pvar` or `.pvar.zst` file, keeping only #CHROM/POS/ID/REF/ALT.
 
@@ -314,12 +362,17 @@ def read_pvar(path: str | Path) -> pl.LazyFrame:
     # "1" or "22" -- ContigStat.id is a String in src/bulk/profile.rs, and
     # letting polars infer it as an integer breaks every downstream
     # plink2 --chr argument (and str/int comparisons) built from it.
+    n_meta = _count_leading_meta_lines(path)
     lf = pl.scan_csv(
         str(path),
         separator="\t",
-        comment_prefix="##",
+        skip_lines=n_meta,
         schema_overrides={"#CHROM": pl.Utf8, "ID": pl.Utf8, "REF": pl.Utf8, "ALT": pl.Utf8},
     ).rename({"#CHROM": "CHROM"})
+    # ID is carried only to keep read_pvar/read_sites_vcf schemas identical
+    # for compute_pvar_stats; nothing reads it, and in this file it is "."
+    # (REF/ALT carry the wide strings), so dropping it saves ~0 memory --
+    # keep it for schema parity with read_sites_vcf's fabricated ID.
     return lf.select(["CHROM", "POS", "ID", "REF", "ALT"])
 
 
@@ -420,6 +473,7 @@ def build_profile(
     missing_rate: float,
     phased_rate: float,
     ploidy: int,
+    supplied: list[str],
     payload: str = "gt-only",
     n_variants_source: int | None = None,
 ) -> dict:
@@ -433,8 +487,16 @@ def build_profile(
     (`main()`, via lazy polars aggregations) before it ever reaches this
     function. Every field under "fitted" is otherwise derived from
     `class_counts`/`contigs`/the scalar rates passed in by the caller --
-    never hand-picked here. `dialed.payload` is the one deliberate
-    exception: it is a generation choice, not a fitted statistic.
+    never hand-picked here. `dialed.payload` and `dialed.ploidy` are the
+    deliberate exceptions: they are generation choices, not fitted
+    statistics.
+
+    `supplied` names every field the caller passed in rather than measured
+    from the source data (e.g. `ploidy` always; `phased_rate`/`n_samples`
+    too when fitting from a sites-only VCF, since neither is derivable from
+    one) -- it makes which values in "fitted"/"dialed" are hand-supplied,
+    not measured, auditable from the JSON alone. No default: callers must
+    say explicitly.
     """
     if n_variants_source is None:
         n_variants_source = sum(c["n_variants"] for c in contigs)
@@ -449,7 +511,6 @@ def build_profile(
         "multiallelic_rate": multiallelic_rate,
         "missing_rate": missing_rate,
         "phased_rate": phased_rate,
-        "ploidy": ploidy,
     }
     return {
         "name": name,
@@ -459,9 +520,10 @@ def build_profile(
             "n_variants_source": n_variants_source,
             "fitted_on": _dt.date.today().isoformat(),
             "fit_tool_version": __version__,
+            "supplied": sorted(supplied),
         },
         "fitted": fitted,
-        "dialed": {"payload": payload},
+        "dialed": {"payload": payload, "ploidy": ploidy},
     }
 
 
@@ -581,17 +643,58 @@ def _gap_bins_lazy(lf: pl.LazyFrame) -> pl.LazyFrame:
     position, so exploding first would fabricate spurious zero-length gaps
     between the alleles of the same site.
 
+    `lf` is assumed coordinate-sorted within each contig (plink2 emits pvar
+    sorted by CHROM, POS; guarded by `assert_pvar_sorted`). Gaps are a
+    straight `POS.diff()` masked to same-contig adjacent rows (`CHROM ==
+    CHROM.shift(1)`), NOT `sort().diff().over("CHROM")`: the sort is a
+    full-frame pipeline breaker and `.over()` is a non-streaming window,
+    which together cost ~20 GB at genome scale (348M rows). shift+mask
+    streams in ~220 MB and is bit-identical on sorted input.
+
     Returns the `histogram_lazy` bin-count frame directly (bounded by
     `GAP_N_BINS`), never the underlying gaps themselves -- a 1kGP-scale
     contig can have tens of millions of gaps, which is exactly the array
     `read_pvar`'s docstring warns against materializing.
     """
     gaps = (
-        lf.sort(["CHROM", "POS"])
-        .select(pl.col("POS").diff().over("CHROM").alias("gap"))
-        .filter(pl.col("gap").is_not_null() & (pl.col("gap") > 0))
+        lf.select(
+            pl.col("POS").diff().alias("gap"),
+            (pl.col("CHROM") == pl.col("CHROM").shift(1)).alias("same_contig"),
+        )
+        .filter(
+            pl.col("same_contig")
+            & pl.col("gap").is_not_null()
+            & (pl.col("gap") > 0)
+        )
+        .select("gap")
     )
     return histogram_lazy(gaps, pl.col("gap"), _gap_edges())
+
+
+def assert_pvar_sorted(lf: pl.LazyFrame) -> None:
+    """Fail if any within-contig POS is out of order (the precondition
+    `_gap_bins_lazy` relies on after dropping its sort). Streams: one boolean
+    reduction, bounded memory.
+
+    Caveat: this checks only descending POS between *adjacent same-contig*
+    rows. It does not detect a contig split into non-contiguous blocks
+    (interleaved contigs), which would also break the sort-free gap path --
+    plink2 always emits contig-grouped pvar, so that case does not arise
+    for our inputs."""
+    bad = (
+        lf.select(
+            (pl.col("CHROM") == pl.col("CHROM").shift(1)).alias("same"),
+            (pl.col("POS") < pl.col("POS").shift(1)).alias("descending"),
+        )
+        .select((pl.col("same") & pl.col("descending")).sum().alias("n_desc"))
+        .collect(engine="streaming")
+        .item()
+    )
+    if bad:
+        raise ValueError(
+            f"pvar is not sorted within contigs ({bad} descending steps); "
+            "gap fitting requires coordinate-sorted input"
+        )
 
 
 def _class_counts_from_df(df: pl.DataFrame) -> dict[str, int]:
@@ -630,10 +733,23 @@ def _multiallelic_rate_from_row(n: int, n_multi: int) -> float:
 
 
 def _titv_lazy(alleles: pl.LazyFrame) -> pl.LazyFrame:
-    """SNP count and transition count (both scalars) over a per-ALLELE frame."""
+    """SNP count and transition count (both scalars) over a per-ALLELE frame.
+
+    Transitions are the four purine<->purine / pyrimidine<->pyrimidine pairs,
+    expressed as direct (REF,ALT) comparisons rather than
+    `concat_str([REF,ALT]).is_in(TRANSITION_PAIRS)`: measured, the `is_in`
+    against a literal list costs ~10 GB extra at 348M rows (16.7 GB vs the
+    6.4 GB scan floor) for a bit-identical result.
+    """
     snps = alleles.filter(pl.col("class") == "snp")
-    pair = pl.concat_str([pl.col("REF"), pl.col("ALT")])
-    return snps.select(n_snps=pl.len(), n_ts=pair.is_in(TRANSITION_PAIRS).sum())
+    r, a = pl.col("REF"), pl.col("ALT")
+    is_ts = (
+        ((r == "A") & (a == "G"))
+        | ((r == "G") & (a == "A"))
+        | ((r == "C") & (a == "T"))
+        | ((r == "T") & (a == "C"))
+    )
+    return snps.select(n_snps=pl.len(), n_ts=is_ts.sum())
 
 
 def _titv_from_row(n_snps: int, n_ts: int) -> float:
@@ -669,9 +785,15 @@ def compute_pvar_stats(lf: pl.LazyFrame) -> dict:
     small (contig count, histogram bin counts, or a one-row scalar frame) --
     never the full per-record or per-allele frame. All six queries below
     share two common subplans (the raw `lf` scan and the exploded `alleles`
-    scan), so `pl.collect_all` executes each of those scans once, not six
-    times, via polars' common-subplan elimination.
+    scan), but they are collected one at a time rather than via
+    `pl.collect_all`: `collect_all`'s common-subplan elimination *caches*
+    the shared 348M-row scan/explode output so it can be reused across the
+    six plans, costing +20 GB (26.4 GB vs 6.4 GB) for no real gain, since a
+    re-scan from warm page cache is both leaner and faster than holding a
+    materialised copy around.
     """
+    assert_pvar_sorted(lf)
+
     contig_lf = _contig_stats_lazy(lf)
     gap_bins_lf = _gap_bins_lazy(lf)
     multi_lf = _multiallelic_rate_lazy(lf)
@@ -681,10 +803,17 @@ def compute_pvar_stats(lf: pl.LazyFrame) -> dict:
     indel_bins_lf = _indel_bins_lazy(alleles)
     titv_lf = _titv_lazy(alleles)
 
-    contig_df, gap_bins_df, multi_df, class_df, indel_bins_df, titv_df = pl.collect_all(
-        [contig_lf, gap_bins_lf, multi_lf, class_lf, indel_bins_lf, titv_lf],
-        engine="streaming",
-    )
+    # Collect each plan on its own rather than pl.collect_all: collect_all's
+    # common-subplan elimination *caches* the shared 348M-row scan/explode
+    # output, costing +20 GB (26.4 GB vs 6.4 GB) and buying nothing -- a
+    # re-scan from warm page cache is both leaner and faster than holding a
+    # materialised copy. Measured on the 348M-row somatic pvar.
+    contig_df = contig_lf.collect(engine="streaming")
+    gap_bins_df = gap_bins_lf.collect(engine="streaming")
+    multi_df = multi_lf.collect(engine="streaming")
+    class_df = class_lf.collect(engine="streaming")
+    indel_bins_df = indel_bins_lf.collect(engine="streaming")
+    titv_df = titv_lf.collect(engine="streaming")
 
     n, n_multi = multi_df.row(0)
     n_snps, n_ts = titv_df.row(0)
@@ -704,12 +833,40 @@ def compute_pvar_stats(lf: pl.LazyFrame) -> dict:
 # plink2 subprocess helpers
 # --------------------------------------------------------------------------
 
+# plink2 sizes its working-memory ("bigstack") off the *node's* physical RAM
+# as reported by the OS, not off the cgroup it is actually confined to -- on
+# a shared SLURM node with e.g. a 32 GiB per-job cgroup but ~1 TB of node
+# RAM, plink2 auto-detects ~half the node total (~500 GB) and plans huge
+# genotype blocks accordingly. Running `--freq counts` genome-wide (348M
+# variants x 16k samples) it then grew resident memory past the cgroup limit
+# (~23 GiB) and was OOM-killed. Every plink2 call here is block-processed
+# (`--freq`/`--missing`/`--export vcf`), so `--memory` only changes the block
+# size, never the output -- capping it keeps resident memory bounded.
+#
+# The cap must be large enough, not just small: plink2's bigstack is a
+# sparsely-resident bump allocator. For 348M variants it *reserves* ~23 GiB
+# up front for the (worst-case-sized) variant index, but only ~15 GiB ever
+# becomes resident. Caps below that reservation fail early with plink2's own
+# "Out of memory" -- measured on this fileset: 8000/16000/20000/26000 MiB all
+# fail (26000 leaves < 2.8 GiB, too little for the ~2.8 GiB pgen block),
+# while 30000 MiB succeeds with plink2 RSS ~15 GiB and total job-cgroup anon
+# RSS ~23 GiB (agent + plink2), ~11 GiB under the 32 GiB limit. The 30000 MiB
+# is a *virtual* reservation that only materializes what the data needs, so
+# it is harmless on smaller inputs. The polars stages elsewhere in this
+# script (~19 GiB peak python RSS on the genome-wide fit) run before/between
+# the plink2 calls, not concurrently with plink2's bigstack.
+#
+# The default is tuned for a 32 GiB cgroup; override via the
+# VCFIXTURE_PLINK2_MEMORY_MB env var for a different job allocation.
+_PLINK2_MEMORY_MB = int(os.environ.get("VCFIXTURE_PLINK2_MEMORY_MB", "30000"))
+
 
 def _run_plink2(args: list[str]) -> None:
-    result = subprocess.run(["plink2", *args], capture_output=True, text=True)
+    cmd = ["plink2", *args, "--memory", str(_PLINK2_MEMORY_MB)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(
-            f"plink2 {' '.join(args)} failed (exit {result.returncode}):\n"
+            f"plink2 {' '.join(cmd[1:])} failed (exit {result.returncode}):\n"
             f"{result.stdout}\n{result.stderr}"
         )
 
@@ -1018,6 +1175,7 @@ def _fit_from_pgen(args: argparse.Namespace) -> dict:
         phased_rate=phased_rate,
         ploidy=args.ploidy,
         payload=args.payload,
+        supplied=["ploidy"],
     )
 
 
@@ -1054,7 +1212,46 @@ def _fit_from_sites_vcf(args: argparse.Namespace) -> dict:
         phased_rate=args.phased_rate,
         ploidy=args.ploidy,
         payload=args.payload,
+        supplied=["ploidy", "phased_rate", "n_samples"],
     )
+
+
+def _validate_with_rust(path: Path) -> None:
+    """Self-check a freshly-written profile against `Profile::validate`.
+
+    Runs ``cargo run -q --features bulk --bin validate-profile -- <path>``
+    (from the repo root, so it works regardless of the caller's cwd) --
+    the exact same `Profile::from_json` + `Profile::validate` a profile
+    goes through once the crate embeds it via ``include_str!``. This turns
+    a bad fit (e.g. `ploidy == 0`, a rate like `missing_rate` outside
+    [0, 1], a NaN histogram bin) into an immediate failure here instead of
+    a much-later failure inside the Rust crate.
+
+    Behavior:
+    - If ``cargo`` is not found on ``PATH`` (e.g. a Python-only sandbox
+      with no Rust toolchain), prints a warning and returns without
+      running anything -- this check is a courtesy, not a hard dependency
+      of fitting a profile.
+    - If the validator exits non-zero, raises ``SystemExit`` carrying its
+      stderr as the message, which aborts `main()` with exit status 1 and
+      prints that stderr for the caller to see.
+    - On success (exit 0), returns silently.
+    """
+    if shutil.which("cargo") is None:
+        warnings.warn(
+            f"cargo not found on PATH; skipping Rust validation of {path}",
+            stacklevel=2,
+        )
+        return
+    repo_root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        ["cargo", "run", "-q", "--features", "bulk", "--bin", "validate-profile", "--", str(path)],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit(f"validate-profile rejected {path}:\n{result.stderr}")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -1079,7 +1276,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--payload",
         default="gt-only",
-        choices=["gt-only", "gt-vaf", "gatk", "mutect2"],
+        choices=_PAYLOAD_CHOICES,
         help="dialed FORMAT preset (not fitted from data; see src/bulk/profile.rs::Payload)",
     )
     parser.add_argument(
@@ -1151,6 +1348,7 @@ def main(argv: list[str] | None = None) -> None:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(profile, indent=2) + "\n")
     print(f"wrote {args.out}")
+    _validate_with_rust(args.out)
 
 
 if __name__ == "__main__":

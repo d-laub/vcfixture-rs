@@ -1,33 +1,68 @@
 import json
+import re
 import shutil
 import subprocess
 import warnings
+from pathlib import Path
 
+import numpy as np
 import polars as pl
 import pytest
 
 from fit_profile import (
+    CLASS_NAMES,
     INDEL_EDGES,
     build_profile,
     classify,
+    _bucket_index_expr,
     _classify_df,
     _explode_alleles,
+    _gap_bins_lazy,
     _gap_edges,
     _multiallelic_rate_from_row,
     _multiallelic_rate_lazy,
+    _payload_choices,
     _sfs_edges,
+    _titv_lazy,
+    assert_pvar_sorted,
     class_mix_from_counts,
     compute_pvar_stats,
     fit_missing_rate_from_sites_vcf,
     fit_sfs,
     fit_sfs_from_sites_vcf,
     histogram,
+    histogram_lazy,
     main,
+    read_pvar,
     read_sites_vcf,
 )
 
 PLINK2_AVAILABLE = shutil.which("plink2") is not None
 BCFTOOLS_AVAILABLE = shutil.which("bcftools") is not None
+CARGO_AVAILABLE = shutil.which("cargo") is not None
+
+_PROFILE_RS = Path(__file__).resolve().parents[2] / "src" / "bulk" / "profile.rs"
+
+
+def _rust_classmix_fields() -> list[str]:
+    src = _PROFILE_RS.read_text()
+    block = re.search(r"pub struct ClassMix \{(.*?)\}", src, re.S).group(1)
+    return re.findall(r"pub (\w+): f64", block)
+
+
+def _rust_payload_variants() -> list[str]:
+    src = _PROFILE_RS.read_text()
+    block = re.search(r"pub enum Payload \{(.*?)\}", src, re.S).group(1)
+    camel = re.findall(r"\b([A-Z]\w+),", block)
+    return [re.sub(r"(?<!^)(?=[A-Z])", "-", c).lower() for c in camel]
+
+
+def test_class_names_match_rust_classmix():
+    assert list(CLASS_NAMES) == _rust_classmix_fields()
+
+
+def test_payload_choices_match_rust_enum():
+    assert sorted(_payload_choices()) == sorted(_rust_payload_variants())
 
 
 def test_histogram_weights_are_one_shorter_than_edges():
@@ -64,16 +99,34 @@ def test_build_profile_emits_schema_valid_json():
         missing_rate=0.0,
         phased_rate=1.0,
         ploidy=2,
+        supplied=["ploidy"],
     )
     j = json.loads(json.dumps(p))
     assert set(j) == {"name", "provenance", "fitted", "dialed"}
     assert set(j["fitted"]) == {
         "contigs", "gap_dist", "sfs", "variant_classes", "indel_length",
-        "titv", "multiallelic_rate", "missing_rate", "phased_rate", "ploidy",
+        "titv", "multiallelic_rate", "missing_rate", "phased_rate",
     }
     assert j["dialed"]["payload"] in {"gt-only", "gt-vaf", "gatk", "mutect2"}
+    assert j["dialed"]["ploidy"] == 2
     # provenance must be populated, never left as a placeholder
     assert j["provenance"]["n_samples_source"] == 10
+
+
+def test_build_profile_records_supplied_fields():
+    prof = build_profile(
+        name="t", source="x", n_samples=10,
+        contigs=[{"id": "chr1", "n_variants": 100, "density_per_kb": 40.0}],
+        gap_dist={"edges": [1.0, 2.0], "weights": [1.0]},
+        sfs={"edges": [1.0, 2.0], "weights": [1.0]},
+        indel_length={"edges": [1.0, 2.0], "weights": [1.0]},
+        class_counts={n: 1 for n in CLASS_NAMES},
+        titv=2.0, multiallelic_rate=0.1, missing_rate=0.0,
+        phased_rate=1.0, ploidy=2, supplied=["ploidy", "phased_rate"],
+    )
+    assert prof["provenance"]["supplied"] == ["phased_rate", "ploidy"]
+    assert "ploidy" not in prof["fitted"]
+    assert prof["dialed"]["ploidy"] == 2
 
 
 # --------------------------------------------------------------------------
@@ -102,6 +155,15 @@ def test_histogram_does_not_warn_when_all_values_in_range():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         histogram([1, 1, 2, 5], edges=[1, 2, 10, 100])
+
+
+def test_bucket_index_single_bin_includes_last_edge():
+    edges = [1.0, 10.0]  # one bin, closed [1, 10]
+    df = pl.DataFrame({"v": [1.0, 5.0, 10.0, 10.0, 0.5, 11.0]})
+    got = df.select(_bucket_index_expr(pl.col("v"), edges).alias("b"))["b"].to_list()
+    counts, _ = np.histogram(df["v"].to_numpy(), bins=edges)
+    assert counts.tolist() == [4]
+    assert got == [0, 0, 0, 0, None, None]
 
 
 # --------------------------------------------------------------------------
@@ -195,6 +257,70 @@ def test_multiallelic_rate_counts_records_not_alleles():
     assert _multiallelic_rate_from_row(n, n_multi) == pytest.approx(1 / 3)
 
 
+# --------------------------------------------------------------------------
+# _titv_lazy: direct (REF,ALT) comparisons must match the
+# concat_str().is_in(TRANSITION_PAIRS) reference behavior.
+# --------------------------------------------------------------------------
+
+
+def test_titv_direct_matches_is_in_reference():
+    alleles = pl.LazyFrame({
+        "class": ["snp","snp","snp","snp","insertion"],
+        "REF":   ["A","G","C","A","A"],
+        "ALT":   ["G","A","T","C","AT"],  # A>G, G>A, C>T ts; A>C tv
+    })
+    got = _titv_lazy(alleles).collect().row(0)  # (n_snps, n_ts)
+    assert got == (4, 3)
+
+
+# --------------------------------------------------------------------------
+# _gap_bins_lazy: shift+mask must match sort+window on sorted input, and
+# assert_pvar_sorted must guard the precondition that makes them equal.
+# --------------------------------------------------------------------------
+
+
+def test_gap_bins_matches_sorted_window_reference():
+    lf = pl.LazyFrame({
+        "CHROM": ["1","1","1","2","2"],
+        "POS":   [100, 250, 251, 5, 30],
+        "ID": ["."]*5, "REF": ["A"]*5, "ALT": ["T"]*5,
+    })
+    got = _gap_bins_lazy(lf).collect()
+    ref_gaps = (lf.sort(["CHROM","POS"])
+        .select(pl.col("POS").diff().over("CHROM").alias("gap"))
+        .filter(pl.col("gap").is_not_null() & (pl.col("gap") > 0)))
+    ref = histogram_lazy(ref_gaps, pl.col("gap"), _gap_edges()).collect()
+    # group_by("_bin") has no defined row order (confirmed non-deterministic
+    # across repeated runs even between two logically-identical plans), so
+    # sort by the bin index before comparing -- the invariant under test is
+    # bit-identical bin *counts*, not group_by iteration order.
+    assert got.sort("_bin").equals(ref.sort("_bin"))
+
+
+def test_assert_pvar_sorted_rejects_unsorted():
+    lf = pl.LazyFrame({"CHROM": ["1","1"], "POS": [200, 100],
+                       "ID": [".","."], "REF": ["A","A"], "ALT": ["T","T"]})
+    with pytest.raises(ValueError, match="not sorted"):
+        assert_pvar_sorted(lf)
+
+
+def test_read_pvar_skips_meta_and_reads_all_rows(tmp_path):
+    p = tmp_path / "t.pvar"
+    p.write_text(
+        "##fileformat=PVARv1.0\n"
+        "##contig=<ID=1>\n"
+        "#CHROM\tPOS\tID\tREF\tALT\n"
+        "1\t100\t.\tA\tG\n"
+        "1\t200\t.\tC\tT\n"
+        "2\t50\t.\tG\tA\n"
+    )
+    lf = read_pvar(p)
+    df = lf.collect()
+    assert df.height == 3
+    assert df["CHROM"].to_list() == ["1", "1", "2"]
+    assert df["POS"].to_list() == [100, 200, 50]
+
+
 def test_compute_pvar_stats_gives_two_class_and_two_indel_observations_per_multiallelic_site():
     # The brief's stated invariant: a multiallelic site with 2 ALTs
     # contributes 2 class observations and (if applicable) 2 indel-length
@@ -222,6 +348,14 @@ def test_compute_pvar_stats_gives_two_class_and_two_indel_observations_per_multi
     assert sum(indel_hist["weights"]) == pytest.approx(1.0)
     # 1 multiallelic record (rs1) out of 2 total records.
     assert stats["multiallelic_rate"] == pytest.approx(0.5)
+    # Regression guard for the six-plan collection (D4): both records are on
+    # contig "1", so exactly one contig; rs2 (A>C) is the only SNP and it's
+    # a transversion, so titv = n_ts / n_tv = 0 / 1 = 0.0.
+    assert len(stats["contigs"]) == 1
+    assert stats["titv"] == pytest.approx(0.0)
+    # One inter-record gap (POS 100 -> 200, both on contig "1"), landing in
+    # a single gap_dist bin -- weights still sum to 1.0.
+    assert sum(stats["gap_dist"]["weights"]) == pytest.approx(1.0)
 
 
 # --------------------------------------------------------------------------
@@ -269,7 +403,7 @@ def _replica_validate_profile(p: dict) -> None:
     assert abs(sum(classmix.values()) - 1.0) < 1e-6
     for rate in ("multiallelic_rate", "missing_rate", "phased_rate"):
         assert 0.0 <= p["fitted"][rate] <= 1.0
-    assert p["fitted"]["ploidy"] >= 1
+    assert p["dialed"]["ploidy"] >= 1
     assert len(p["fitted"]["contigs"]) >= 1
 
 
@@ -579,3 +713,31 @@ def test_end_to_end_sites_vcf_produces_a_valid_profile(tmp_path):
     assert p["fitted"]["phased_rate"] == pytest.approx(0.9)
     # AN == 100 == 2 * n_samples everywhere -> no missingness.
     assert p["fitted"]["missing_rate"] == pytest.approx(0.0)
+
+
+# --------------------------------------------------------------------------
+# validate-profile binary: CI gate for freshly-written profiles
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not CARGO_AVAILABLE, reason="cargo not installed")
+def test_validate_profile_binary_rejects_nan(tmp_path):
+    prof = build_profile(
+        name="bad", source="x", n_samples=10,
+        contigs=[{"id": "chr1", "n_variants": 100, "density_per_kb": 40.0}],
+        gap_dist={"edges": [1.0, 2.0], "weights": [1.0]},
+        sfs={"edges": [1.0, 2.0], "weights": [1.0]},
+        indel_length={"edges": [1.0, 2.0], "weights": [1.0]},
+        class_counts={n: 1 for n in CLASS_NAMES},
+        titv=2.0, multiallelic_rate=0.1, missing_rate=0.0,
+        phased_rate=1.0, ploidy=2, supplied=["ploidy"],
+    )
+    prof["fitted"]["variant_classes"]["snp"] = float("nan")  # poison
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps(prof))
+    r = subprocess.run(
+        ["cargo", "run", "--quiet", "--features", "bulk",
+         "--bin", "validate-profile", "--", str(p)],
+        capture_output=True, text=True,
+    )
+    assert r.returncode != 0, r.stdout + r.stderr

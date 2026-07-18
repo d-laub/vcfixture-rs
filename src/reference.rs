@@ -201,7 +201,7 @@ impl ReferenceBuilder {
             return Err(BuildError::ContigExists(id));
         }
         let seq: Vec<u8> = (0..length)
-            .map(|_| BASES[self.rng.gen_range(0..4)])
+            .map(|_| BASES[self.rng.random_range(0..4)])
             .collect();
         self.seqs.insert(id, seq);
         Ok(self)

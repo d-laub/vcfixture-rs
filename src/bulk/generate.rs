@@ -18,6 +18,15 @@
 //! gives the hypergeometric, which is HWE asymptotically), and there is
 //! still no LD, since placement is independent per record.
 //!
+//! `gen_record` implements the "uniform placement without replacement" step
+//! with two strategies, chosen by how sparse `ac` is relative to the
+//! non-missing slot count: rejection-sampling distinct slot ranks into a
+//! `HashSet` for the common sparse case (a median AC of 1 against up to
+//! 6404 non-missing slots), or a partial Fisher-Yates shuffle of the
+//! materialised non-missing index list for the dense case. Both give the
+//! same uniform-without-replacement distribution; see `gen_record`'s inline
+//! comment for the threshold and the determinism argument.
+//!
 //! [`block_rng`] is the determinism guarantee for parallel generation: a
 //! block's RNG stream is a pure function of `(seed, block_idx)`, never of
 //! thread identity or a shared mutable RNG, so output is byte-identical
@@ -103,25 +112,59 @@ pub fn gen_record<R: Rng>(
     // shrink the realised AC below the drawn `ac`.
     let mut gts: Vec<i8> = Vec::with_capacity(n_alleles as usize);
     for _ in 0..n_samples {
-        let sample_missing = rng.gen::<f64>() < fitted.missing_rate;
+        let sample_missing = rng.random::<f64>() < fitted.missing_rate;
         for _ in 0..ploidy {
             gts.push(if sample_missing { -1 } else { 0 });
         }
     }
 
     // Exact-AC placement: place exactly `ac` alt alleles uniformly at random
-    // among the non-missing slots, without replacement (partial
-    // Fisher-Yates), rather than drawing each slot i.i.d. Bernoulli at the
-    // implied frequency `ac / n_alleles` — see the module doc for why the
-    // i.i.d. draw does not preserve the fitted SFS. `ac` can exceed the
-    // number of non-missing slots at high AC + high missing_rate; clamp
-    // rather than panic.
-    let mut idx: Vec<usize> = (0..n_alleles as usize).filter(|&i| gts[i] != -1).collect();
-    let ac_eff = (ac as usize).min(idx.len());
-    for i in 0..ac_eff {
-        let j = rng.gen_range(i..idx.len());
-        idx.swap(i, j);
-        gts[idx[i]] = 1;
+    // among the non-missing slots, without replacement, rather than drawing
+    // each slot i.i.d. Bernoulli at the implied frequency `ac / n_alleles` —
+    // see the module doc for why the i.i.d. draw does not preserve the
+    // fitted SFS. `ac` can exceed the number of non-missing slots at high AC
+    // + high missing_rate; clamp rather than panic.
+    //
+    // Two placement strategies, chosen by how sparse the target AC is
+    // relative to the non-missing slot count:
+    //   - Sparse (the common case: a median AC of 1 against up to 6404
+    //     non-missing slots): rejection-sample distinct slot *ranks* (a
+    //     rank is a slot's position among non-missing slots, left to right)
+    //     into a `HashSet`, then apply membership by walking `gts` in index
+    //     order. This avoids ever materialising the non-missing index list.
+    //   - Dense (`ac_eff` is a large fraction of `n_nonmissing`, so
+    //     rejection sampling's expected draw count blows up): partial
+    //     Fisher-Yates over the materialised non-missing index list, as
+    //     before.
+    //
+    // Determinism note: `HashSet` insertion order never influences output —
+    // ranks are drawn from `rng` (deterministic) and membership is applied
+    // while walking `gts` in index order, never by iterating the `HashSet`.
+    let n_nonmissing = gts.iter().filter(|&&g| g != -1).count();
+    let ac_eff = (ac as usize).min(n_nonmissing);
+
+    if ac_eff * 2 <= n_nonmissing {
+        let mut chosen: std::collections::HashSet<usize> =
+            std::collections::HashSet::with_capacity(ac_eff);
+        while chosen.len() < ac_eff {
+            chosen.insert(rng.random_range(0..n_nonmissing));
+        }
+        let mut rank = 0usize;
+        for g in gts.iter_mut() {
+            if *g != -1 {
+                if chosen.contains(&rank) {
+                    *g = 1;
+                }
+                rank += 1;
+            }
+        }
+    } else {
+        let mut idx: Vec<usize> = (0..n_alleles as usize).filter(|&i| gts[i] != -1).collect();
+        for i in 0..ac_eff {
+            let j = rng.random_range(i..idx.len());
+            idx.swap(i, j);
+            gts[idx[i]] = 1;
+        }
     }
 
     GenRecord {
@@ -168,7 +211,7 @@ fn gen_site<R: Rng>(rng: &mut R, s: &Samplers, class: VariantClass) -> (String, 
         }
         VariantClass::Mnp => {
             // Same length (2-3), differing at every position.
-            let len = rng.gen_range(2..=3);
+            let len = rng.random_range(2..=3);
             let mut ref_ = String::with_capacity(len);
             let mut alt = String::with_capacity(len);
             for _ in 0..len {
@@ -184,10 +227,10 @@ fn gen_site<R: Rng>(rng: &mut R, s: &Samplers, class: VariantClass) -> (String, 
         }
         VariantClass::Complex => {
             // Different lengths (2-4), guaranteeing ref != alt.
-            let ref_len = rng.gen_range(2..=4);
-            let mut alt_len = rng.gen_range(2..=4);
+            let ref_len = rng.random_range(2..=4);
+            let mut alt_len = rng.random_range(2..=4);
             while alt_len == ref_len {
-                alt_len = rng.gen_range(2..=4);
+                alt_len = rng.random_range(2..=4);
             }
             let ref_: String = (0..ref_len).map(|_| s.base(rng) as char).collect();
             let alt: String = (0..alt_len).map(|_| s.base(rng) as char).collect();
@@ -219,17 +262,18 @@ struct SampleStats {
 impl SampleStats {
     fn new(alleles: &[i8], phased: bool) -> SampleStats {
         let sep = if phased { '|' } else { '/' };
-        let gt = alleles
-            .iter()
-            .map(|a| {
-                if *a < 0 {
-                    ".".to_string()
-                } else {
-                    a.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(&sep.to_string());
+        let mut gt = String::with_capacity(alleles.len() * 2);
+        for (i, a) in alleles.iter().enumerate() {
+            if i > 0 {
+                gt.push(sep);
+            }
+            if *a < 0 {
+                gt.push('.');
+            } else {
+                use std::fmt::Write as _;
+                let _ = write!(gt, "{a}");
+            }
+        }
 
         let n_ref = alleles.iter().filter(|&&a| a == 0).count() as i32;
         let n_alt = alleles.iter().filter(|&&a| a == 1).count() as i32;
@@ -332,11 +376,19 @@ mod tests {
         let mut a = block_rng(42, 7);
         let mut b = block_rng(42, 7);
         let mut c = block_rng(42, 8);
-        let xa: u64 = a.gen();
-        let xb: u64 = b.gen();
-        let xc: u64 = c.gen();
+        let xa: u64 = a.random();
+        let xb: u64 = b.random();
+        let xc: u64 = c.random();
         assert_eq!(xa, xb, "same (seed, block) must give the same stream");
         assert_ne!(xa, xc, "different block must give a different stream");
+    }
+
+    #[test]
+    fn sample_stats_gt_string_is_unchanged_by_buffer_reuse() {
+        assert_eq!(SampleStats::new(&[0, 1], true).gt, "0|1");
+        assert_eq!(SampleStats::new(&[1, 1], false).gt, "1/1");
+        assert_eq!(SampleStats::new(&[-1, 0], false).gt, "./0");
+        assert_eq!(SampleStats::new(&[0, 1, 1], true).gt, "0|1|1");
     }
 
     #[test]
@@ -362,6 +414,19 @@ mod tests {
                     assert_ne!(*a, r.ref_, "ref == alt at iteration {i}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn exactly_ac_eff_alt_alleles_are_placed() {
+        let (p, s) = fixture();
+        for i in 0..200u64 {
+            let mut rng = block_rng(7, i);
+            let r = gen_record(&mut rng, &s, "chr1", 100 + i, 1000, 2, &p.fitted);
+            let n_alt = r.gts.iter().filter(|&&g| g == 1).count();
+            let n_missing = r.gts.iter().filter(|&&g| g == -1).count();
+            let n_nonmissing = r.gts.len() - n_missing;
+            assert!(n_alt <= n_nonmissing);
         }
     }
 
