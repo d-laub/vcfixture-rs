@@ -1,5 +1,6 @@
 #![cfg(feature = "bulk")]
 
+use std::collections::BTreeMap;
 use std::num::NonZero;
 use vcfixture::bulk::{BulkError, BulkSpec, Format, Payload, Profile, Size};
 
@@ -469,6 +470,115 @@ fn target_size_split_also_follows_variants() {
          uniform density: chr1={c1} chr3={c3} {:?}",
         s.per_contig
     );
+}
+
+/// The core `Size::PerContig` contract: each requested contig gets exactly
+/// the count it was given, with no profile-derived reweighting. A count of
+/// 0 is legal and means "generate nothing here" -- such a contig never
+/// reaches `Summary::observe`, so it has no `per_contig` entry at all and
+/// must be read through `get`, not indexed.
+#[test]
+fn per_contig_gives_exact_requested_counts() {
+    let profile = Profile::from_json(SKEWED_VARIANTS_PROFILE).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.bcf");
+    let counts = BTreeMap::from([
+        ("chr1".to_string(), 37u64),
+        ("chr2".to_string(), 250u64),
+        ("chr3".to_string(), 0u64),
+    ]);
+    let s = BulkSpec::new(profile)
+        .samples(4)
+        .contigs(["chr1", "chr2", "chr3"])
+        .seed(7)
+        .size(Size::PerContig(counts))
+        .write(&path)
+        .unwrap();
+
+    assert_eq!(s.per_contig["chr1"].n_records, 37);
+    assert_eq!(s.per_contig["chr2"].n_records, 250);
+    assert_eq!(
+        s.per_contig.get("chr3").map_or(0, |c| c.n_records),
+        0,
+        "a 0-count contig must produce no records: {:?}",
+        s.per_contig
+    );
+    assert_eq!(s.n_records_total(), 287);
+}
+
+/// A requested contig with no entry in the map would otherwise generate
+/// silently empty output. Reject it, and name it.
+#[test]
+fn per_contig_missing_contig_is_an_error() {
+    let profile = Profile::from_json(SKEWED_VARIANTS_PROFILE).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.bcf");
+    let counts = BTreeMap::from([("chr1".to_string(), 10u64)]);
+    let err = BulkSpec::new(profile)
+        .samples(4)
+        .contigs(["chr1", "chr2"])
+        .size(Size::PerContig(counts))
+        .write(&path)
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(matches!(err, BulkError::Invalid(_)), "{msg}");
+    assert!(
+        msg.contains("chr2"),
+        "error must name the contig with no count: {msg}"
+    );
+}
+
+/// The near-miss that pins down exact name matching: `"1"` is what the
+/// profile calls this contig, and `resolve_contig_stat` *would* normalize
+/// `"chr1"` onto it -- but `Size::PerContig` keys are matched exactly
+/// against the requested output names, so `"1"` is an unknown key, not a
+/// silently-accepted alias.
+#[test]
+fn per_contig_unknown_key_is_an_error() {
+    let profile = Profile::from_json(SKEWED_VARIANTS_PROFILE).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.bcf");
+    let counts = BTreeMap::from([("chr1".to_string(), 10u64), ("1".to_string(), 10u64)]);
+    let err = BulkSpec::new(profile)
+        .samples(4)
+        .contigs(["chr1"])
+        .size(Size::PerContig(counts))
+        .write(&path)
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(matches!(err, BulkError::Invalid(_)), "{msg}");
+    assert!(
+        msg.contains("\"1\""),
+        "error must name the unrequested key: {msg}"
+    );
+}
+
+/// Explicit counts must beat the profile's fitted shape outright, not be
+/// blended with it: this map inverts SKEWED_VARIANTS_PROFILE's 6:2:1 skew,
+/// giving the *least*-variant contig the most records.
+#[test]
+fn per_contig_ignores_profile_shape() {
+    let profile = Profile::from_json(SKEWED_VARIANTS_PROFILE).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.bcf");
+    let counts = BTreeMap::from([
+        ("chr1".to_string(), 50u64),
+        ("chr2".to_string(), 100u64),
+        ("chr3".to_string(), 300u64),
+    ]);
+    let s = BulkSpec::new(profile)
+        .samples(4)
+        .contigs(["chr1", "chr2", "chr3"])
+        .seed(7)
+        .size(Size::PerContig(counts))
+        .write(&path)
+        .unwrap();
+
+    assert_eq!(s.per_contig["chr1"].n_records, 50);
+    assert_eq!(s.per_contig["chr2"].n_records, 100);
+    assert_eq!(s.per_contig["chr3"].n_records, 300);
 }
 
 /// The fixture issue #15 needed and `NONUNIFORM_DENSITY_PROFILE` cannot
