@@ -15,6 +15,7 @@ pub mod sample;
 pub mod summary;
 pub mod writer;
 
+use std::collections::BTreeMap;
 use std::num::NonZero;
 use std::path::Path;
 
@@ -114,7 +115,9 @@ pub enum BulkError {
 }
 
 /// How many records to generate, and how that maps onto per-contig counts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Not `Copy`: `PerContig` carries a `BTreeMap`. `BulkSpec::size` takes its
+// argument by value, so the builder API is unaffected.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Size {
     /// Exactly `n` records total, split across contigs proportional to
     /// fitted per-contig variant count (`n_variants`) (see
@@ -122,6 +125,25 @@ pub enum Size {
     Records(u64),
     /// Exactly `n` records for *each* requested contig.
     RecordsPerContig(u64),
+    /// Exactly the given number of records for each named contig.
+    ///
+    /// The profile's fitted per-contig statistics are not consulted at all:
+    /// this is the escape hatch for reproducing a specific cohort's
+    /// per-contig shape against a profile that was fit on a different one —
+    /// the scheduling-benchmark case that [`Size::Records`]'s
+    /// profile-derived split cannot express.
+    ///
+    /// Keys are matched **exactly** against the names passed to
+    /// [`BulkSpec::contigs`] — unlike [`resolve_contig_stat`], there is no
+    /// `chr`-prefix normalization here, because both lists come from the
+    /// same caller in the same call. A requested contig with no entry, or
+    /// an entry naming a contig that was not requested, is an error rather
+    /// than a silent empty contig or a silently ignored key (see
+    /// [`per_contig_counts`]).
+    ///
+    /// A count of `0` is legal and means "generate nothing for this
+    /// contig"; it still gets a `##contig` header entry.
+    PerContig(BTreeMap<String, u64>),
     /// Grow the output until its compressed size is `>= n` bytes, then stop.
     /// May overshoot, but never undershoot: the record count is calibrated
     /// from two cheap byte measurements (fitting `bytes ~= b0 + k*records`),
@@ -366,12 +388,16 @@ impl BulkSpec {
             .num_threads(self.workers.get())
             .build()?;
 
-        let counts: Vec<u64> = match self.size {
-            Size::RecordsPerContig(n) => vec![n; self.contig_ids.len()],
-            Size::Records(total) => distribute_by_n_variants(fitted, &self.contig_ids, total),
+        // `&self.size` rather than `self.size`: `Size` is no longer `Copy`
+        // (`PerContig` carries a map), and moving it out of `self` here
+        // would forbid the `&self` method calls further down.
+        let counts: Vec<u64> = match &self.size {
+            Size::RecordsPerContig(n) => vec![*n; self.contig_ids.len()],
+            Size::Records(total) => distribute_by_n_variants(fitted, &self.contig_ids, *total),
+            Size::PerContig(map) => per_contig_counts(map, &self.contig_ids)?,
             Size::Target(target_bytes) => {
                 let (_counts, tmp, _bytes, summary) =
-                    self.resolve_target_counts(&pool, &samplers, fitted, target_bytes)?;
+                    self.resolve_target_counts(&pool, &samplers, fitted, *target_bytes)?;
                 Self::promote_temp(tmp, path, self.format)?;
                 let json = summary.to_json()?;
                 let mut summary_path = path.as_os_str().to_os_string();
@@ -784,6 +810,46 @@ pub fn parse_size(s: &str) -> Result<u64, BulkError> {
         .map_err(|_| BulkError::BadSize(s.to_string()))
 }
 
+/// Parse `--records-for` tokens (`NAME=COUNT`) into ordered `(name, count)`
+/// pairs.
+///
+/// Returns a `Vec`, not the `BTreeMap` that [`Size::PerContig`] wants,
+/// because command-line order is load-bearing: when `--contigs` is omitted
+/// these names supply the output contig order, which a map would discard.
+/// The caller collects into a map once it has taken the order it needs.
+///
+/// Lives here rather than in the binary for the same reason [`parse_size`]
+/// does — `tests/cli.rs` cannot import from a `[[bin]]` target.
+pub fn parse_records_for(tokens: &[String]) -> Result<Vec<(String, u64)>, BulkError> {
+    let mut out: Vec<(String, u64)> = Vec::with_capacity(tokens.len());
+    for tok in tokens {
+        let (name, count) = tok.split_once('=').ok_or_else(|| {
+            BulkError::Invalid(format!("expected NAME=COUNT in --records-for, got {tok:?}"))
+        })?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(BulkError::Invalid(format!(
+                "empty contig name in --records-for entry {tok:?}"
+            )));
+        }
+        let count: u64 = count.trim().parse().map_err(|_| {
+            BulkError::Invalid(format!(
+                "expected a non-negative integer record count in --records-for \
+                 entry {tok:?}"
+            ))
+        })?;
+        // Linear scan: a run has tens of contigs, not thousands, and this
+        // preserves the order a `BTreeMap`-based dedupe would lose.
+        if out.iter().any(|(n, _)| n == name) {
+            return Err(BulkError::Invalid(format!(
+                "duplicate contig name {name:?} in --records-for"
+            )));
+        }
+        out.push((name.to_string(), count));
+    }
+    Ok(out)
+}
+
 /// Moves `src` to `dst`: a rename when both are on the same filesystem
 /// (the common case, and atomic), falling back to copy-then-remove when
 /// they aren't (e.g. `TMPDIR` on a different filesystem than the output
@@ -874,6 +940,57 @@ fn resolve_contig_stat<'a>(fitted: &'a Fitted, idx: usize, id: &str) -> &'a Cont
 fn normalize_contig_id(id: &str) -> String {
     let lower = id.to_ascii_lowercase();
     lower.strip_prefix("chr").unwrap_or(&lower).to_string()
+}
+
+/// Resolves [`Size::PerContig`] to per-contig counts parallel to
+/// `contig_ids`, validating the two name sets against each other first.
+///
+/// Both directions are errors, and both name the offending contigs:
+///
+/// - A requested contig with no entry would otherwise generate a silently
+///   empty contig — indistinguishable in the output from a deliberate
+///   zero, but not what the caller asked for.
+/// - An entry naming a contig that was not requested is almost always a
+///   typo (`"1"` for `"chr1"`, `"chrX"` in an autosome-only run). Ignoring
+///   it silently hands back a corpus that does not match the request.
+///
+/// Names are compared exactly. [`resolve_contig_stat`]'s `chr`-prefix
+/// normalization exists to reconcile caller-chosen output names against the
+/// bare ids committed profiles were fit from; that is a different problem.
+/// Here both lists come from the same caller in the same call, so a loud
+/// error beats a second, fuzzier way to spell a contig name.
+fn per_contig_counts(
+    map: &BTreeMap<String, u64>,
+    contig_ids: &[String],
+) -> Result<Vec<u64>, BulkError> {
+    let missing: Vec<&str> = contig_ids
+        .iter()
+        .filter(|id| !map.contains_key(id.as_str()))
+        .map(|id| id.as_str())
+        .collect();
+    if !missing.is_empty() {
+        return Err(BulkError::Invalid(format!(
+            "Size::PerContig has no record count for requested contig(s) \
+             {missing:?}; every contig passed to .contigs() needs an entry \
+             (names are matched exactly, with no chr-prefix normalization)"
+        )));
+    }
+
+    let unknown: Vec<&str> = map
+        .keys()
+        .filter(|k| !contig_ids.iter().any(|id| id == *k))
+        .map(|k| k.as_str())
+        .collect();
+    if !unknown.is_empty() {
+        return Err(BulkError::Invalid(format!(
+            "Size::PerContig names contig(s) {unknown:?} that were not \
+             requested via .contigs(); names are matched exactly, with no \
+             chr-prefix normalization"
+        )));
+    }
+
+    // Indexing is guarded by the `missing` check above.
+    Ok(contig_ids.iter().map(|id| map[id.as_str()]).collect())
 }
 
 /// Splits `total` records across `contig_ids` proportional to each
