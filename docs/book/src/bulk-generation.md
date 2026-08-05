@@ -103,18 +103,41 @@ which thread computed which block or in what order.
 
 ## Sizing
 
-Three ways to say how much to generate:
+Four ways to say how much to generate:
 
 - `Size::RecordsPerContig(n)` / `--records-per-contig N` — exactly `n`
   records for each requested contig.
 - `Size::Records(n)` / `--records N` — exactly `n` records total, split
-  across contigs proportional to each contig's fitted density.
+  across contigs proportional to each contig's fitted variant count
+  (`n_variants`).
+- `Size::PerContig(map)` / `--records-for chr1=5759060,chr2=6088598` —
+  exactly the given number of records for each named contig, with the
+  profile's fitted per-contig statistics ignored entirely. Names are matched
+  exactly against the requested contigs; a requested contig with no count,
+  or a count naming a contig that was not requested, is an error. A count of
+  `0` is legal. On the CLI, omitting `--contigs` makes these names the
+  output contig list, in the order written.
 - `Size::Target(bytes)` / `--target-size 100MB` — generate until the
   compressed output reaches *at least* the target, then stop. This
   overshoots rather than undershoots, and the overshoot is a small
   percentage of the target rather than a fixed byte budget (observed on the
   order of ~9% in practice) — don't rely on the output landing within any
   absolute byte window of the target.
+
+### Which one shapes a corpus like a real cohort
+
+`--records` weights by `n_variants`, and for the built-in human profiles that
+is a genuinely skewed split: across the 22 autosomes `germline-1kgp`'s fitted
+counts span about 6× (chr2 at 6.1M, chr21 at 1.0M). Their *densities* span only
+about 1.2×, so weighting by density instead would flatten the corpus to
+near-uniform.
+
+That difference matters as soon as a benchmark measures anything
+scheduling-related — contig-level concurrency, load balancing, longest-first
+dispatch, makespan tails. A corpus whose contigs all finish at the same time
+makes any scheduler look efficient. Use `--records` to inherit the profile's own
+6× shape, or `--records-for` to impose a specific cohort's shape on a profile
+that was fit on a different one.
 
 ## API example
 

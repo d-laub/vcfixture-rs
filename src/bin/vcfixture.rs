@@ -9,7 +9,9 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use vcfixture::bulk::{parse_size, BulkError, BulkSpec, Format, Payload, Profile, Size};
+use vcfixture::bulk::{
+    parse_records_for, parse_size, BulkError, BulkSpec, Format, Payload, Profile, Size,
+};
 
 #[derive(Parser)]
 #[command(name = "vcfixture", about = "Generate VCF/BCF test data")]
@@ -37,22 +39,32 @@ enum Cmd {
         #[arg(long, default_value_t = 1)]
         samples: usize,
         /// Output contig names, in the order they will be written.
+        /// Defaults to the `--records-for` names in the order given, or to
+        /// `chr1,chr2,chr3` when neither is supplied.
+        #[arg(long, value_delimiter = ',')]
+        contigs: Option<Vec<String>>,
+        /// Stop once the compressed output reaches this size (e.g. 100MB).
+        #[arg(long, conflicts_with_all = ["records", "records_per_contig", "records_for"])]
+        target_size: Option<String>,
+        /// Generate exactly this many records total, split across contigs
+        /// proportional to the profile's fitted per-contig variant counts
+        /// (`n_variants`) -- not to its fitted density, which is close to
+        /// uniform across the human autosomes.
+        #[arg(long, conflicts_with_all = ["target_size", "records_per_contig", "records_for"])]
+        records: Option<u64>,
+        /// Generate exactly this many records for each requested contig.
+        #[arg(long, conflicts_with_all = ["target_size", "records", "records_for"])]
+        records_per_contig: Option<u64>,
+        /// Generate exactly this many records for the named contig, e.g.
+        /// `--records-for chr1=5759060,chr2=6088598`. Repeatable and
+        /// comma-separated. When `--contigs` is omitted these names also
+        /// set the output contig list and its order.
         #[arg(
             long,
             value_delimiter = ',',
-            default_values_t = ["chr1".to_string(), "chr2".to_string(), "chr3".to_string()]
+            conflicts_with_all = ["target_size", "records", "records_per_contig"]
         )]
-        contigs: Vec<String>,
-        /// Stop once the compressed output reaches this size (e.g. 100MB).
-        #[arg(long, conflicts_with_all = ["records", "records_per_contig"])]
-        target_size: Option<String>,
-        /// Generate exactly this many records total, split across contigs
-        /// proportional to the profile's fitted density.
-        #[arg(long, conflicts_with_all = ["target_size", "records_per_contig"])]
-        records: Option<u64>,
-        /// Generate exactly this many records for each requested contig.
-        #[arg(long, conflicts_with_all = ["target_size", "records"])]
-        records_per_contig: Option<u64>,
+        records_for: Vec<String>,
         /// Override the profile's payload preset (which FORMAT fields to
         /// synthesize).
         #[arg(long)]
@@ -141,6 +153,7 @@ fn run() -> Result<(), BulkError> {
         target_size,
         records,
         records_per_contig,
+        records_for,
         payload,
         format,
         seed,
@@ -151,12 +164,32 @@ fn run() -> Result<(), BulkError> {
 
     let profile = resolve_profile(&profile)?;
 
+    let records_for = if records_for.is_empty() {
+        None
+    } else {
+        Some(parse_records_for(&records_for)?)
+    };
+
+    // `--contigs` wins; otherwise `--records-for`'s names supply the output
+    // order (so a 22-autosome run spells them out once, not twice, in two
+    // places that could drift); otherwise the historical default.
+    let contigs = match (contigs, &records_for) {
+        (Some(c), _) => c,
+        (None, Some(pairs)) => pairs.iter().map(|(id, _)| id.clone()).collect(),
+        (None, None) => vec!["chr1".to_string(), "chr2".to_string(), "chr3".to_string()],
+    };
+
     let size = if let Some(s) = target_size {
         Size::Target(parse_size(&s)?)
     } else if let Some(n) = records {
         Size::Records(n)
     } else if let Some(n) = records_per_contig {
         Size::RecordsPerContig(n)
+    } else if let Some(pairs) = records_for {
+        // If `--contigs` was also given and disagrees with these keys,
+        // `BulkSpec::write`'s `Size::PerContig` validation reports it with
+        // the offending names -- no separate check needed here.
+        Size::PerContig(pairs.into_iter().collect())
     } else {
         Size::RecordsPerContig(1000)
     };
