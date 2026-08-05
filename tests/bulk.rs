@@ -478,9 +478,16 @@ fn non_diploid_profile_rejects_payloads_declaring_pl_or_ad() {
         profile.dialed.payload = payload.clone();
         let result = profile.validate();
         assert!(
-            matches!(result, Err(BulkError::Invalid(_))),
+            matches!(
+                result,
+                Err(BulkError::PayloadPloidy {
+                    ploidy: 3,
+                    payload: ref p,
+                }) if *p == payload
+            ),
             "payload {payload:?} declares PL/AD, which are diploid-only; \
-             ploidy 3 must be rejected, got: {result:?}"
+             ploidy 3 must be rejected with PayloadPloidy naming the payload \
+             and the offending ploidy, got: {result:?}"
         );
     }
 }

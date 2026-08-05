@@ -100,7 +100,7 @@ impl Samplers {
     pub fn new(fitted: &Fitted, an_source: u64) -> Result<Samplers, BulkError> {
         fitted.variant_classes.validate()?;
         if fitted.titv <= 0.0 {
-            return Err(BulkError::Invalid("titv must be > 0".into()));
+            return Err(BulkError::InvalidProfile("titv must be > 0".into()));
         }
         let m: &ClassMix = &fitted.variant_classes;
         let mut acc = 0.0;
