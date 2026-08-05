@@ -62,8 +62,10 @@ impl BulkWriter {
     ) -> Result<BulkWriter, BulkError> {
         let file = std::fs::File::create(path)?;
 
+        // The rejected level, not noodles' rendering of it: `BulkError` names
+        // the range itself, so the foreign error adds nothing here.
         let level = bgzf::io::writer::CompressionLevel::try_from(compression_level)
-            .map_err(|e| BulkError::CompressionLevel(e.to_string()))?;
+            .map_err(|_| BulkError::CompressionLevel(compression_level))?;
 
         let mut w = match format {
             Format::Bcf => {
@@ -157,6 +159,11 @@ mod tests {
 
     /// An out-of-range bgzf compression level is an argument error. It is
     /// the caller's number that is wrong, not the profile.
+    ///
+    /// The rendered message is asserted, not just the variant: the whole
+    /// point of carrying the `u8` is that the user sees their own number and
+    /// the accepted range, instead of noodles' `invalid input: 99` doubled
+    /// behind our own prefix.
     #[test]
     fn out_of_range_compression_level_is_an_argument_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -169,15 +176,45 @@ mod tests {
             NonZero::new(1).unwrap(),
         );
         assert!(
-            matches!(result, Err(BulkError::CompressionLevel(_))),
+            matches!(result, Err(BulkError::CompressionLevel(99))),
             "compression level 99 is out of range and must be an argument \
-             error, not an invalid profile"
+             error carrying the offending level, not an invalid profile"
         );
-        assert!(!result
-            .err()
-            .unwrap()
-            .to_string()
-            .starts_with("invalid profile:"));
+
+        let msg = result.err().unwrap().to_string();
+        assert!(!msg.starts_with("invalid profile:"));
+        // The upper bound is whatever the linked noodles-bgzf accepts, so it
+        // is read the same way `BulkError` renders it rather than written out
+        // here -- noodles' `libdeflate` feature moves it from 9 to 12.
+        let max = bgzf::io::writer::CompressionLevel::BEST.get();
+        assert_eq!(
+            msg,
+            format!("invalid compression level: 99 (expected 0-{max})")
+        );
+        assert!(
+            !msg.contains("invalid input"),
+            "must not embed noodles' error wording, got: {msg}"
+        );
+    }
+
+    /// The largest level noodles accepts must be accepted here too -- the
+    /// boundary the error message advertises has to be real, or the message
+    /// sends users at a level that then fails.
+    #[test]
+    fn the_advertised_maximum_compression_level_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let max = bgzf::io::writer::CompressionLevel::BEST.get();
+        let result = BulkWriter::create(
+            &dir.path().join("max.bcf"),
+            Format::Bcf,
+            &header(),
+            max,
+            NonZero::new(1).unwrap(),
+        );
+        assert!(
+            result.is_ok(),
+            "level {max} is advertised as valid and must be accepted"
+        );
     }
 
     #[test]

@@ -4,7 +4,15 @@ use thiserror::Error;
 
 /// All errors produced while declaring fields, adding records, deriving the
 /// reserved registry, or writing output.
+///
+/// # Non-exhaustive
+///
+/// Like [`crate::bulk::BulkError`], this enum is `#[non_exhaustive]`: a
+/// downstream `match` must carry a wildcard arm. Every validation rule added
+/// to the builder has meant a new variant, and pinning the set now would
+/// make each of those a breaking change.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum BuildError {
     #[error("sequence allele bases must be [ACGTN]+, got {0:?}")]
     BadAlleleBases(String),
