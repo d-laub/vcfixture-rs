@@ -107,11 +107,6 @@ pub enum BulkError {
         corrections: usize,
     },
 
-    /// Deprecated catch-all, removed in Task 5 once every call site is
-    /// routed. Do not add new uses.
-    #[error("invalid profile: {0}")]
-    Invalid(String),
-
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("io: {0}")]
