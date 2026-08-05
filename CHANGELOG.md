@@ -1,3 +1,31 @@
+## v0.4.0 (2026-08-05)
+
+### BREAKING CHANGE
+
+- BulkError also gains BadRecordsFor(String),
+PerContigMissing(Vec<String>), and PerContigUnknown(Vec<String>) for the
+--records-for and Size::PerContig failures introduced in #17. Their
+message text is unchanged; only the misleading "invalid profile: " prefix
+is dropped. Downstream `match` arms on BulkError need a wildcard arm.
+- BulkError::Invalid is removed. Profile-validation
+failures are now BulkError::InvalidProfile (same message, same prefix);
+other failures use NoContigs, NoSamples, DuplicateContig, PayloadPloidy,
+BadSize, CompressionLevel, ProfileLoad, WorkerPool, or TargetNotReached.
+
+### Feat
+
+- **cli**: add --records-for for explicit per-contig counts
+- **bulk**: add Size::PerContig for explicit per-contig counts
+
+### Refactor
+
+- **bulk**: route --records-for and PerContig errors (#16)
+- **bulk**: remove the BulkError::Invalid catch-all (#16)
+- **bulk**: route writer and CLI errors, parse --threads as NonZero (#16)
+- **bulk**: route spec, parsing, and runtime errors (#16)
+- **bulk**: route profile-content errors to InvalidProfile (#16)
+- **bulk**: add per-class BulkError variants (#16)
+
 ## v0.3.0 (2026-07-18)
 
 ### Feat
