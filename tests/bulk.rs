@@ -522,7 +522,10 @@ fn per_contig_missing_contig_is_an_error() {
         .unwrap_err();
 
     let msg = err.to_string();
-    assert!(matches!(err, BulkError::Invalid(_)), "{msg}");
+    assert!(
+        matches!(&err, BulkError::PerContigMissing(missing) if missing.iter().any(|c| c == "chr2")),
+        "must name the contig with no count: {msg}"
+    );
     assert!(
         msg.contains("chr2"),
         "error must name the contig with no count: {msg}"
@@ -548,7 +551,10 @@ fn per_contig_unknown_key_is_an_error() {
         .unwrap_err();
 
     let msg = err.to_string();
-    assert!(matches!(err, BulkError::Invalid(_)), "{msg}");
+    assert!(
+        matches!(&err, BulkError::PerContigUnknown(unknown) if unknown.iter().any(|c| c == "1")),
+        "must name the unrequested key: {msg}"
+    );
     assert!(
         msg.contains("\"1\""),
         "error must name the unrequested key: {msg}"

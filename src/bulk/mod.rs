@@ -83,10 +83,31 @@ pub enum BulkError {
          silently drops region-query hits)"
     )]
     DuplicateContig(String),
+    /// `Size::PerContig` omitted a contig that `.contigs()` requested. The
+    /// names are the actionable payload, so they are structured rather than
+    /// pre-formatted into a string.
+    #[error(
+        "Size::PerContig has no record count for requested contig(s) {0:?}; \
+         every contig passed to .contigs() needs an entry (names are matched \
+         exactly, with no chr-prefix normalization)"
+    )]
+    PerContigMissing(Vec<String>),
+    /// `Size::PerContig` named a contig that `.contigs()` never requested.
+    #[error(
+        "Size::PerContig names contig(s) {0:?} that were not requested via \
+         .contigs(); names are matched exactly, with no chr-prefix \
+         normalization"
+    )]
+    PerContigUnknown(Vec<String>),
 
     // --- argument parsing -------------------------------------------------
     #[error("bad size: {0:?} (expected a byte count, optionally suffixed KB/MB/GB)")]
     BadSize(String),
+    /// A malformed `--records-for` token. One string variant rather than four:
+    /// a caller cannot act differently on "missing `=`" than on "count is not
+    /// a number" -- both mean *this token is malformed, here is how*.
+    #[error("{0}")]
+    BadRecordsFor(String),
     #[error("invalid compression level: {0}")]
     CompressionLevel(String),
 
@@ -824,16 +845,16 @@ pub fn parse_records_for(tokens: &[String]) -> Result<Vec<(String, u64)>, BulkEr
     let mut out: Vec<(String, u64)> = Vec::with_capacity(tokens.len());
     for tok in tokens {
         let (name, count) = tok.split_once('=').ok_or_else(|| {
-            BulkError::Invalid(format!("expected NAME=COUNT in --records-for, got {tok:?}"))
+            BulkError::BadRecordsFor(format!("expected NAME=COUNT in --records-for, got {tok:?}"))
         })?;
         let name = name.trim();
         if name.is_empty() {
-            return Err(BulkError::Invalid(format!(
+            return Err(BulkError::BadRecordsFor(format!(
                 "empty contig name in --records-for entry {tok:?}"
             )));
         }
         let count: u64 = count.trim().parse().map_err(|_| {
-            BulkError::Invalid(format!(
+            BulkError::BadRecordsFor(format!(
                 "expected a non-negative integer record count in --records-for \
                  entry {tok:?}"
             ))
@@ -841,7 +862,7 @@ pub fn parse_records_for(tokens: &[String]) -> Result<Vec<(String, u64)>, BulkEr
         // Linear scan: a run has tens of contigs, not thousands, and this
         // preserves the order a `BTreeMap`-based dedupe would lose.
         if out.iter().any(|(n, _)| n == name) {
-            return Err(BulkError::Invalid(format!(
+            return Err(BulkError::BadRecordsFor(format!(
                 "duplicate contig name {name:?} in --records-for"
             )));
         }
@@ -963,30 +984,22 @@ fn per_contig_counts(
     map: &BTreeMap<String, u64>,
     contig_ids: &[String],
 ) -> Result<Vec<u64>, BulkError> {
-    let missing: Vec<&str> = contig_ids
+    let missing: Vec<String> = contig_ids
         .iter()
         .filter(|id| !map.contains_key(id.as_str()))
-        .map(|id| id.as_str())
+        .map(|id| id.to_string())
         .collect();
     if !missing.is_empty() {
-        return Err(BulkError::Invalid(format!(
-            "Size::PerContig has no record count for requested contig(s) \
-             {missing:?}; every contig passed to .contigs() needs an entry \
-             (names are matched exactly, with no chr-prefix normalization)"
-        )));
+        return Err(BulkError::PerContigMissing(missing));
     }
 
-    let unknown: Vec<&str> = map
+    let unknown: Vec<String> = map
         .keys()
         .filter(|k| !contig_ids.iter().any(|id| id == *k))
-        .map(|k| k.as_str())
+        .map(|k| k.to_string())
         .collect();
     if !unknown.is_empty() {
-        return Err(BulkError::Invalid(format!(
-            "Size::PerContig names contig(s) {unknown:?} that were not \
-             requested via .contigs(); names are matched exactly, with no \
-             chr-prefix normalization"
-        )));
+        return Err(BulkError::PerContigUnknown(unknown));
     }
 
     // Indexing is guarded by the `missing` check above.
