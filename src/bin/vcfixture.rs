@@ -81,8 +81,8 @@ enum Cmd {
         compression_level: u8,
         /// Worker thread count for compression/generation. Defaults to all
         /// available cores.
-        #[arg(long)]
-        threads: Option<usize>,
+        #[arg(long, value_parser = parse_threads)]
+        threads: Option<NonZero<usize>>,
         /// Output path (e.g. `out.bcf`). A `.csi` index and a
         /// `.summary.json` are written alongside it.
         #[arg(short, long)]
@@ -132,16 +132,24 @@ fn resolve_profile(name_or_path: &str) -> Result<Profile, BulkError> {
     match Profile::builtin(name_or_path) {
         Ok(p) => Ok(p),
         Err(BulkError::UnknownProfile(_)) => {
-            let text = std::fs::read_to_string(name_or_path).map_err(|e| {
-                BulkError::Invalid(format!(
-                    "profile {name_or_path:?} is not a builtin name and could not be \
-                     read as a file: {e}"
-                ))
-            })?;
+            let text =
+                std::fs::read_to_string(name_or_path).map_err(|e| BulkError::ProfileLoad {
+                    path: name_or_path.to_string(),
+                    source: e,
+                })?;
             Profile::from_json(&text)
         }
         Err(e) => Err(e),
     }
+}
+
+/// Parses `--threads` straight into a `NonZero<usize>` so zero is rejected
+/// by clap's own usage error and never becomes a library error variant.
+fn parse_threads(s: &str) -> Result<NonZero<usize>, String> {
+    let n: usize = s
+        .parse()
+        .map_err(|_| format!("{s:?} is not a thread count"))?;
+    NonZero::new(n).ok_or_else(|| "must be >= 1".to_string())
 }
 
 fn run() -> Result<(), BulkError> {
@@ -206,8 +214,6 @@ fn run() -> Result<(), BulkError> {
         spec = spec.payload(p.into());
     }
     if let Some(n) = threads {
-        let n = NonZero::new(n)
-            .ok_or_else(|| BulkError::Invalid("--threads must be >= 1".to_string()))?;
         spec = spec.workers(n);
     }
 

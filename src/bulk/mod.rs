@@ -43,12 +43,92 @@ pub use summary::Summary;
 pub use writer::Format;
 
 /// Errors from bulk generation.
+///
+/// Variants are grouped by *who* is at fault, because the message a user
+/// sees depends on it: a malformed profile JSON, a spec the caller built
+/// wrong, an unparseable argument, or a failure at generation time. The
+/// `invalid profile:` prefix appears on exactly the first group -- those
+/// messages name a profile field rather than describing themselves, so they
+/// need the context; every other variant's message stands alone.
+///
+/// Profile-content failures share one `InvalidProfile(String)` rather than
+/// getting a variant each: a caller cannot act differently on "histogram
+/// edges must be increasing" than on "histogram weights must sum > 0", so
+/// the extra variants would only ever reach `Display`.
 #[derive(Debug, thiserror::Error)]
 pub enum BulkError {
     #[error("unknown builtin profile: {0}")]
     UnknownProfile(String),
+
+    // --- profile content --------------------------------------------------
+    /// A fitted or dialed statistic that fails [`Profile::validate`].
     #[error("invalid profile: {0}")]
-    Invalid(String),
+    InvalidProfile(String),
+    /// The one profile-content failure a caller can fix without editing the
+    /// profile JSON -- by choosing a payload that doesn't emit AD/PL.
+    #[error(
+        "invalid profile: payload {payload:?} emits AD and/or PL, which are \
+         hard-coded for diploid (ploidy 2) calls, but ploidy is {ploidy}"
+    )]
+    PayloadPloidy { payload: Payload, ploidy: u8 },
+
+    // --- spec / caller validation -----------------------------------------
+    #[error("need >= 1 output contig")]
+    NoContigs,
+    #[error("need >= 1 sample")]
+    NoSamples,
+    #[error(
+        "duplicate output contig name: {0:?} (each requested contig must be \
+         unique; duplicates produce backwards positions and a CSI that \
+         silently drops region-query hits)"
+    )]
+    DuplicateContig(String),
+    /// `Size::PerContig` omitted a contig that `.contigs()` requested. The
+    /// names are the actionable payload, so they are structured rather than
+    /// pre-formatted into a string.
+    #[error(
+        "Size::PerContig has no record count for requested contig(s) {0:?}; \
+         every contig passed to .contigs() needs an entry (names are matched \
+         exactly, with no chr-prefix normalization)"
+    )]
+    PerContigMissing(Vec<String>),
+    /// `Size::PerContig` named a contig that `.contigs()` never requested.
+    #[error(
+        "Size::PerContig names contig(s) {0:?} that were not requested via \
+         .contigs(); names are matched exactly, with no chr-prefix \
+         normalization"
+    )]
+    PerContigUnknown(Vec<String>),
+
+    // --- argument parsing -------------------------------------------------
+    #[error("bad size: {0:?} (expected a byte count, optionally suffixed KB/MB/GB)")]
+    BadSize(String),
+    /// A malformed `--records-for` token. One string variant rather than four:
+    /// a caller cannot act differently on "missing `=`" than on "count is not
+    /// a number" -- both mean *this token is malformed, here is how*.
+    #[error("{0}")]
+    BadRecordsFor(String),
+    #[error("invalid compression level: {0}")]
+    CompressionLevel(String),
+
+    // --- profile loading --------------------------------------------------
+    #[error("profile {path:?} is not a builtin name and could not be read as a file: {source}")]
+    ProfileLoad {
+        path: String,
+        source: std::io::Error,
+    },
+
+    // --- runtime ----------------------------------------------------------
+    #[error("failed to build worker pool: {0}")]
+    WorkerPool(#[from] rayon::ThreadPoolBuildError),
+    #[error(
+        "could not reach target size {target_bytes} bytes within {corrections} corrective rounds"
+    )]
+    TargetNotReached {
+        target_bytes: u64,
+        corrections: usize,
+    },
+
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("io: {0}")]
@@ -297,10 +377,10 @@ impl BulkSpec {
         let path = path.as_ref();
         self.profile.validate()?;
         if self.contig_ids.is_empty() {
-            return Err(BulkError::Invalid("need >= 1 output contig".into()));
+            return Err(BulkError::NoContigs);
         }
         if self.n_samples == 0 {
-            return Err(BulkError::Invalid("need >= 1 sample".into()));
+            return Err(BulkError::NoSamples);
         }
         // A duplicate output contig name would give each occurrence its own
         // independent position stream starting back at 0, so positions run
@@ -313,11 +393,7 @@ impl BulkSpec {
             let mut seen = std::collections::HashSet::with_capacity(self.contig_ids.len());
             for id in &self.contig_ids {
                 if !seen.insert(id.as_str()) {
-                    return Err(BulkError::Invalid(format!(
-                        "duplicate output contig name: {id:?} (each requested contig \
-                         must be unique; duplicates produce backwards positions and a \
-                         CSI that silently drops region-query hits)"
-                    )));
+                    return Err(BulkError::DuplicateContig(id.clone()));
                 }
             }
         }
@@ -331,8 +407,7 @@ impl BulkSpec {
         let samplers = Samplers::new(fitted, an_source)?;
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(self.workers.get())
-            .build()
-            .map_err(|e| BulkError::Invalid(format!("failed to build worker pool: {e}")))?;
+            .build()?;
 
         // `&self.size` rather than `self.size`: `Size` is no longer `Copy`
         // (`PerContig` carries a map), and moving it out of `self` here
@@ -584,9 +659,10 @@ impl BulkSpec {
             drop(tmp); // discard the under-target temp before regenerating
         }
 
-        Err(BulkError::Invalid(format!(
-            "could not reach target size {target_bytes} bytes within {MAX_CORRECTIONS} corrective rounds"
-        )))
+        Err(BulkError::TargetNotReached {
+            target_bytes,
+            corrections: MAX_CORRECTIONS,
+        })
     }
 
     /// Like [`BulkSpec::measure_compressed_bytes`], but builds the
@@ -752,7 +828,7 @@ pub fn parse_size(s: &str) -> Result<u64, BulkError> {
     num.trim()
         .parse::<u64>()
         .map(|n| n * mult)
-        .map_err(|_| BulkError::Invalid(format!("bad size: {s}")))
+        .map_err(|_| BulkError::BadSize(s.to_string()))
 }
 
 /// Parse `--records-for` tokens (`NAME=COUNT`) into ordered `(name, count)`
@@ -769,16 +845,16 @@ pub fn parse_records_for(tokens: &[String]) -> Result<Vec<(String, u64)>, BulkEr
     let mut out: Vec<(String, u64)> = Vec::with_capacity(tokens.len());
     for tok in tokens {
         let (name, count) = tok.split_once('=').ok_or_else(|| {
-            BulkError::Invalid(format!("expected NAME=COUNT in --records-for, got {tok:?}"))
+            BulkError::BadRecordsFor(format!("expected NAME=COUNT in --records-for, got {tok:?}"))
         })?;
         let name = name.trim();
         if name.is_empty() {
-            return Err(BulkError::Invalid(format!(
+            return Err(BulkError::BadRecordsFor(format!(
                 "empty contig name in --records-for entry {tok:?}"
             )));
         }
         let count: u64 = count.trim().parse().map_err(|_| {
-            BulkError::Invalid(format!(
+            BulkError::BadRecordsFor(format!(
                 "expected a non-negative integer record count in --records-for \
                  entry {tok:?}"
             ))
@@ -786,7 +862,7 @@ pub fn parse_records_for(tokens: &[String]) -> Result<Vec<(String, u64)>, BulkEr
         // Linear scan: a run has tens of contigs, not thousands, and this
         // preserves the order a `BTreeMap`-based dedupe would lose.
         if out.iter().any(|(n, _)| n == name) {
-            return Err(BulkError::Invalid(format!(
+            return Err(BulkError::BadRecordsFor(format!(
                 "duplicate contig name {name:?} in --records-for"
             )));
         }
@@ -908,30 +984,22 @@ fn per_contig_counts(
     map: &BTreeMap<String, u64>,
     contig_ids: &[String],
 ) -> Result<Vec<u64>, BulkError> {
-    let missing: Vec<&str> = contig_ids
+    let missing: Vec<String> = contig_ids
         .iter()
         .filter(|id| !map.contains_key(id.as_str()))
-        .map(|id| id.as_str())
+        .map(|id| id.to_string())
         .collect();
     if !missing.is_empty() {
-        return Err(BulkError::Invalid(format!(
-            "Size::PerContig has no record count for requested contig(s) \
-             {missing:?}; every contig passed to .contigs() needs an entry \
-             (names are matched exactly, with no chr-prefix normalization)"
-        )));
+        return Err(BulkError::PerContigMissing(missing));
     }
 
-    let unknown: Vec<&str> = map
+    let unknown: Vec<String> = map
         .keys()
         .filter(|k| !contig_ids.iter().any(|id| id == *k))
-        .map(|k| k.as_str())
+        .map(|k| k.to_string())
         .collect();
     if !unknown.is_empty() {
-        return Err(BulkError::Invalid(format!(
-            "Size::PerContig names contig(s) {unknown:?} that were not \
-             requested via .contigs(); names are matched exactly, with no \
-             chr-prefix normalization"
-        )));
+        return Err(BulkError::PerContigUnknown(unknown));
     }
 
     // Indexing is guarded by the `missing` check above.
@@ -1082,5 +1150,66 @@ mod tests {
         let ids = vec!["big".to_string(), "small".to_string()];
         let counts = distribute_by_n_variants(&p.fitted, &ids, 11_000);
         assert_eq!(counts, vec![10_000, 1_000]);
+    }
+
+    /// The whole point of the split: only profile-content errors carry the
+    /// `invalid profile:` prefix. Every other class names its own problem.
+    #[test]
+    fn error_messages_are_classified() {
+        // Profile content keeps the prefix -- these messages name a profile
+        // field, not themselves, so the prefix is load-bearing.
+        assert_eq!(
+            BulkError::InvalidProfile("ploidy must be >= 1".into()).to_string(),
+            "invalid profile: ploidy must be >= 1"
+        );
+        assert!(BulkError::PayloadPloidy {
+            payload: Payload::Gatk,
+            ploidy: 3,
+        }
+        .to_string()
+        .starts_with("invalid profile: payload Gatk emits AD and/or PL"));
+
+        // Everything else must NOT claim the profile is at fault.
+        for e in [
+            BulkError::NoContigs,
+            BulkError::NoSamples,
+            BulkError::DuplicateContig("chr1".into()),
+            BulkError::BadSize("banana".into()),
+            BulkError::CompressionLevel("level 99 out of range".into()),
+            BulkError::TargetNotReached {
+                target_bytes: 1024,
+                corrections: 4,
+            },
+            BulkError::ProfileLoad {
+                path: "x".into(),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            },
+            BulkError::BadRecordsFor("expected NAME=COUNT in --records-for, got \"x\"".into()),
+            BulkError::PerContigMissing(vec!["chr2".into()]),
+            BulkError::PerContigUnknown(vec!["1".into()]),
+        ] {
+            let msg = e.to_string();
+            assert!(
+                !msg.starts_with("invalid profile:"),
+                "{e:?} must not be described as an invalid profile, got: {msg}"
+            );
+        }
+
+        assert_eq!(BulkError::NoContigs.to_string(), "need >= 1 output contig");
+        assert_eq!(BulkError::NoSamples.to_string(), "need >= 1 sample");
+        assert!(BulkError::DuplicateContig("chr1".into())
+            .to_string()
+            .starts_with(r#"duplicate output contig name: "chr1""#));
+        assert!(BulkError::BadSize("banana".into())
+            .to_string()
+            .starts_with(r#"bad size: "banana""#));
+        assert_eq!(
+            BulkError::TargetNotReached {
+                target_bytes: 1024,
+                corrections: 4,
+            }
+            .to_string(),
+            "could not reach target size 1024 bytes within 4 corrective rounds"
+        );
     }
 }

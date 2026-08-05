@@ -522,7 +522,10 @@ fn per_contig_missing_contig_is_an_error() {
         .unwrap_err();
 
     let msg = err.to_string();
-    assert!(matches!(err, BulkError::Invalid(_)), "{msg}");
+    assert!(
+        matches!(&err, BulkError::PerContigMissing(missing) if missing.iter().any(|c| c == "chr2")),
+        "must name the contig with no count: {msg}"
+    );
     assert!(
         msg.contains("chr2"),
         "error must name the contig with no count: {msg}"
@@ -548,7 +551,10 @@ fn per_contig_unknown_key_is_an_error() {
         .unwrap_err();
 
     let msg = err.to_string();
-    assert!(matches!(err, BulkError::Invalid(_)), "{msg}");
+    assert!(
+        matches!(&err, BulkError::PerContigUnknown(unknown) if unknown.iter().any(|c| c == "1")),
+        "must name the unrequested key: {msg}"
+    );
     assert!(
         msg.contains("\"1\""),
         "error must name the unrequested key: {msg}"
@@ -682,8 +688,9 @@ fn duplicate_contig_names_are_rejected() {
         .size(Size::RecordsPerContig(10))
         .write(&path);
     assert!(
-        matches!(result, Err(BulkError::Invalid(_))),
-        "duplicate output contig names must be rejected as invalid: {result:?}"
+        matches!(&result, Err(BulkError::DuplicateContig(id)) if id == "chr1"),
+        "duplicate output contig names must be rejected with DuplicateContig \
+         naming the offending contig: {result:?}"
     );
     assert!(
         !path.exists(),
@@ -706,9 +713,16 @@ fn non_diploid_profile_rejects_payloads_declaring_pl_or_ad() {
         profile.dialed.payload = payload.clone();
         let result = profile.validate();
         assert!(
-            matches!(result, Err(BulkError::Invalid(_))),
+            matches!(
+                result,
+                Err(BulkError::PayloadPloidy {
+                    ploidy: 3,
+                    payload: ref p,
+                }) if *p == payload
+            ),
             "payload {payload:?} declares PL/AD, which are diploid-only; \
-             ploidy 3 must be rejected, got: {result:?}"
+             ploidy 3 must be rejected with PayloadPloidy naming the payload \
+             and the offending ploidy, got: {result:?}"
         );
     }
 }
@@ -776,3 +790,36 @@ const TRIPLOID_PROFILE: &str = r#"
   "dialed": { "payload": "gt-only", "ploidy": 3 }
 }
 "#;
+
+/// An empty contig list and a zero sample count are caller mistakes, not
+/// profile mistakes -- they must not be reported as an invalid profile.
+#[test]
+fn empty_spec_dimensions_are_rejected_as_spec_errors() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let no_contigs = spec()
+        .contigs(Vec::<String>::new())
+        .size(Size::RecordsPerContig(10))
+        .write(dir.path().join("a.bcf"));
+    assert!(
+        matches!(no_contigs, Err(BulkError::NoContigs)),
+        "an empty contig list must be a spec error: {no_contigs:?}"
+    );
+
+    let no_samples = spec()
+        .samples(0)
+        .size(Size::RecordsPerContig(10))
+        .write(dir.path().join("b.bcf"));
+    assert!(
+        matches!(no_samples, Err(BulkError::NoSamples)),
+        "a zero sample count must be a spec error: {no_samples:?}"
+    );
+
+    for e in [no_contigs, no_samples] {
+        let msg = e.unwrap_err().to_string();
+        assert!(
+            !msg.starts_with("invalid profile:"),
+            "a spec error must not blame the profile, got: {msg}"
+        );
+    }
+}

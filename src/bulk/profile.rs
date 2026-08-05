@@ -127,14 +127,13 @@ impl Profile {
         self.fitted.indel_length.validate()?;
         self.fitted.variant_classes.validate()?;
         if self.dialed.ploidy == 0 {
-            return Err(BulkError::Invalid("ploidy must be >= 1".into()));
+            return Err(BulkError::InvalidProfile("ploidy must be >= 1".into()));
         }
         if self.dialed.payload.needs_diploid() && self.dialed.ploidy != 2 {
-            return Err(BulkError::Invalid(format!(
-                "payload {:?} emits AD and/or PL, which are hard-coded for \
-                 diploid (ploidy 2) calls, but ploidy is {}",
-                self.dialed.payload, self.dialed.ploidy
-            )));
+            return Err(BulkError::PayloadPloidy {
+                payload: self.dialed.payload.clone(),
+                ploidy: self.dialed.ploidy,
+            });
         }
         for (label, v) in [
             ("multiallelic_rate", self.fitted.multiallelic_rate),
@@ -142,11 +141,13 @@ impl Profile {
             ("phased_rate", self.fitted.phased_rate),
         ] {
             if !(0.0..=1.0).contains(&v) {
-                return Err(BulkError::Invalid(format!("{label} must be in [0, 1]")));
+                return Err(BulkError::InvalidProfile(format!(
+                    "{label} must be in [0, 1]"
+                )));
             }
         }
         if self.fitted.contigs.is_empty() {
-            return Err(BulkError::Invalid("need >= 1 contig".into()));
+            return Err(BulkError::InvalidProfile("need >= 1 contig".into()));
         }
         Ok(())
     }
@@ -157,10 +158,12 @@ impl Histogram {
     /// non-negative weights summing to a positive total).
     pub fn validate(&self) -> Result<(), BulkError> {
         if self.edges.len() < 2 {
-            return Err(BulkError::Invalid("histogram needs >= 2 edges".into()));
+            return Err(BulkError::InvalidProfile(
+                "histogram needs >= 2 edges".into(),
+            ));
         }
         if self.weights.len() + 1 != self.edges.len() {
-            return Err(BulkError::Invalid(format!(
+            return Err(BulkError::InvalidProfile(format!(
                 "histogram weights ({}) must be edges ({}) - 1",
                 self.weights.len(),
                 self.edges.len()
@@ -170,23 +173,27 @@ impl Histogram {
         // comparisons are always false, so `< 0.0`, `<= 0.0`, etc. would
         // otherwise let a NaN-poisoned histogram through silently.
         if self.weights.iter().any(|w| !w.is_finite()) {
-            return Err(BulkError::Invalid(
+            return Err(BulkError::InvalidProfile(
                 "histogram weights must be finite (no NaN or Inf)".into(),
             ));
         }
         if self.edges.iter().any(|e| !e.is_finite()) {
-            return Err(BulkError::Invalid(
+            return Err(BulkError::InvalidProfile(
                 "histogram edges must be finite (no NaN or Inf)".into(),
             ));
         }
         if self.weights.iter().any(|w| *w < 0.0) {
-            return Err(BulkError::Invalid("histogram weights must be >= 0".into()));
+            return Err(BulkError::InvalidProfile(
+                "histogram weights must be >= 0".into(),
+            ));
         }
         if self.weights.iter().sum::<f64>() <= 0.0 {
-            return Err(BulkError::Invalid("histogram weights must sum > 0".into()));
+            return Err(BulkError::InvalidProfile(
+                "histogram weights must sum > 0".into(),
+            ));
         }
         if self.edges.windows(2).any(|w| w[1] <= w[0]) {
-            return Err(BulkError::Invalid(
+            return Err(BulkError::InvalidProfile(
                 "histogram edges must be increasing".into(),
             ));
         }
@@ -210,7 +217,7 @@ impl ClassMix {
             ("symbolic", self.symbolic),
         ] {
             if !v.is_finite() {
-                return Err(BulkError::Invalid(format!(
+                return Err(BulkError::InvalidProfile(format!(
                     "variant_classes.{label} must be finite (no NaN or Inf)"
                 )));
             }
@@ -218,7 +225,7 @@ impl ClassMix {
         let sum =
             self.snp + self.insertion + self.deletion + self.mnp + self.complex + self.symbolic;
         if (sum - 1.0).abs() > 1e-6 {
-            return Err(BulkError::Invalid(format!(
+            return Err(BulkError::InvalidProfile(format!(
                 "variant_classes must sum to 1.0, got {sum}"
             )));
         }
@@ -412,6 +419,10 @@ mod tests {
         p.dialed.payload = Payload::Gatk;
         p.dialed.ploidy = 3;
         let err = p.validate().unwrap_err();
+        assert!(
+            matches!(err, BulkError::PayloadPloidy { ploidy: 3, .. }),
+            "expected PayloadPloidy {{ ploidy: 3, .. }}, got: {err:?}"
+        );
         assert!(
             format!("{err}").contains("diploid"),
             "expected a diploid-ploidy rejection, got: {err:?}"

@@ -8,7 +8,39 @@ fn parses_a_size_with_units() {
     assert_eq!(parse_size("512KB").unwrap(), 512 * 1024);
     assert_eq!(parse_size("1GB").unwrap(), 1024 * 1024 * 1024);
     assert_eq!(parse_size("2048").unwrap(), 2048);
-    assert!(parse_size("banana").is_err());
+    let bad = parse_size("banana");
+    assert!(
+        matches!(&bad, Err(vcfixture::bulk::BulkError::BadSize(s)) if s == "banana"),
+        "an unparseable size is an argument error, not an invalid profile: {bad:?}"
+    );
+    assert!(!bad.unwrap_err().to_string().starts_with("invalid profile:"));
+}
+
+/// `--threads 0` is rejected by clap as a usage error before any library
+/// code runs, so it can never reach BulkError at all.
+#[test]
+fn zero_threads_is_a_clap_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let out_path = dir.path().join("unused.bcf");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_vcfixture"))
+        .args(["bulk", "--threads", "0", "-o"])
+        .arg(&out_path)
+        .output()
+        .expect("binary should run");
+    assert!(!out.status.success(), "--threads 0 must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("must be >= 1"),
+        "clap should explain the constraint, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("invalid profile"),
+        "a bad --threads value must not blame the profile, got: {stderr}"
+    );
+    assert!(
+        !out_path.exists(),
+        "nothing should be written for a usage error"
+    );
 }
 
 #[test]
@@ -39,7 +71,7 @@ fn parses_records_for_entries() {
 
 #[test]
 fn rejects_malformed_records_for_entries() {
-    use vcfixture::bulk::parse_records_for;
+    use vcfixture::bulk::{parse_records_for, BulkError};
 
     let cases = [
         ("chr1", "no '=' separator"),
@@ -49,13 +81,28 @@ fn rejects_malformed_records_for_entries() {
         ("chr1=-5", "negative count"),
     ];
     for (tok, why) in cases {
+        let err = parse_records_for(&[tok.to_string()]);
         assert!(
-            parse_records_for(&[tok.to_string()]).is_err(),
-            "must reject {tok:?} ({why})"
+            matches!(&err, Err(BulkError::BadRecordsFor(_))),
+            "must reject {tok:?} ({why}) with BulkError::BadRecordsFor, got: {err:?}"
+        );
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            !msg.starts_with("invalid profile:"),
+            "{tok:?} ({why}) must not be described as an invalid profile, got: {msg}"
         );
     }
 
     // A duplicate name would silently drop one of the two counts once the
     // pairs are collected into a BTreeMap, so reject it at parse time.
-    assert!(parse_records_for(&["chr1=1".to_string(), "chr1=2".to_string()]).is_err());
+    let dup = parse_records_for(&["chr1=1".to_string(), "chr1=2".to_string()]);
+    assert!(
+        matches!(&dup, Err(BulkError::BadRecordsFor(_))),
+        "duplicate --records-for name must be BulkError::BadRecordsFor, got: {dup:?}"
+    );
+    let dup_msg = dup.unwrap_err().to_string();
+    assert!(
+        !dup_msg.starts_with("invalid profile:"),
+        "duplicate --records-for name must not be described as an invalid profile, got: {dup_msg}"
+    );
 }
