@@ -197,23 +197,51 @@ mod tests {
         );
     }
 
-    /// The largest level noodles accepts must be accepted here too -- the
-    /// boundary the error message advertises has to be real, or the message
-    /// sends users at a level that then fails.
+    /// The range the message advertises must be the range actually enforced,
+    /// checked from both sides of the boundary.
+    ///
+    /// Asserting only that the maximum is accepted would be a test that
+    /// cannot fail: `create` hands the level straight to noodles, and
+    /// `BEST` is by construction within noodles' own bounds. The claim worth
+    /// pinning is the one that *can* drift -- that the bound named in the
+    /// message is the bound the code applies. Hard-coding `0-9` in the
+    /// message while a downstream feature-unified build accepted up to 12
+    /// would fail here, and so would going back to noodles' wording.
     #[test]
-    fn the_advertised_maximum_compression_level_is_accepted() {
+    fn the_advertised_range_is_the_range_enforced() {
         let dir = tempfile::tempdir().unwrap();
         let max = bgzf::io::writer::CompressionLevel::BEST.get();
-        let result = BulkWriter::create(
-            &dir.path().join("max.bcf"),
+
+        // The top of the advertised range is accepted ...
+        assert!(
+            BulkWriter::create(
+                &dir.path().join("max.bcf"),
+                Format::Bcf,
+                &header(),
+                max,
+                NonZero::new(1).unwrap(),
+            )
+            .is_ok(),
+            "level {max} is advertised as valid and must be accepted"
+        );
+
+        // ... and one past it is rejected, by a message naming that same
+        // bound. This is what ties the advertised range to the real one.
+        let over = max + 1;
+        // Not `expect_err`: `BulkWriter` is deliberately not `Debug`.
+        let err = match BulkWriter::create(
+            &dir.path().join("over.bcf"),
             Format::Bcf,
             &header(),
-            max,
+            over,
             NonZero::new(1).unwrap(),
-        );
-        assert!(
-            result.is_ok(),
-            "level {max} is advertised as valid and must be accepted"
+        ) {
+            Ok(_) => panic!("level {over} is past the advertised maximum and must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.to_string(),
+            format!("invalid compression level: {over} (expected 0-{max})")
         );
     }
 

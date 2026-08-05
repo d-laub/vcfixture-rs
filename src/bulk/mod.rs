@@ -66,6 +66,27 @@ pub use writer::Format;
 /// would otherwise be a breaking change. Callers that want to branch should
 /// do so on the variants they handle and fall through on the rest, which is
 /// what a growing error type asks for anyway.
+///
+/// Branch on what you handle, and fall through on the rest:
+///
+/// ```
+/// use vcfixture::bulk::BulkError;
+///
+/// fn exit_code(e: &BulkError) -> i32 {
+///     match e {
+///         BulkError::NoContigs => 2,
+///         BulkError::NoSamples => 3,
+///         _ => 1,
+///     }
+/// }
+/// ```
+///
+/// Dropping that final arm does not compile, which
+/// [`crate::compile_fail_guards`] pins.
+///
+/// **Adding a variant?** Add its arm to the guard block there too. Until you
+/// do, that block fails to compile for the ordinary "forgot a variant"
+/// reason and silently stops testing this attribute.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum BulkError {
