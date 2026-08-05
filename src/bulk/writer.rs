@@ -63,7 +63,7 @@ impl BulkWriter {
         let file = std::fs::File::create(path)?;
 
         let level = bgzf::io::writer::CompressionLevel::try_from(compression_level)
-            .map_err(|e| BulkError::Invalid(format!("invalid compression level: {e}")))?;
+            .map_err(|e| BulkError::CompressionLevel(e.to_string()))?;
 
         let mut w = match format {
             Format::Bcf => {
@@ -153,6 +153,31 @@ mod tests {
             )
             .add_sample_name("s1")
             .build()
+    }
+
+    /// An out-of-range bgzf compression level is an argument error. It is
+    /// the caller's number that is wrong, not the profile.
+    #[test]
+    fn out_of_range_compression_level_is_an_argument_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // `header()` is the existing helper at the top of this test module.
+        let result = BulkWriter::create(
+            &dir.path().join("a.bcf"),
+            Format::Bcf,
+            &header(),
+            99,
+            NonZero::new(1).unwrap(),
+        );
+        assert!(
+            matches!(result, Err(BulkError::CompressionLevel(_))),
+            "compression level 99 is out of range and must be an argument \
+             error, not an invalid profile"
+        );
+        assert!(!result
+            .err()
+            .unwrap()
+            .to_string()
+            .starts_with("invalid profile:"));
     }
 
     #[test]

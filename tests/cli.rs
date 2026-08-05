@@ -15,3 +15,27 @@ fn parses_a_size_with_units() {
     );
     assert!(!bad.unwrap_err().to_string().starts_with("invalid profile:"));
 }
+
+/// `--threads 0` is rejected by clap as a usage error before any library
+/// code runs, so it can never reach BulkError at all.
+#[test]
+fn zero_threads_is_a_clap_usage_error() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_vcfixture"))
+        .args(["bulk", "--threads", "0", "-o", "unused.bcf"])
+        .output()
+        .expect("binary should run");
+    assert!(!out.status.success(), "--threads 0 must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("must be >= 1"),
+        "clap should explain the constraint, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("invalid profile"),
+        "a bad --threads value must not blame the profile, got: {stderr}"
+    );
+    assert!(
+        !std::path::Path::new("unused.bcf").exists(),
+        "nothing should be written for a usage error"
+    );
+}
