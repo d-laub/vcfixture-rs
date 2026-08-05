@@ -42,12 +42,76 @@ pub use summary::Summary;
 pub use writer::Format;
 
 /// Errors from bulk generation.
+///
+/// Variants are grouped by *who* is at fault, because the message a user
+/// sees depends on it: a malformed profile JSON, a spec the caller built
+/// wrong, an unparseable argument, or a failure at generation time. The
+/// `invalid profile:` prefix appears on exactly the first group -- those
+/// messages name a profile field rather than describing themselves, so they
+/// need the context; every other variant's message stands alone.
+///
+/// Profile-content failures share one `InvalidProfile(String)` rather than
+/// getting a variant each: a caller cannot act differently on "histogram
+/// edges must be increasing" than on "histogram weights must sum > 0", so
+/// the extra variants would only ever reach `Display`.
 #[derive(Debug, thiserror::Error)]
 pub enum BulkError {
     #[error("unknown builtin profile: {0}")]
     UnknownProfile(String),
+
+    // --- profile content --------------------------------------------------
+    /// A fitted or dialed statistic that fails [`Profile::validate`].
+    #[error("invalid profile: {0}")]
+    InvalidProfile(String),
+    /// The one profile-content failure a caller can fix without editing the
+    /// profile JSON -- by choosing a payload that doesn't emit AD/PL.
+    #[error(
+        "invalid profile: payload {payload:?} emits AD and/or PL, which are \
+         hard-coded for diploid (ploidy 2) calls, but ploidy is {ploidy}"
+    )]
+    PayloadPloidy { payload: Payload, ploidy: u8 },
+
+    // --- spec / caller validation -----------------------------------------
+    #[error("need >= 1 output contig")]
+    NoContigs,
+    #[error("need >= 1 sample")]
+    NoSamples,
+    #[error(
+        "duplicate output contig name: {0:?} (each requested contig must be \
+         unique; duplicates produce backwards positions and a CSI that \
+         silently drops region-query hits)"
+    )]
+    DuplicateContig(String),
+
+    // --- argument parsing -------------------------------------------------
+    #[error("bad size: {0:?} (expected a byte count, optionally suffixed KB/MB/GB)")]
+    BadSize(String),
+    #[error("invalid compression level: {0}")]
+    CompressionLevel(String),
+
+    // --- profile loading --------------------------------------------------
+    #[error("profile {path:?} is not a builtin name and could not be read as a file: {source}")]
+    ProfileLoad {
+        path: String,
+        source: std::io::Error,
+    },
+
+    // --- runtime ----------------------------------------------------------
+    #[error("failed to build worker pool: {0}")]
+    WorkerPool(#[from] rayon::ThreadPoolBuildError),
+    #[error(
+        "could not reach target size {target_bytes} bytes within {corrections} corrective rounds"
+    )]
+    TargetNotReached {
+        target_bytes: u64,
+        corrections: usize,
+    },
+
+    /// Deprecated catch-all, removed in Task 5 once every call site is
+    /// routed. Do not add new uses.
     #[error("invalid profile: {0}")]
     Invalid(String),
+
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("io: {0}")]
@@ -965,5 +1029,59 @@ mod tests {
         let ids = vec!["big".to_string(), "small".to_string()];
         let counts = distribute_by_n_variants(&p.fitted, &ids, 11_000);
         assert_eq!(counts, vec![10_000, 1_000]);
+    }
+
+    /// The whole point of the split: only profile-content errors carry the
+    /// `invalid profile:` prefix. Every other class names its own problem.
+    #[test]
+    fn error_messages_are_classified() {
+        // Profile content keeps the prefix -- these messages name a profile
+        // field, not themselves, so the prefix is load-bearing.
+        assert_eq!(
+            BulkError::InvalidProfile("ploidy must be >= 1".into()).to_string(),
+            "invalid profile: ploidy must be >= 1"
+        );
+        assert!(BulkError::PayloadPloidy {
+            payload: Payload::Gatk,
+            ploidy: 3,
+        }
+        .to_string()
+        .starts_with("invalid profile: payload Gatk emits AD and/or PL"));
+
+        // Everything else must NOT claim the profile is at fault.
+        for e in [
+            BulkError::NoContigs,
+            BulkError::NoSamples,
+            BulkError::DuplicateContig("chr1".into()),
+            BulkError::BadSize("banana".into()),
+            BulkError::CompressionLevel("level 99 out of range".into()),
+            BulkError::TargetNotReached {
+                target_bytes: 1024,
+                corrections: 4,
+            },
+        ] {
+            let msg = e.to_string();
+            assert!(
+                !msg.starts_with("invalid profile:"),
+                "{e:?} must not be described as an invalid profile, got: {msg}"
+            );
+        }
+
+        assert_eq!(BulkError::NoContigs.to_string(), "need >= 1 output contig");
+        assert_eq!(BulkError::NoSamples.to_string(), "need >= 1 sample");
+        assert!(BulkError::DuplicateContig("chr1".into())
+            .to_string()
+            .starts_with(r#"duplicate output contig name: "chr1""#));
+        assert!(BulkError::BadSize("banana".into())
+            .to_string()
+            .starts_with(r#"bad size: "banana""#));
+        assert_eq!(
+            BulkError::TargetNotReached {
+                target_bytes: 1024,
+                corrections: 4,
+            }
+            .to_string(),
+            "could not reach target size 1024 bytes within 4 corrective rounds"
+        );
     }
 }
