@@ -20,8 +20,11 @@ fn parses_a_size_with_units() {
 /// code runs, so it can never reach BulkError at all.
 #[test]
 fn zero_threads_is_a_clap_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let out_path = dir.path().join("unused.bcf");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_vcfixture"))
-        .args(["bulk", "--threads", "0", "-o", "unused.bcf"])
+        .args(["bulk", "--threads", "0", "-o"])
+        .arg(&out_path)
         .output()
         .expect("binary should run");
     assert!(!out.status.success(), "--threads 0 must fail");
@@ -35,7 +38,7 @@ fn zero_threads_is_a_clap_usage_error() {
         "a bad --threads value must not blame the profile, got: {stderr}"
     );
     assert!(
-        !std::path::Path::new("unused.bcf").exists(),
+        !out_path.exists(),
         "nothing should be written for a usage error"
     );
 }

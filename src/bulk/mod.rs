@@ -1050,6 +1050,10 @@ mod tests {
                 target_bytes: 1024,
                 corrections: 4,
             },
+            BulkError::ProfileLoad {
+                path: "x".into(),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            },
         ] {
             let msg = e.to_string();
             assert!(

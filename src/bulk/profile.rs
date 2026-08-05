@@ -420,6 +420,10 @@ mod tests {
         p.dialed.ploidy = 3;
         let err = p.validate().unwrap_err();
         assert!(
+            matches!(err, BulkError::PayloadPloidy { ploidy: 3, .. }),
+            "expected PayloadPloidy {{ ploidy: 3, .. }}, got: {err:?}"
+        );
+        assert!(
             format!("{err}").contains("diploid"),
             "expected a diploid-ploidy rejection, got: {err:?}"
         );
