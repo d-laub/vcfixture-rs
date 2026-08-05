@@ -71,7 +71,7 @@ fn parses_records_for_entries() {
 
 #[test]
 fn rejects_malformed_records_for_entries() {
-    use vcfixture::bulk::parse_records_for;
+    use vcfixture::bulk::{parse_records_for, BulkError};
 
     let cases = [
         ("chr1", "no '=' separator"),
@@ -81,13 +81,28 @@ fn rejects_malformed_records_for_entries() {
         ("chr1=-5", "negative count"),
     ];
     for (tok, why) in cases {
+        let err = parse_records_for(&[tok.to_string()]);
         assert!(
-            parse_records_for(&[tok.to_string()]).is_err(),
-            "must reject {tok:?} ({why})"
+            matches!(&err, Err(BulkError::BadRecordsFor(_))),
+            "must reject {tok:?} ({why}) with BulkError::BadRecordsFor, got: {err:?}"
+        );
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            !msg.starts_with("invalid profile:"),
+            "{tok:?} ({why}) must not be described as an invalid profile, got: {msg}"
         );
     }
 
     // A duplicate name would silently drop one of the two counts once the
     // pairs are collected into a BTreeMap, so reject it at parse time.
-    assert!(parse_records_for(&["chr1=1".to_string(), "chr1=2".to_string()]).is_err());
+    let dup = parse_records_for(&["chr1=1".to_string(), "chr1=2".to_string()]);
+    assert!(
+        matches!(&dup, Err(BulkError::BadRecordsFor(_))),
+        "duplicate --records-for name must be BulkError::BadRecordsFor, got: {dup:?}"
+    );
+    let dup_msg = dup.unwrap_err().to_string();
+    assert!(
+        !dup_msg.starts_with("invalid profile:"),
+        "duplicate --records-for name must not be described as an invalid profile, got: {dup_msg}"
+    );
 }

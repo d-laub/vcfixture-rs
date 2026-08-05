@@ -1184,6 +1184,9 @@ mod tests {
                 path: "x".into(),
                 source: std::io::Error::from(std::io::ErrorKind::NotFound),
             },
+            BulkError::BadRecordsFor("expected NAME=COUNT in --records-for, got \"x\"".into()),
+            BulkError::PerContigMissing(vec!["chr2".into()]),
+            BulkError::PerContigUnknown(vec!["1".into()]),
         ] {
             let msg = e.to_string();
             assert!(
