@@ -454,8 +454,9 @@ fn duplicate_contig_names_are_rejected() {
         .size(Size::RecordsPerContig(10))
         .write(&path);
     assert!(
-        matches!(result, Err(BulkError::Invalid(_))),
-        "duplicate output contig names must be rejected as invalid: {result:?}"
+        matches!(&result, Err(BulkError::DuplicateContig(id)) if id == "chr1"),
+        "duplicate output contig names must be rejected with DuplicateContig \
+         naming the offending contig: {result:?}"
     );
     assert!(
         !path.exists(),
@@ -555,3 +556,36 @@ const TRIPLOID_PROFILE: &str = r#"
   "dialed": { "payload": "gt-only", "ploidy": 3 }
 }
 "#;
+
+/// An empty contig list and a zero sample count are caller mistakes, not
+/// profile mistakes -- they must not be reported as an invalid profile.
+#[test]
+fn empty_spec_dimensions_are_rejected_as_spec_errors() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let no_contigs = spec()
+        .contigs(Vec::<String>::new())
+        .size(Size::RecordsPerContig(10))
+        .write(dir.path().join("a.bcf"));
+    assert!(
+        matches!(no_contigs, Err(BulkError::NoContigs)),
+        "an empty contig list must be a spec error: {no_contigs:?}"
+    );
+
+    let no_samples = spec()
+        .samples(0)
+        .size(Size::RecordsPerContig(10))
+        .write(dir.path().join("b.bcf"));
+    assert!(
+        matches!(no_samples, Err(BulkError::NoSamples)),
+        "a zero sample count must be a spec error: {no_samples:?}"
+    );
+
+    for e in [no_contigs, no_samples] {
+        let msg = e.unwrap_err().to_string();
+        assert!(
+            !msg.starts_with("invalid profile:"),
+            "a spec error must not blame the profile, got: {msg}"
+        );
+    }
+}

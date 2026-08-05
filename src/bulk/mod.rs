@@ -339,10 +339,10 @@ impl BulkSpec {
         let path = path.as_ref();
         self.profile.validate()?;
         if self.contig_ids.is_empty() {
-            return Err(BulkError::Invalid("need >= 1 output contig".into()));
+            return Err(BulkError::NoContigs);
         }
         if self.n_samples == 0 {
-            return Err(BulkError::Invalid("need >= 1 sample".into()));
+            return Err(BulkError::NoSamples);
         }
         // A duplicate output contig name would give each occurrence its own
         // independent position stream starting back at 0, so positions run
@@ -355,11 +355,7 @@ impl BulkSpec {
             let mut seen = std::collections::HashSet::with_capacity(self.contig_ids.len());
             for id in &self.contig_ids {
                 if !seen.insert(id.as_str()) {
-                    return Err(BulkError::Invalid(format!(
-                        "duplicate output contig name: {id:?} (each requested contig \
-                         must be unique; duplicates produce backwards positions and a \
-                         CSI that silently drops region-query hits)"
-                    )));
+                    return Err(BulkError::DuplicateContig(id.clone()));
                 }
             }
         }
@@ -373,8 +369,7 @@ impl BulkSpec {
         let samplers = Samplers::new(fitted, an_source)?;
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(self.workers.get())
-            .build()
-            .map_err(|e| BulkError::Invalid(format!("failed to build worker pool: {e}")))?;
+            .build()?;
 
         let counts: Vec<u64> = match self.size {
             Size::RecordsPerContig(n) => vec![n; self.contig_ids.len()],
@@ -622,9 +617,10 @@ impl BulkSpec {
             drop(tmp); // discard the under-target temp before regenerating
         }
 
-        Err(BulkError::Invalid(format!(
-            "could not reach target size {target_bytes} bytes within {MAX_CORRECTIONS} corrective rounds"
-        )))
+        Err(BulkError::TargetNotReached {
+            target_bytes,
+            corrections: MAX_CORRECTIONS,
+        })
     }
 
     /// Like [`BulkSpec::measure_compressed_bytes`], but builds the
@@ -790,7 +786,7 @@ pub fn parse_size(s: &str) -> Result<u64, BulkError> {
     num.trim()
         .parse::<u64>()
         .map(|n| n * mult)
-        .map_err(|_| BulkError::Invalid(format!("bad size: {s}")))
+        .map_err(|_| BulkError::BadSize(s.to_string()))
 }
 
 /// Moves `src` to `dst`: a rename when both are on the same filesystem
