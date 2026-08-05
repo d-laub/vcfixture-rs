@@ -755,6 +755,46 @@ pub fn parse_size(s: &str) -> Result<u64, BulkError> {
         .map_err(|_| BulkError::Invalid(format!("bad size: {s}")))
 }
 
+/// Parse `--records-for` tokens (`NAME=COUNT`) into ordered `(name, count)`
+/// pairs.
+///
+/// Returns a `Vec`, not the `BTreeMap` that [`Size::PerContig`] wants,
+/// because command-line order is load-bearing: when `--contigs` is omitted
+/// these names supply the output contig order, which a map would discard.
+/// The caller collects into a map once it has taken the order it needs.
+///
+/// Lives here rather than in the binary for the same reason [`parse_size`]
+/// does — `tests/cli.rs` cannot import from a `[[bin]]` target.
+pub fn parse_records_for(tokens: &[String]) -> Result<Vec<(String, u64)>, BulkError> {
+    let mut out: Vec<(String, u64)> = Vec::with_capacity(tokens.len());
+    for tok in tokens {
+        let (name, count) = tok.split_once('=').ok_or_else(|| {
+            BulkError::Invalid(format!("expected NAME=COUNT in --records-for, got {tok:?}"))
+        })?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(BulkError::Invalid(format!(
+                "empty contig name in --records-for entry {tok:?}"
+            )));
+        }
+        let count: u64 = count.trim().parse().map_err(|_| {
+            BulkError::Invalid(format!(
+                "expected a non-negative integer record count in --records-for \
+                 entry {tok:?}"
+            ))
+        })?;
+        // Linear scan: a run has tens of contigs, not thousands, and this
+        // preserves the order a `BTreeMap`-based dedupe would lose.
+        if out.iter().any(|(n, _)| n == name) {
+            return Err(BulkError::Invalid(format!(
+                "duplicate contig name {name:?} in --records-for"
+            )));
+        }
+        out.push((name.to_string(), count));
+    }
+    Ok(out)
+}
+
 /// Moves `src` to `dst`: a rename when both are on the same filesystem
 /// (the common case, and atomic), falling back to copy-then-remove when
 /// they aren't (e.g. `TMPDIR` on a different filesystem than the output
