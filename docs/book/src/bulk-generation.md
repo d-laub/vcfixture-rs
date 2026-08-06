@@ -97,9 +97,27 @@ real budget on a ~0x lever on the metrics this tool exists to support.
 ## Determinism
 
 Same seed, profile, and spec always produce byte-identical output, regardless
-of worker/thread count. Each block of records seeds its own PRNG from a pure
-function of `(seed, block index)`, so results assemble the same way no matter
-which thread computed which block or in what order.
+of worker/thread count. Each block of records seeds its own PRNGs from a pure
+function of `(seed, block index, stream)`, so results assemble the same way
+no matter which thread computed which block or in what order.
+
+Positions and record content are drawn from two separate streams. Within a
+block, the position stream depends only on `(seed, block index, record
+count)` — never on cohort width, ploidy, or payload. That separation is what
+lets contig lengths be computed by a pass that draws gaps alone, without
+generating a single genotype.
+
+Block boundaries, though, are sized by genotype *cells* rather than records,
+so they do depend on `n_samples` and ploidy. A cohort wide enough to change
+the block size — above roughly 4,000 diploid samples — re-partitions records
+into different blocks and so lays out different positions for the same seed.
+Positions are independent of payload unconditionally; they are independent
+of cohort width only among widths that share a block size.
+
+This guarantee is scoped to a major version. Block boundaries and stream
+layout are implementation details, and changing them changes the bytes a
+given seed produces: v0.5.0 does not reproduce v0.4.0's output. Within a
+version, reproduction is exact.
 
 ## Sizing
 
