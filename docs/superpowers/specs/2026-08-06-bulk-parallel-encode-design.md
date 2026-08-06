@@ -108,11 +108,12 @@ pub enum Stream { Position, Content }
 pub fn block_rng(seed: u64, block_idx: u64, stream: Stream) -> ChaCha8Rng;
 ```
 
-The domain is folded into the splitmix64 finalizer alongside `block_idx` with
-its own constant, so `(seed, block_idx, Position)` and
-`(seed, block_idx, Content)` cannot alias for any `seed`/`block_idx` — an
-explicit domain rather than a `seed ^ SALT` trick, which would only make
-aliasing improbable rather than impossible.
+The domain goes through its own splitmix64 finalizer round after the
+`(seed, block_idx)` mix, rather than callers salting `seed` themselves. This
+is a named, self-documenting domain separation with the same 2^-64 collision
+assumption the existing per-block separation already makes — not a stronger
+guarantee, but an explicit one in one place instead of a `seed ^ SALT` trick
+repeated at call sites.
 
 A block then draws gaps from `Stream::Position` and everything else (class,
 site, AC, missingness, placement, phasing) from `Stream::Content`. A block's
