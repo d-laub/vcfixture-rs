@@ -34,6 +34,86 @@ enum Sink {
     Vcf(vcf::io::Writer<std::fs::File>),
 }
 
+/// Encodes a block's records into an in-memory buffer, off the writer
+/// thread.
+///
+/// One encoder is built per rayon worker (not per block) and its buffer is
+/// reused: `noodles_bcf::io::Writer` derives its `StringMaps` inside
+/// `write_header` and keeps it privately, so a header-less writer fails at
+/// runtime with "chromosome not in string map". The header is therefore
+/// written once to populate that map, `header_len` is remembered, and each
+/// block rewinds to it with `truncate`. At 32,000 samples the header text
+/// is ~200 KB of sample names, which is exactly why this is per worker
+/// rather than per block.
+// The block pipeline task (a later task in #22) wires this into the
+// generation pipeline; until then it is only exercised by this module's
+// tests.
+#[allow(dead_code)]
+pub(crate) enum BlockEncoder {
+    Bcf {
+        w: bcf::io::Writer<Vec<u8>>,
+        header_len: usize,
+    },
+    Text {
+        w: vcf::io::Writer<Vec<u8>>,
+        header_len: usize,
+    },
+}
+
+#[allow(dead_code)]
+impl BlockEncoder {
+    /// Builds an encoder whose output matches what [`BulkWriter`] with the
+    /// same `format` and `header` would emit. `VcfGz` and `Vcf` share the
+    /// same text encoding; they differ only in whether [`BulkWriter`]'s
+    /// sink compresses.
+    pub(crate) fn new(format: Format, header: &vcf::Header) -> Result<BlockEncoder, BulkError> {
+        match format {
+            Format::Bcf => {
+                let mut w = bcf::io::Writer::from(Vec::new());
+                w.write_header(header)?;
+                let header_len = w.get_ref().len();
+                Ok(BlockEncoder::Bcf { w, header_len })
+            }
+            Format::VcfGz | Format::Vcf => {
+                let mut w = vcf::io::Writer::new(Vec::new());
+                w.write_header(header)?;
+                let header_len = w.get_ref().len();
+                Ok(BlockEncoder::Text { w, header_len })
+            }
+        }
+    }
+
+    /// Starts a new block, discarding the previous one's bytes while
+    /// keeping the string map the header write populated.
+    pub(crate) fn begin(&mut self) {
+        match self {
+            BlockEncoder::Bcf { w, header_len } => w.get_mut().truncate(*header_len),
+            BlockEncoder::Text { w, header_len } => w.get_mut().truncate(*header_len),
+        }
+    }
+
+    /// Appends one record to the current block.
+    pub(crate) fn push(
+        &mut self,
+        header: &vcf::Header,
+        record: &RecordBuf,
+    ) -> Result<(), BulkError> {
+        match self {
+            BlockEncoder::Bcf { w, .. } => w.write_variant_record(header, record)?,
+            BlockEncoder::Text { w, .. } => w.write_variant_record(header, record)?,
+        }
+        Ok(())
+    }
+
+    /// The current block's encoded records, without the header prefix.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        match self {
+            BlockEncoder::Bcf { w, header_len } => &w.get_ref()[*header_len..],
+            BlockEncoder::Text { w, header_len } => &w.get_ref()[*header_len..],
+        }
+    }
+}
+
 /// A streaming BCF/VCF(.gz) writer.
 ///
 /// Indexing is a second pass ([`BulkWriter::finish_and_index`]): the
@@ -117,6 +197,22 @@ impl BulkWriter {
         Ok(())
     }
 
+    /// Writes an already-encoded block of records straight to the sink.
+    ///
+    /// The counterpart to [`BlockEncoder`]: record encoding happens in a
+    /// rayon worker, and the writer thread only concatenates the resulting
+    /// bytes in block order. Like [`BulkWriter::write`], this does not
+    /// force a flush — the bgzf writer batches into ~64 KiB blocks itself.
+    pub fn write_encoded(&mut self, bytes: &[u8]) -> Result<(), BulkError> {
+        use std::io::Write as _;
+        match &mut self.sink {
+            Sink::Bcf(x) => x.get_mut().write_all(bytes)?,
+            Sink::VcfGz(x) => x.get_mut().write_all(bytes)?,
+            Sink::Vcf(x) => x.get_mut().write_all(bytes)?,
+        }
+        Ok(())
+    }
+
     /// Finishes the stream, then writes `<path>.csi` via a second read pass.
     ///
     /// Indexing only applies to `Bcf`; `VcfGz`/`Vcf` are not indexed here.
@@ -152,6 +248,16 @@ mod tests {
             .add_contig(
                 "chr1",
                 vcf::header::record::value::Map::<vcf::header::record::value::map::Contig>::new(),
+            )
+            // Reserved GT FORMAT: `sample_records` (below) sets a "GT" value
+            // on each record, and the BCF string map (built from the header
+            // by `write_header`) must know about "GT" up front or encoding
+            // fails at runtime with "genotype key not in string map".
+            .add_format(
+                vcf::variant::record::samples::keys::key::GENOTYPE,
+                vcf::header::record::value::Map::<vcf::header::record::value::map::Format>::from(
+                    vcf::variant::record::samples::keys::key::GENOTYPE,
+                ),
             )
             .add_sample_name("s1")
             .build()
@@ -368,5 +474,90 @@ mod tests {
             "output must be byte-identical regardless of thread count (1 vs 16 workers)"
         );
         assert!(!a.is_empty());
+    }
+
+    fn sample_records(n: usize) -> Vec<RecordBuf> {
+        (1..=n)
+            .map(|pos| {
+                let keys: vcf::variant::record_buf::samples::Keys =
+                    ["GT"].iter().map(|k| k.to_string()).collect();
+                let values = vec![
+                    vec![Some(
+                        vcf::variant::record_buf::samples::sample::Value::from("0|1".to_string(),)
+                    )];
+                    1
+                ];
+                RecordBuf::builder()
+                    .set_reference_sequence_name("chr1")
+                    .set_variant_start(noodles_core::Position::try_from(pos * 10).unwrap())
+                    .set_reference_bases("A")
+                    .set_alternate_bases(vcf::variant::record_buf::AlternateBases::from(vec![
+                        String::from("T"),
+                    ]))
+                    .set_samples(vcf::variant::record_buf::Samples::new(keys, values))
+                    .build()
+            })
+            .collect()
+    }
+
+    /// The load-bearing assumption of the block pipeline: bytes produced by
+    /// a reused `BlockEncoder` are exactly what the real writer would have
+    /// emitted for the same records in the same order.
+    #[test]
+    fn block_encoded_bytes_match_a_direct_write() {
+        for format in [Format::Bcf, Format::VcfGz, Format::Vcf] {
+            let h = header();
+            let records = sample_records(10);
+
+            // Direct: every record straight through BulkWriter.
+            let dir = tempfile::tempdir().unwrap();
+            let direct_path = dir.path().join("direct.out");
+            let mut w =
+                BulkWriter::create(&direct_path, format, &h, 6, NonZero::new(1).unwrap()).unwrap();
+            for r in &records {
+                w.write(&h, r).unwrap();
+            }
+            w.finish_and_index(&direct_path).unwrap();
+
+            // Blocked: encode in blocks of 3 through one reused encoder,
+            // hand the bytes to BulkWriter.
+            let blocked_path = dir.path().join("blocked.out");
+            let mut w =
+                BulkWriter::create(&blocked_path, format, &h, 6, NonZero::new(1).unwrap()).unwrap();
+            let mut enc = BlockEncoder::new(format, &h).unwrap();
+            for chunk in records.chunks(3) {
+                enc.begin();
+                for r in chunk {
+                    enc.push(&h, r).unwrap();
+                }
+                w.write_encoded(enc.bytes()).unwrap();
+            }
+            w.finish_and_index(&blocked_path).unwrap();
+
+            assert_eq!(
+                std::fs::read(&direct_path).unwrap(),
+                std::fs::read(&blocked_path).unwrap(),
+                "block-encoded output must be byte-identical for {format:?}"
+            );
+        }
+    }
+
+    /// `begin()` must discard the previous block, not append to it.
+    #[test]
+    fn begin_rewinds_the_block_buffer() {
+        let h = header();
+        let records = sample_records(4);
+        let mut enc = BlockEncoder::new(Format::Bcf, &h).unwrap();
+
+        enc.begin();
+        enc.push(&h, &records[0]).unwrap();
+        let first = enc.bytes().to_vec();
+
+        enc.begin();
+        enc.push(&h, &records[0]).unwrap();
+        assert_eq!(enc.bytes(), first.as_slice(), "begin must reset the buffer");
+
+        enc.begin();
+        assert!(enc.bytes().is_empty(), "begin must leave an empty block");
     }
 }
