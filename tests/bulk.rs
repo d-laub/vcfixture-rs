@@ -38,7 +38,7 @@ fn records_per_contig_is_exact() {
 fn same_seed_gives_byte_identical_output_across_thread_counts() {
     // `BulkSpec::block_records(SAMPLES, 2)` (`src/bulk/mod.rs`) is currently
     // 500 records at this cohort width (8 samples, ploidy 2) — the
-    // granularity at which `generate_contig`'s rayon `into_par_iter` has
+    // granularity at which `BulkSpec::stream_contigs`' rayon `par_iter` has
     // anything to reorder. At `RecordsPerContig(50)` (the value this test
     // used before this fix), `50.div_ceil(500) == 1` block per contig: there
     // is nothing for rayon to reorder, so both parallel paths (this crate's
@@ -71,7 +71,7 @@ fn same_seed_gives_byte_identical_output_across_thread_counts() {
         blocks_per_contig > 1,
         "test is vacuous: {RECORDS_PER_CONTIG} records/contig gives only \
          {blocks_per_contig} rayon block(s) per contig, so there is nothing \
-         for `into_par_iter` to reorder"
+         for `par_iter` to reorder"
     );
 
     fn heavy(workers: usize) -> BulkSpec {
@@ -489,9 +489,9 @@ fn target_size_split_also_follows_variants() {
 
 /// The core `Size::PerContig` contract: each requested contig gets exactly
 /// the count it was given, with no profile-derived reweighting. A count of
-/// 0 is legal and means "generate nothing here" -- such a contig never
-/// reaches `Summary::observe`, so it has no `per_contig` entry at all and
-/// must be read through `get`, not indexed.
+/// 0 is legal and means "generate nothing here" -- such a contig produces
+/// no non-empty `BlockSummary` to merge, so it has no `per_contig` entry at
+/// all and must be read through `get`, not indexed.
 #[test]
 fn per_contig_gives_exact_requested_counts() {
     let profile = Profile::from_json(SKEWED_VARIANTS_PROFILE).unwrap();
@@ -857,14 +857,19 @@ fn layout_span_equals_the_realized_max_position() {
     // block_len`'s `.min(n_records - start)` only has anything to clamp on
     // the partial-tail case.
     //
-    // This is still only a max-position check on the currently-active
-    // `generate_contig`/`contig_span` write path, which computes the header
-    // length from the very same records it writes -- so it cannot catch
-    // drift between the write path and a *different* pass that computes
-    // spans some other way. That stronger cross-check (declared length from
-    // `ContigLayout::span()`, computed by the gap-only pass, against the
-    // realized max position from the write pass that regenerates the same
-    // stream) arrives once the block pipeline replaces this write path.
+    // NOTE ON STRENGTH: this test is deliberately *weak*, and must not be
+    // mistaken for evidence that the block pipeline is correct. The write
+    // pass takes `offsets[b]` and `block_len(b)` from the same
+    // `ContigLayout` whose `block_spans` `span()` sums, so an error in an
+    // interior block's span cancels exactly on both sides and this
+    // assertion still passes. What it does pin is the *plumbing*: that the
+    // header is built from the layout the records were actually written
+    // under, and that the final block's span is not dropped or
+    // double-counted. The genuinely independent cross-check -- the full
+    // position vector against a gap walk recomputed from `block_rng` +
+    // `Samplers::gap`, never consulting `ContigLayout` -- is
+    // `realized_positions_match_an_independently_recomputed_gap_walk`
+    // below.
     for (seed, samples, records) in [(1u64, 2usize, 1500u64), (7, 37, 1300), (99, 300, 2000)] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.bcf");
@@ -951,4 +956,246 @@ fn positions_do_not_depend_on_payload_and_are_stable_across_widths_sharing_a_blo
         "cohort width moved positions, despite both widths sharing a block size"
     );
     assert_eq!(a, positions(2, Payload::Gatk), "payload moved positions");
+}
+
+#[test]
+fn output_is_byte_identical_across_thread_counts_and_chunkings() {
+    // The oracle for the block pipeline: whatever the worker count (which
+    // sets both the rayon pool size and the in-flight chunk width), the
+    // bytes and the Summary must be identical. Worker count 1 is the
+    // serial reference — one block encoded and written at a time.
+    fn run(workers: usize) -> (Vec<u8>, vcfixture::bulk::Summary) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.bcf");
+        let summary = BulkSpec::new(Profile::builtin("germline-1kgp").unwrap())
+            .samples(40)
+            .contigs(["chr1", "chr2"])
+            .size(Size::RecordsPerContig(1_500))
+            .payload(Payload::Gatk)
+            .seed(21)
+            .workers(NonZero::new(workers).unwrap())
+            .write(&path)
+            .unwrap();
+        (std::fs::read(&path).unwrap(), summary)
+    }
+
+    let (bytes1, sum1) = run(1);
+    for workers in [2usize, 5, 16] {
+        let (bytes, sum) = run(workers);
+        assert_eq!(
+            bytes1, bytes,
+            "output must be byte-identical at {workers} workers"
+        );
+        assert_eq!(
+            sum1.genotype_checksum, sum.genotype_checksum,
+            "checksum must be identical at {workers} workers"
+        );
+        assert_eq!(sum1.per_contig, sum.per_contig);
+        assert_eq!(sum1.class_counts, sum.class_counts);
+        assert_eq!(sum1.n_alleles_nonref, sum.n_alleles_nonref);
+    }
+
+    // Guard against vacuity: the payload must span several bgzf blocks, or
+    // neither the rayon block fan-out nor the writer's own compression
+    // pool would have anything to reorder.
+    //
+    // The threshold is bgzf's *uncompressed* staging buffer (`MAX_BUF_SIZE`,
+    // ~65,498 bytes): a block is dispatched once that many uncompressed
+    // bytes have accumulated. So the quantity to compare against it is the
+    // decompressed payload, not the compressed file length -- at level 6 on
+    // this repetitive data the file is ~57 KB while the payload behind it
+    // is megabytes, and comparing the compressed length would have made
+    // this guard fail on a perfectly non-vacuous test. Same idiom as
+    // `same_seed_gives_byte_identical_output_across_thread_counts` above
+    // and `writer::tests::output_is_byte_identical_regardless_of_worker_count`.
+    const MAX_BUF_SIZE: usize = 65_498;
+    let mut decompressed = Vec::new();
+    std::io::Read::read_to_end(
+        &mut noodles_bgzf::io::Reader::new(std::io::Cursor::new(&bytes1)),
+        &mut decompressed,
+    )
+    .unwrap();
+    assert!(
+        decompressed.len() > 3 * MAX_BUF_SIZE,
+        "test payload ({} bytes uncompressed, {} compressed) must exceed \
+         several bgzf blocks ({MAX_BUF_SIZE} bytes each)",
+        decompressed.len(),
+        bytes1.len()
+    );
+}
+
+#[test]
+fn declared_contig_lengths_are_never_zero() {
+    // `##contig length` is a 1-based coordinate bound, so `length=0`
+    // declares a contig that cannot hold even position 1 -- a malformed
+    // header, and one that region-query tooling reads as an empty
+    // reference sequence.
+    //
+    // This is reachable, not hypothetical: `ContigLayout::span()` sums an
+    // empty block list to `0` for a zero-record contig, and
+    // `Size::Records(total)` with `total` below the contig count really
+    // does produce zero-record contigs (`distribute_by_n_variants` floors
+    // the proportional split, then largest-remainder hands the single
+    // record to exactly one contig). The pre-#22 `contig_span` hid this
+    // behind an `unwrap_or(1)`; the floor now lives in
+    // `BulkSpec::build_header`.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.bcf");
+    let summary = BulkSpec::new(Profile::builtin("germline-1kgp").unwrap())
+        .samples(2)
+        .contigs(["chr1", "chr2", "chr3"])
+        .size(Size::Records(1))
+        .payload(Payload::GtOnly)
+        .seed(4)
+        .workers(NonZero::new(2).unwrap())
+        .write(&path)
+        .unwrap();
+
+    assert_eq!(summary.n_records_total(), 1);
+    // Vacuity guard: if every contig somehow got a record, there is no
+    // zero-span contig here and the floor is never exercised.
+    assert!(
+        summary.per_contig.len() < 3,
+        "test is vacuous: no contig ended up with zero records ({:?})",
+        summary.per_contig
+    );
+
+    let mut r = noodles_bcf::io::reader::Builder::default()
+        .build_from_path(&path)
+        .unwrap();
+    let header = r.read_header().unwrap();
+    assert_eq!(
+        header.contigs().len(),
+        3,
+        "every requested contig must still be declared, even at zero records"
+    );
+    for (id, contig) in header.contigs() {
+        let declared = contig.length().expect("contig length is declared");
+        assert!(
+            declared >= 1,
+            "contig {id} declared length {declared}, but a ##contig length \
+             must be >= 1 even for a contig with no records"
+        );
+    }
+}
+
+#[test]
+fn realized_positions_match_an_independently_recomputed_gap_walk() {
+    // The independent cross-check on the block pipeline.
+    //
+    // `layout_span_equals_the_realized_max_position` cannot catch an
+    // interior block-offset error: the write pass reads `offsets[b]` from
+    // the very `ContigLayout` whose `block_spans` `span()` sums, so both
+    // sides of that assertion move together. This test never touches
+    // `ContigLayout` at all. It rebuilds the expected position of *every*
+    // record from the public primitives the design is specified in --
+    // `block_rng(seed, block_idx, Stream::Position)` plus `Samplers::gap`,
+    // with its own prefix sum over blocks -- and compares the full vector,
+    // in order, against what was actually written to the file.
+    //
+    // Why that is not an identity: the expectation is derived from the
+    // *specification* of the partition (block-index arithmetic over
+    // `BulkSpec::block_records` and `BulkSpec::CONTIG_BLOCK_STRIDE`), not
+    // from the artifact `compute_layouts` produced. A block seeded from the
+    // wrong `block_idx`, a block handed the wrong record count, a wrong
+    // per-block offset, a mis-sliced `block_spans` copy-back across
+    // contigs, or a chunk written out of order all change interior
+    // positions and fail here -- including the cases that leave the
+    // contig's maximum position untouched (e.g. two interior blocks'
+    // spans transposed in the prefix sum).
+    use vcfixture::bulk::generate::{block_rng, Stream};
+    use vcfixture::bulk::sample::Samplers;
+
+    // (seed, samples, records_per_contig, contigs)
+    let cases: [(u64, usize, u64, &[&str]); 2] = [
+        // Narrow cohort: block_records saturates at MAX_BLOCK_RECORDS
+        // (500), so 1300 records is 500/500/300 -- a partial final block --
+        // across two contigs, which also exercises CONTIG_BLOCK_STRIDE.
+        (3, 5, 1_300, &["chr1", "chr2"]),
+        // Wide cohort: block_records is cell-bounded (4e6 / (8000*2) =
+        // 250), so 650 records is 250/250/150 under a partition a flat-500
+        // write pass would get wrong.
+        (8, 8_000, 650, &["chr1"]),
+    ];
+
+    for (seed, samples, records, contigs) in cases {
+        let profile = Profile::builtin("germline-1kgp").unwrap();
+        let ploidy = profile.dialed.ploidy;
+        let block_records = BulkSpec::block_records(samples, ploidy);
+        let n_blocks = records.div_ceil(block_records);
+        assert!(
+            n_blocks >= 3,
+            "test is vacuous at samples={samples}, records={records}: \
+             {n_blocks} block(s) leaves no interior block whose offset \
+             could be wrong"
+        );
+
+        // The expectation: gaps only, straight from the block streams.
+        let samplers = Samplers::new(
+            &profile.fitted,
+            2 * profile.provenance.n_samples_source as u64,
+        )
+        .unwrap();
+        let mut expected: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        for (ci, id) in contigs.iter().enumerate() {
+            let mut positions = Vec::with_capacity(records as usize);
+            let mut offset = 0u64;
+            for b in 0..n_blocks {
+                let block_idx = ci as u64 * BulkSpec::CONTIG_BLOCK_STRIDE + b;
+                let mut rng = block_rng(seed, block_idx, Stream::Position);
+                let count = block_records.min(records - b * block_records);
+                let mut local = 0u64;
+                for _ in 0..count {
+                    local += samplers.gap(&mut rng);
+                    positions.push(offset + local);
+                }
+                offset += local;
+            }
+            expected.insert((*id).to_string(), positions);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.bcf");
+        BulkSpec::new(Profile::builtin("germline-1kgp").unwrap())
+            .samples(samples)
+            .contigs(contigs.iter().copied())
+            .size(Size::RecordsPerContig(records))
+            .payload(Payload::GtOnly)
+            .seed(seed)
+            .workers(NonZero::new(4).unwrap())
+            .write(&path)
+            .unwrap();
+
+        let mut r = noodles_bcf::io::reader::Builder::default()
+            .build_from_path(&path)
+            .unwrap();
+        let header = r.read_header().unwrap();
+        let names: Vec<String> = header.contigs().keys().cloned().collect();
+
+        let mut realized: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        for rec in r.records() {
+            let rec = rec.unwrap();
+            let chrom = names[rec.reference_sequence_id().unwrap()].clone();
+            let pos = usize::from(rec.variant_start().unwrap().unwrap()) as u64;
+            realized.entry(chrom).or_default().push(pos);
+        }
+
+        assert_eq!(
+            realized, expected,
+            "realized positions must match the independently recomputed gap \
+             walk (seed={seed}, samples={samples}, records={records})"
+        );
+
+        // The header's declared length must agree with that same
+        // independent walk, not merely with whatever the write pass did.
+        for (id, contig) in header.contigs() {
+            let declared = contig.length().expect("contig length is declared") as u64;
+            assert_eq!(
+                declared,
+                *expected[id.as_str()].last().unwrap(),
+                "declared length for {id} must equal the independently \
+                 recomputed final position (seed={seed}, samples={samples})"
+            );
+        }
+    }
 }

@@ -35,10 +35,11 @@ use noodles_vcf::{
     },
 };
 
-use generate::{block_rng, gen_record, to_record_buf, GenRecord, Stream};
+use generate::{block_rng, gen_record, to_record_buf, Stream};
 use profile::{ContigStat, Fitted};
 use sample::Samplers;
-use writer::BulkWriter;
+use summary::BlockSummary;
+use writer::{BlockEncoder, BulkWriter};
 
 pub use profile::{Payload, Profile};
 pub use summary::Summary;
@@ -244,25 +245,6 @@ pub enum Size {
     Target(u64),
 }
 
-/// One generated record plus this call's phasing draw.
-///
-/// [`GenRecord`] is Task 6's type ([`crate::bulk::generate`]) and out of scope to
-/// modify here, and it has no `phased` field (phasing is a per-record
-/// decision only [`to_record_buf`] needs, not part of the site/genotype
-/// generation `gen_record` performs) — so it is tracked alongside, not
-/// inside, the generated record.
-struct Rec {
-    g: GenRecord,
-    phased: bool,
-}
-
-/// Records generated for one block (`BulkSpec::MAX_BLOCK_RECORDS` records,
-/// or fewer for a contig's final partial block), with positions still
-/// relative to the block's own start (see [`BulkSpec::generate_contig`]).
-// TODO(#22 task 6): deleted along with `generate_contig` and `contig_span`
-// once the block pipeline replaces the regenerate-twice structure.
-type BlockOutput = (Vec<Rec>, u64);
-
 /// How one contig decomposes into blocks, and how long each block's slice
 /// of the contig is.
 ///
@@ -271,10 +253,12 @@ type BlockOutput = (Vec<Rec>, u64);
 /// genotype (issue #22). The contig's populated span is their sum, and
 /// block `i`'s absolute position offset is their exclusive prefix sum, so
 /// one `Vec<u64>` carries everything the write pass needs.
-// `#[allow(dead_code)]`: nothing calls `ContigLayout` or `compute_layouts`
-// yet -- the block-pipeline task (#22 task 6) wires them into `write` and
-// removes this allow.
-#[allow(dead_code)]
+///
+/// This is the *single* description of a contig's block partition: the
+/// write pass ([`BulkSpec::stream_contigs`]) reads its per-block record
+/// counts and position offsets from here rather than recomputing them, so
+/// the layout the header was built from and the layout the records were
+/// written under cannot drift apart.
 pub(crate) struct ContigLayout {
     /// Records per block for this run (constant except for the final
     /// partial block).
@@ -283,7 +267,6 @@ pub(crate) struct ContigLayout {
     block_spans: Vec<u64>,
 }
 
-#[allow(dead_code)]
 impl ContigLayout {
     fn n_blocks(&self) -> usize {
         self.block_spans.len()
@@ -302,6 +285,11 @@ impl ContigLayout {
     }
 
     /// The contig's populated span (its last record's position).
+    ///
+    /// `0` for a contig with no records: there is no last record, so `0` is
+    /// the honest answer, and the caller is the one that knows a *declared*
+    /// `##contig length` may not be `0` — [`BulkSpec::build_header`] applies
+    /// that floor (see its doc comment).
     fn span(&self) -> u64 {
         self.block_spans.iter().sum()
     }
@@ -397,15 +385,21 @@ impl BulkSpec {
 
     /// `block_idx` is derived as `contig_idx * CONTIG_BLOCK_STRIDE +
     /// local_block`, so a contig's stream never depends on how many
-    /// contigs precede it. At `MAX_BLOCK_RECORDS` records per block this
-    /// allows up to `CONTIG_BLOCK_STRIDE * MAX_BLOCK_RECORDS` (500 billion)
-    /// records per contig before colliding with the next contig's
-    /// block-index space — far beyond any realistic run (a 100 MB benchmark
-    /// BCF is ~265k records total). [`BulkSpec::compute_layouts`] checks
-    /// this bound explicitly rather than leaving it merely documented,
-    /// since a wide cohort's smaller [`BulkSpec::block_records`] brings a
-    /// pathologically large single-contig request within reach.
-    const CONTIG_BLOCK_STRIDE: u64 = 1_000_000;
+    /// contigs precede it. The per-contig record budget this buys is
+    /// `CONTIG_BLOCK_STRIDE * block_records(n_samples, ploidy)`, which is
+    /// *not* a constant: it is 500 billion only at the narrow-cohort
+    /// ceiling of [`BulkSpec::MAX_BLOCK_RECORDS`], and falls with cohort
+    /// width — at 32,000 diploid samples [`BulkSpec::block_records`] is 62,
+    /// so the budget is ~62 billion records per contig. Either way it is
+    /// far beyond any realistic run (a 100 MB benchmark BCF is ~265k
+    /// records total). Because the budget *does* move with cohort width,
+    /// [`BulkSpec::compute_layouts`] checks the bound explicitly rather
+    /// than leaving it merely documented.
+    // `pub` + `#[doc(hidden)]` for the same reason as `MAX_BLOCK_RECORDS`:
+    // `tests/bulk.rs` reconstructs block indices from the real constant
+    // instead of mirroring its value as a literal.
+    #[doc(hidden)]
+    pub const CONTIG_BLOCK_STRIDE: u64 = 1_000_000;
 
     /// Builds a spec from a profile, with defaults matching a small smoke
     /// test rather than a benchmark-scale run: 1 sample, `chr1..chr3`, 1000
@@ -484,8 +478,9 @@ impl BulkSpec {
         self
     }
 
-    /// Sets the bgzf compression worker count. Never affects output bytes
-    /// (see [`BulkSpec::generate_contig`] and `writer::tests::
+    /// Sets the worker count: both the rayon block-generation pool and the
+    /// bgzf compression pool. Never affects output bytes (see
+    /// [`BulkSpec::stream_contigs`] and `writer::tests::
     /// output_is_byte_identical_regardless_of_worker_count`), only speed.
     pub fn workers(mut self, n: NonZero<usize>) -> BulkSpec {
         self.workers = n;
@@ -501,27 +496,25 @@ impl BulkSpec {
     /// Generates and writes the file, then a CSI index and a
     /// `<path>.summary.json` alongside it.
     ///
-    /// Records are generated and buffered **one contig at a time** (never
-    /// the whole file at once), via two passes over `self.contig_ids`:
+    /// Records are **never** materialized a whole file — or even a whole
+    /// contig — at a time. Generation is two passes over `self.contig_ids`:
     ///
-    /// 1. **Span pass**: generate each contig just to learn its populated
-    ///    span (`pos_max`, via [`contig_span`]), then drop its records
-    ///    immediately — only the span (a `u64`) is retained per contig.
+    /// 1. **Layout pass** ([`BulkSpec::compute_layouts`]): draw gaps, and
+    ///    only gaps, to learn each contig's block partition, per-block span,
+    ///    and populated span. No genotype is generated, so this costs
+    ///    `O(total_records)` rather than `O(total_records * n_samples)`.
     /// 2. Build and write the header from those spans (it must declare
     ///    every contig's length before any record is written).
-    /// 3. **Write pass**: regenerate each contig — byte-identical to the
-    ///    span pass, since [`BulkSpec::generate_contig`] is a pure function
-    ///    of `(seed, contig_idx, n_records)`, never of what a previous call
-    ///    computed — and write it immediately, dropping its records before
-    ///    moving to the next contig.
+    /// 3. **Write pass** ([`BulkSpec::stream_contigs`]): generate, encode,
+    ///    and summarize each block inside the rayon fan-out, and write the
+    ///    resulting bytes to the sink in block order. Blocks are consumed
+    ///    `2 * workers` at a time, so peak memory is bounded by the blocks
+    ///    in flight rather than by the largest contig.
     ///
-    /// Peak memory is therefore bounded by the largest single contig's
-    /// records, not the sum across every contig. Regenerating trades extra
-    /// CPU (each contig's records are computed twice) for that memory
-    /// bound; per-contig generation is itself parallelized (see
-    /// [`BulkSpec::generate_contig`]), so this is cheap relative to the
-    /// memory it avoids. See the [`BulkSpec`] doc comment for the
-    /// contig-length and contig-name-resolution rules this enforces.
+    /// Records are therefore generated exactly once (before issue #22 the
+    /// span pass generated every genotype in the file only to throw it
+    /// away). See the [`BulkSpec`] doc comment for the contig-length and
+    /// contig-name-resolution rules this enforces.
     pub fn write(self, path: impl AsRef<Path>) -> Result<Summary, BulkError> {
         let path = path.as_ref();
         self.profile.validate()?;
@@ -577,16 +570,8 @@ impl BulkSpec {
             }
         };
 
-        let spans: Vec<u64> = self
-            .contig_ids
-            .iter()
-            .zip(&counts)
-            .enumerate()
-            .map(|(i, (id, &n))| {
-                let recs = self.generate_contig(&pool, &samplers, fitted, id, i as u64, n);
-                contig_span(&recs)
-            })
-            .collect();
+        let layouts = self.compute_layouts(&pool, &samplers, fitted, &counts)?;
+        let spans: Vec<u64> = layouts.iter().map(|l| l.span()).collect();
 
         let header = self.build_header(&spans);
         let mut writer = BulkWriter::create(
@@ -596,25 +581,8 @@ impl BulkSpec {
             self.compression_level,
             self.workers,
         )?;
-        let mut summary = Summary::new(self.n_samples);
-        for (i, (id, &n)) in self.contig_ids.iter().zip(&counts).enumerate() {
-            let recs = self.generate_contig(&pool, &samplers, fitted, id, i as u64, n);
-            for r in &recs {
-                let buf = to_record_buf(&r.g, &self.payload, r.phased);
-                writer.write(&header, &buf)?;
-                summary.observe(id, r.g.pos, r.g.class, &r.g.gts);
-            }
-            // No mid-stream flush here: `MultithreadedWriter` dispatches a
-            // compressed bgzf block once its ~64 KiB staging buffer fills
-            // regardless, and forcing one at every contig boundary would
-            // fragment the output and hurt compression. It would also make
-            // this write's bgzf block layout differ from
-            // `measure_compressed_bytes`'s (which likewise never flushes
-            // per contig) — exactly the bug `Size::Target` used to have:
-            // measuring a byte count the real write would not reproduce.
-            // Neither path flushing mid-stream keeps the two structurally
-            // identical, so the measurement stays exact, not just close.
-        }
+        let summary =
+            self.stream_contigs(&pool, &samplers, fitted, &layouts, &header, &mut writer)?;
         writer.finish_and_index(path)?;
 
         let json = summary.to_json()?;
@@ -628,9 +596,25 @@ impl BulkSpec {
     /// Builds the header: sample names, one `##FORMAT` line per key the
     /// spec's [`Payload`] preset uses, and one `##contig` per requested
     /// contig with `length` set to that contig's populated span (`spans`,
-    /// parallel to `self.contig_ids`; see [`contig_span`] and
+    /// parallel to `self.contig_ids`; see [`ContigLayout::span`] and
     /// [`BulkSpec::write`]'s two-pass structure for how spans are computed
-    /// without holding every contig's records in memory at once).
+    /// without ever holding a contig's records in memory).
+    ///
+    /// # The declared length is floored at 1
+    ///
+    /// A contig with zero records has a populated span of `0`
+    /// ([`ContigLayout::span`] sums an empty block list), and this is
+    /// genuinely reachable: `Size::Records(total)` with `total` below the
+    /// contig count floors some contigs to zero in
+    /// [`distribute_by_n_variants`]. `##contig length=0` is a malformed
+    /// declaration — the length is a 1-based coordinate bound, so `0`
+    /// declares a contig that cannot contain even position 1 — which is
+    /// exactly the class of output this crate exists to not produce. The
+    /// floor lives here, at the one place a length is *declared*, rather
+    /// than inside `span()`, which would have to lie about a contig that
+    /// really does span nothing, and rather than at each caller's `spans`
+    /// collect site, where it would be duplicated per caller and could
+    /// silently be forgotten by the next one.
     fn build_header(&self, spans: &[u64]) -> vcf::Header {
         let mut hb = vcf::Header::builder();
         for i in 0..self.n_samples {
@@ -641,7 +625,7 @@ impl BulkSpec {
         }
         for (id, &span) in self.contig_ids.iter().zip(spans) {
             let mut contig = Map::<ContigMap>::new();
-            *contig.length_mut() = Some(span as usize);
+            *contig.length_mut() = Some(span.max(1) as usize);
             hb = hb.add_contig(id.clone(), contig);
         }
         hb.build()
@@ -657,9 +641,6 @@ impl BulkSpec {
     /// was drawn twice. Because positions now come from
     /// [`Stream::Position`] (see [`block_rng`]), the same numbers fall out
     /// of `O(total_records)` gap draws with no per-sample work at all.
-    // `#[allow(dead_code)]`: not called yet -- the block-pipeline task (#22
-    // task 6) wires this into `write` and removes this allow.
-    #[allow(dead_code)]
     fn compute_layouts(
         &self,
         pool: &rayon::ThreadPool,
@@ -667,11 +648,11 @@ impl BulkSpec {
         _fitted: &Fitted,
         counts: &[u64],
     ) -> Result<Vec<ContigLayout>, BulkError> {
-        // Ploidy lives on `self.profile.dialed`, not `Fitted` -- the brief's
-        // sketch of this signature named `fitted.ploidy`, which does not
-        // exist on `Fitted` (see `src/bulk/profile.rs`); `fitted` is kept as
-        // a parameter to match the brief's interface and `generate_contig`'s
-        // sibling signature, but ploidy is read from `self` instead.
+        // Ploidy lives on `self.profile.dialed`, not `Fitted` (see
+        // `profile::tests::ploidy_lives_in_dialed_not_fitted`); `fitted` is
+        // kept as a parameter to match `stream_contigs`' sibling signature
+        // and to leave room for a fitted-derived partition, but ploidy is
+        // read from `self` instead.
         let block_records = Self::block_records(self.n_samples, self.profile.dialed.ploidy);
         let seed = self.seed;
 
@@ -732,95 +713,132 @@ impl BulkSpec {
         Ok(layouts)
     }
 
-    /// Generates one contig's records.
+    /// Generates and writes every contig through the block pipeline.
     ///
-    /// Parallelizes across `Self::MAX_BLOCK_RECORDS`-record blocks with
-    /// rayon (`into_par_iter` over block indices, each seeded independently
-    /// via [`block_rng`]), then reassembles them in index order — this, not
-    /// anything about `pool`'s thread count, is what makes output
-    /// thread-count independent: `.collect()` on a rayon parallel iterator
-    /// always preserves index order regardless of which thread computed
-    /// which item, and each block's position and content streams are each a
-    /// pure function of `(seed, block_idx, stream)`, never of thread
-    /// identity or a shared mutable RNG.
+    /// The single implementation behind [`BulkSpec::write`] and
+    /// [`BulkSpec::write_to_temp`] — before issue #22 these carried two
+    /// near-identical copies of a span pass plus a serial write loop, and a
+    /// now-deleted `measure_compressed_bytes` carried a third.
     ///
-    /// Positions must be strictly increasing across the *whole* contig
-    /// (VCF requires sorted records), but each block can only compute
-    /// positions relative to its own start while running in parallel with
-    /// no knowledge of the previous block's total span. So each block
-    /// generates with a block-local position starting at 0 (first record's
-    /// position is its own first gap draw, `>= 1`), returning both its
-    /// records and its local span (the last record's local position); a
-    /// cheap sequential prefix sum over blocks then turns those into
-    /// absolute contig positions. Because gap draws come from their own
-    /// stream, a block's local positions are a pure function of `(seed,
-    /// block_idx, count)` alone — independent of `n_samples`, ploidy, and
-    /// payload — which is the form Task 5's positions-only span pass
-    /// consumes.
-    fn generate_contig(
+    /// Everything that scales with cohort width happens inside the rayon
+    /// block task: record synthesis, `RecordBuf` construction, BCF/VCF
+    /// encoding, and the summary fold. The serial consumer only
+    /// concatenates each block's bytes into the sink in block order and
+    /// merges an O(1) [`BlockSummary`]. Blocks are consumed in chunks of
+    /// `2 * workers` so that peak memory is bounded by the blocks in flight
+    /// rather than by the largest contig — the old code held an entire
+    /// contig's records live, ~2.9 GB of genotypes at 32,000 samples.
+    ///
+    /// `.collect()` on a rayon parallel iterator preserves index order
+    /// regardless of which thread computed which item, which is what keeps
+    /// record order — and therefore output bytes and the hierarchical
+    /// checksum — independent of thread count. `chunk_blocks` likewise
+    /// changes only how many blocks are in flight, never which records land
+    /// in which block: the partition comes from `layouts`, whose block
+    /// boundaries depend on record count and cohort width alone.
+    ///
+    /// The block partition is *read from* `layouts`, never recomputed here.
+    /// Two independent computations of the same partition is precisely the
+    /// silent-divergence mode this design exists to avoid: the `##contig`
+    /// lengths in `header` were derived from these same
+    /// [`ContigLayout::block_spans`], so a locally re-derived partition
+    /// would declare one set of lengths and write another.
+    ///
+    /// No mid-stream flush happens at a contig boundary (or anywhere else):
+    /// `MultithreadedWriter` dispatches a compressed bgzf block once its
+    /// ~64 KiB staging buffer fills regardless, and forcing one per contig
+    /// would fragment the output and hurt compression. It would also make
+    /// [`BulkSpec::write`]'s bgzf block layout differ from
+    /// [`BulkSpec::measured_bytes`]'s — exactly the bug `Size::Target` used
+    /// to have: measuring a byte count the real write would not reproduce.
+    /// Both paths running through this one function is what keeps the
+    /// measurement exact rather than merely close.
+    fn stream_contigs(
         &self,
         pool: &rayon::ThreadPool,
         samplers: &Samplers,
         fitted: &Fitted,
-        chrom: &str,
-        contig_idx: u64,
-        n_records: u64,
-    ) -> Vec<Rec> {
-        if n_records == 0 {
-            return Vec::new();
-        }
+        layouts: &[ContigLayout],
+        header: &vcf::Header,
+        writer: &mut BulkWriter,
+    ) -> Result<Summary, BulkError> {
+        // Build one encoder up front so a malformed header surfaces as an
+        // error here rather than inside a worker: `map_init` below cannot
+        // propagate a construction failure, and encoding into a `Vec<u8>`
+        // has no other failure mode once this has succeeded.
+        drop(BlockEncoder::new(self.format, header)?);
 
+        // Ploidy lives on `self.profile.dialed`, not `Fitted` (see
+        // `profile::tests::ploidy_lives_in_dialed_not_fitted`); `fitted` is
+        // still needed here for `phased_rate` and by `gen_record`.
         let ploidy = self.profile.dialed.ploidy;
-        let n_samples = self.n_samples;
-        let seed = self.seed;
-        // Flat `MAX_BLOCK_RECORDS`, not cell-sized `Self::block_records`:
-        // `generate_contig` is deleted in #22 task 6 once the block
-        // pipeline replaces this regenerate-twice structure, so it keeps
-        // its pre-task-5 sizing (previously the `BLOCK_SIZE` constant, same
-        // value) rather than adopting cell-based sizing here too.
-        let n_blocks = n_records.div_ceil(Self::MAX_BLOCK_RECORDS);
+        let mut summary = Summary::new(self.n_samples);
+        let chunk_blocks = 2 * self.workers.get();
 
-        let blocks: Vec<BlockOutput> = pool.install(|| {
-            (0..n_blocks)
-                .into_par_iter()
-                .map(|local_block| {
-                    let block_idx = contig_idx * Self::CONTIG_BLOCK_STRIDE + local_block;
-                    let mut pos_rng = block_rng(seed, block_idx, Stream::Position);
-                    let mut rng = block_rng(seed, block_idx, Stream::Content);
-                    let start = local_block * Self::MAX_BLOCK_RECORDS;
-                    let count = Self::MAX_BLOCK_RECORDS.min(n_records - start);
+        for (ci, (id, layout)) in self.contig_ids.iter().zip(layouts).enumerate() {
+            let offsets = layout.offsets();
+            let n_blocks = layout.n_blocks();
 
-                    let mut local_pos = 0u64;
-                    let mut recs = Vec::with_capacity(count as usize);
-                    for _ in 0..count {
-                        local_pos += samplers.gap(&mut pos_rng);
-                        let g = gen_record(
-                            &mut rng, samplers, chrom, local_pos, n_samples, ploidy, fitted,
-                        );
-                        // Phasing is a per-record draw, not part of
-                        // `gen_record` (see `Rec`'s doc comment) — drawn
-                        // from the same block-local Content stream, right
-                        // after the record it applies to, so that stream
-                        // stays a pure function of `(seed, block_idx,
-                        // Stream::Content)` alone.
-                        let phased = rng.random::<f64>() < fitted.phased_rate;
-                        recs.push(Rec { g, phased });
-                    }
-                    (recs, local_pos)
-                })
-                .collect()
-        });
+            for start in (0..n_blocks).step_by(chunk_blocks) {
+                let chunk: Vec<usize> = (start..(start + chunk_blocks).min(n_blocks)).collect();
 
-        let mut out = Vec::with_capacity(n_records as usize);
-        let mut offset = 0u64;
-        for (mut recs, span) in blocks {
-            for r in &mut recs {
-                r.g.pos += offset;
+                let encoded: Vec<Result<(Vec<u8>, BlockSummary), BulkError>> = pool.install(|| {
+                    chunk
+                        .par_iter()
+                        .map_init(
+                            || {
+                                BlockEncoder::new(self.format, header).expect(
+                                    "encoding a header into a Vec<u8> cannot fail; the same \
+                                     construction was validated before the loop",
+                                )
+                            },
+                            |enc, &b| {
+                                let block_idx = ci as u64 * Self::CONTIG_BLOCK_STRIDE + b as u64;
+                                let mut pos_rng = block_rng(self.seed, block_idx, Stream::Position);
+                                let mut content_rng =
+                                    block_rng(self.seed, block_idx, Stream::Content);
+
+                                let mut local = 0u64;
+                                let mut bs = BlockSummary::new();
+                                enc.begin();
+
+                                for _ in 0..layout.block_len(b) {
+                                    local += samplers.gap(&mut pos_rng);
+                                    let g = gen_record(
+                                        &mut content_rng,
+                                        samplers,
+                                        id,
+                                        offsets[b] + local,
+                                        self.n_samples,
+                                        ploidy,
+                                        fitted,
+                                    );
+                                    // Phasing is a per-record draw taken
+                                    // from the content stream immediately
+                                    // after the record it applies to, so
+                                    // the block's stream stays a pure
+                                    // function of (seed, block_idx).
+                                    let phased = content_rng.random::<f64>() < fitted.phased_rate;
+                                    let buf = to_record_buf(&g, &self.payload, phased);
+                                    enc.push(header, &buf)?;
+                                    bs.observe(g.pos, g.class, &g.gts);
+                                }
+
+                                Ok((enc.bytes().to_vec(), bs))
+                            },
+                        )
+                        .collect()
+                });
+
+                for item in encoded {
+                    let (bytes, bs) = item?;
+                    writer.write_encoded(&bytes)?;
+                    summary.merge_block(id, &bs);
+                }
             }
-            out.extend(recs);
-            offset += span;
         }
-        out
+
+        Ok(summary)
     }
 
     /// Resolves [`Size::Target`] to per-contig record *counts*, the
@@ -830,7 +848,7 @@ impl BulkSpec {
     /// destination instead of regenerating a third time.
     ///
     /// Two cheap calibration points (`1_000` and `2_000` records per
-    /// contig, measured bytes-only via [`BulkSpec::measure_compressed_bytes`])
+    /// contig, measured bytes-only via [`BulkSpec::measured_bytes`])
     /// fit `bytes ~= b0 + k*records` (`k` bytes/record, `b0` the fixed
     /// header/index cost), which gives a direct count estimate for
     /// `target_bytes` in one step rather than the old scheme's up-to-25
@@ -881,8 +899,8 @@ impl BulkSpec {
         // Two calibration points; c2 = 2*c1 so the slope is well-conditioned.
         let split1 = distribute_by_n_variants(fitted, &self.contig_ids, 1_000 * n_contigs);
         let split2 = distribute_by_n_variants(fitted, &self.contig_ids, 2_000 * n_contigs);
-        let bytes1 = self.measure_compressed_bytes(pool, samplers, fitted, &split1)?;
-        let bytes2 = self.measure_compressed_bytes(pool, samplers, fitted, &split2)?;
+        let bytes1 = self.measured_bytes(pool, samplers, fitted, &split1)?;
+        let bytes2 = self.measured_bytes(pool, samplers, fitted, &split2)?;
 
         let r1 = split1.iter().sum::<u64>() as f64;
         let r2 = split2.iter().sum::<u64>() as f64;
@@ -937,8 +955,8 @@ impl BulkSpec {
             // `write_to_temp` may have left a `<tmp_path>.csi` companion
             // (Bcf only) that `NamedTempFile`'s `Drop` does not know about;
             // best-effort clean it up, mirroring
-            // `BulkSpec::measure_compressed_bytes`, so repeated corrective
-            // rounds don't litter the temp dir.
+            // `BulkSpec::measured_bytes`, so repeated corrective rounds
+            // don't litter the temp dir.
             if matches!(self.format, Format::Bcf) {
                 let mut csi_path = tmp.path().as_os_str().to_os_string();
                 csi_path.push(".csi");
@@ -953,11 +971,19 @@ impl BulkSpec {
         })
     }
 
-    /// Like [`BulkSpec::measure_compressed_bytes`], but builds the
-    /// [`Summary`] during the write pass and returns the live temp file
-    /// instead of deleting it, so the caller can promote it to the real
-    /// destination via [`BulkSpec::promote_temp`]. Byte-exact: identical
-    /// header, records, and (absent) flush cadence as [`BulkSpec::write`].
+    /// Writes `per_contig_count` to a temp file through the real writer,
+    /// returning the live temp file (so the caller can promote it to the
+    /// real destination via [`BulkSpec::promote_temp`] instead of
+    /// regenerating), its compressed byte length, and its [`Summary`].
+    ///
+    /// Byte-exact against [`BulkSpec::write`]: same layout pass, the same
+    /// [`BulkSpec::stream_contigs`] call, the same header, and the same
+    /// (absent) flush cadence — a calibration point is what the real write
+    /// will produce, not merely close to it.
+    ///
+    /// The returned size is read back from the `finish_and_index`'d file's
+    /// metadata, not from a live byte counter: dispatch to the bgzf
+    /// compression pool is asynchronous and a counter would lag it.
     fn write_to_temp(
         &self,
         pool: &rayon::ThreadPool,
@@ -965,16 +991,8 @@ impl BulkSpec {
         fitted: &Fitted,
         per_contig_count: &[u64],
     ) -> Result<(tempfile::NamedTempFile, u64, Summary), BulkError> {
-        let spans: Vec<u64> = self
-            .contig_ids
-            .iter()
-            .zip(per_contig_count)
-            .enumerate()
-            .map(|(i, (id, &n))| {
-                let recs = self.generate_contig(pool, samplers, fitted, id, i as u64, n);
-                contig_span(&recs)
-            })
-            .collect();
+        let layouts = self.compute_layouts(pool, samplers, fitted, per_contig_count)?;
+        let spans: Vec<u64> = layouts.iter().map(|l| l.span()).collect();
 
         let header = self.build_header(&spans);
         let tmp = tempfile::NamedTempFile::new()?;
@@ -987,18 +1005,37 @@ impl BulkSpec {
             self.compression_level,
             self.workers,
         )?;
-        let mut summary = Summary::new(self.n_samples);
-        for (i, (id, &n)) in self.contig_ids.iter().zip(per_contig_count).enumerate() {
-            let recs = self.generate_contig(pool, samplers, fitted, id, i as u64, n);
-            for r in &recs {
-                let buf = to_record_buf(&r.g, &self.payload, r.phased);
-                w.write(&header, &buf)?;
-                summary.observe(id, r.g.pos, r.g.class, &r.g.gts);
-            }
-        }
+        let summary = self.stream_contigs(pool, samplers, fitted, &layouts, &header, &mut w)?;
         w.finish_and_index(&tmp_path)?;
         let bytes = std::fs::metadata(&tmp_path)?.len();
         Ok((tmp, bytes, summary))
+    }
+
+    /// The compressed byte size `per_contig_count` would produce, measured
+    /// by writing it through the real writer to a temp file that is then
+    /// discarded. A thin wrapper over [`BulkSpec::write_to_temp`] — the two
+    /// used to be separate near-identical implementations, which is how
+    /// `Size::Target` once came to measure a byte count the real write did
+    /// not reproduce.
+    fn measured_bytes(
+        &self,
+        pool: &rayon::ThreadPool,
+        samplers: &Samplers,
+        fitted: &Fitted,
+        per_contig_count: &[u64],
+    ) -> Result<u64, BulkError> {
+        let (tmp, bytes, _summary) =
+            self.write_to_temp(pool, samplers, fitted, per_contig_count)?;
+        // `finish_and_index` may have written a `<tmp>.csi` companion (Bcf
+        // only) that `NamedTempFile`'s `Drop` does not know about;
+        // best-effort clean it up so repeated calibration rounds don't
+        // litter the temp dir.
+        if matches!(self.format, Format::Bcf) {
+            let mut csi_path = tmp.path().as_os_str().to_os_string();
+            csi_path.push(".csi");
+            let _ = std::fs::remove_file(csi_path);
+        }
+        Ok(bytes)
     }
 
     /// Moves a written temp file (and, for BCF, its `.csi` companion) onto
@@ -1025,79 +1062,6 @@ impl BulkSpec {
                 Ok(())
             }
         }
-    }
-
-    /// Measures the exact compressed byte size that `per_contig_count`
-    /// would produce, by actually generating and writing it to a throwaway
-    /// temp file through the real [`BulkWriter`] — **one contig at a time**,
-    /// exactly as [`BulkSpec::write`] does: a span pass that generates each
-    /// contig only long enough to learn its populated span before dropping
-    /// its records, then a write pass that regenerates each contig (a pure
-    /// function of `(seed, contig_idx, n_records)`, so byte-identical to the
-    /// span pass) and writes it immediately, dropping its records before
-    /// moving to the next contig. Peak memory here is therefore bounded by
-    /// the largest single contig's records, not the sum across every
-    /// contig — the same bound `write()` gives the real output, and the
-    /// fix for this function previously holding every contig's full record
-    /// set (`Vec<Vec<Rec>>`) live at once.
-    ///
-    /// The returned size is read back from `finish_and_index`'d file
-    /// metadata, not a live byte counter (dispatch to the compression
-    /// thread pool is asynchronous and would otherwise lag). Because
-    /// `write()` also never calls a mid-stream flush, this temp-file write
-    /// is structurally identical to the real write — same header, same
-    /// records, same (absent) flush cadence — so the byte count returned
-    /// here is exactly what the real write produces for this
-    /// `per_contig_count`, not merely close to it.
-    fn measure_compressed_bytes(
-        &self,
-        pool: &rayon::ThreadPool,
-        samplers: &Samplers,
-        fitted: &Fitted,
-        per_contig_count: &[u64],
-    ) -> Result<u64, BulkError> {
-        let spans: Vec<u64> = self
-            .contig_ids
-            .iter()
-            .zip(per_contig_count)
-            .enumerate()
-            .map(|(i, (id, &n))| {
-                let recs = self.generate_contig(pool, samplers, fitted, id, i as u64, n);
-                contig_span(&recs)
-            })
-            .collect();
-
-        let header = self.build_header(&spans);
-        let tmp = tempfile::NamedTempFile::new()?;
-        let tmp_path = tmp.path().to_path_buf();
-
-        let mut w = BulkWriter::create(
-            &tmp_path,
-            self.format,
-            &header,
-            self.compression_level,
-            self.workers,
-        )?;
-        for (i, (id, &n)) in self.contig_ids.iter().zip(per_contig_count).enumerate() {
-            let recs = self.generate_contig(pool, samplers, fitted, id, i as u64, n);
-            for r in &recs {
-                let buf = to_record_buf(&r.g, &self.payload, r.phased);
-                w.write(&header, &buf)?;
-            }
-        }
-        w.finish_and_index(&tmp_path)?;
-
-        let bytes = std::fs::metadata(&tmp_path)?.len();
-
-        // `finish_and_index` may have written a `<tmp_path>.csi` companion
-        // (Bcf only) that `NamedTempFile`'s `Drop` does not know about;
-        // best-effort clean it up so repeated measurement rounds don't
-        // litter the temp dir.
-        let mut csi_path = tmp_path.as_os_str().to_os_string();
-        csi_path.push(".csi");
-        let _ = std::fs::remove_file(csi_path);
-
-        Ok(bytes)
     }
 }
 
@@ -1172,16 +1136,6 @@ fn move_file(src: &Path, dst: &Path) -> Result<(), BulkError> {
     std::fs::copy(src, dst)?;
     let _ = std::fs::remove_file(src);
     Ok(())
-}
-
-/// The populated span of one contig's generated records — the maximum
-/// position among them, or `1` if the contig has zero records. Positions
-/// are strictly increasing within a contig (see
-/// [`BulkSpec::generate_contig`]'s doc comment), so this equals the last
-/// record's position, but is computed via `.max()` rather than relying on
-/// that ordering to hold forever.
-fn contig_span(recs: &[Rec]) -> u64 {
-    recs.iter().map(|r| r.g.pos).max().unwrap_or(1)
 }
 
 /// Resolves a per-contig fitted statistic for one requested *output*

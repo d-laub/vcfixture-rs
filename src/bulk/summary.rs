@@ -196,20 +196,6 @@ impl Summary {
         }
     }
 
-    /// Temporary shim over [`Summary::merge_block`], kept only until the
-    /// block pipeline lands (issue #22 task 6) and rewires the still-serial
-    /// call sites in `src/bulk/mod.rs` to build and merge real
-    /// [`BlockSummary`] blocks directly. Constructs a one-record block and
-    /// merges it, so callers are unaffected in shape but pay the
-    /// merge-per-record cost this task exists to move off the writer
-    /// thread. `merge_block` is the real entry point; this wrapper is
-    /// deleted once nothing calls it.
-    pub fn observe(&mut self, chrom: &str, pos: u64, class: VariantClass, gts: &[i8]) {
-        let mut b = BlockSummary::new();
-        b.observe(pos, class, gts);
-        self.merge_block(chrom, &b);
-    }
-
     pub fn n_records_total(&self) -> u64 {
         self.per_contig.values().map(|c| c.n_records).sum()
     }

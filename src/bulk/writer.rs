@@ -6,7 +6,7 @@
 //! `virtual_position()` nor a byte count, so the index is a second pass via
 //! [`noodles_bcf::fs::index`]. [`Size::Target`](crate::bulk::Size::Target)
 //! measures compressed output size via `fs::metadata` on a finished temp
-//! file (see [`crate::bulk::BulkSpec::measure_compressed_bytes`]), not a
+//! file (see [`crate::bulk::BulkSpec::measured_bytes`]), not a
 //! live byte counter — an earlier live `CountingWriter` counter was dead
 //! code outside this module's own tests and has been removed.
 
@@ -45,10 +45,8 @@ enum Sink {
 /// block rewinds to it with `truncate`. At 32,000 samples the header text
 /// is ~200 KB of sample names, which is exactly why this is per worker
 /// rather than per block.
-// The block pipeline task (a later task in #22) wires this into the
-// generation pipeline; until then it is only exercised by this module's
-// tests.
-#[allow(dead_code)]
+/// Driven by [`crate::bulk::BulkSpec`]'s block pipeline, whose serial
+/// consumer hands the resulting bytes to [`BulkWriter::write_encoded`].
 pub(crate) enum BlockEncoder {
     Bcf {
         w: bcf::io::Writer<Vec<u8>>,
@@ -60,7 +58,6 @@ pub(crate) enum BlockEncoder {
     },
 }
 
-#[allow(dead_code)]
 impl BlockEncoder {
     /// Builds an encoder whose output matches what [`BulkWriter`] with the
     /// same `format` and `header` would emit. `VcfGz` and `Vcf` share the

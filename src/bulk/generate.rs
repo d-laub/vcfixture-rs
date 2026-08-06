@@ -434,8 +434,9 @@ mod tests {
         // The point of the split: a block's gap sequence -- drawn from the
         // Position stream -- must be the same regardless of `n_samples`,
         // even though `gen_record`'s content draws (on the Content stream)
-        // scale with it. This reproduces `generate_contig`'s actual
-        // per-record loop shape (`src/bulk/mod.rs`): a gap draw on the
+        // scale with it. This reproduces the block pipeline's actual
+        // per-record loop shape (`BulkSpec::stream_contigs`,
+        // `src/bulk/mod.rs`): a gap draw on the
         // position stream, then `gen_record` plus a phasing draw on the
         // content stream, repeated -- rather than calling `Samplers::gap`
         // in isolation, which would trivially pass no matter how the two
