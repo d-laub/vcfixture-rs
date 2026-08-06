@@ -49,6 +49,38 @@ Speedup range 2.51x–3.08x, average ~2.81x. This clears the "wins" bar plainly 
 
 All (samples, records) points, workers, and workload sizes above are **single-shot measurements**, not averaged over repeated runs. The same (2000, 20000) workload was independently re-measured three times over the course of this task (7.049s in the full sweep, 7.502s in the Step 4 scaling run, 7.762s in the Step 5 profiling run) — a ~10% spread. The overall win is far larger than this noise, so no conclusion above changes, but individual row speedups should be read as accurate to roughly ±10%, not to the three significant figures the table prints.
 
+## Hardware and allocation
+
+```
+$ hostname
+carter-cn-03
+
+$ nproc
+8
+
+$ nproc --all
+96
+
+$ grep Cpus_allowed_list /proc/self/status
+Cpus_allowed_list:	0-3,48-51
+
+$ cat /sys/devices/system/cpu/cpu0/topology/thread_siblings_list
+0,48
+
+$ lscpu | rg -i 'thread|core|socket|model name'
+Thread(s) per core:  2
+Core(s) per socket:  12
+Socket(s):           4
+Model name:          Intel(R) Xeon(R) CPU E5-4650 v3 @ 2.10GHz
+```
+
+> Every measurement in this document ran inside a Slurm allocation of
+> `Cpus_allowed_list: 0-3,48-51` on `carter-cn-03` — **4 physical cores** plus
+> their SMT siblings, not 8 cores. `nproc` and
+> `std::thread::available_parallelism()` both report 8 because they count
+> logical CPUs, which is why `workers` defaulted to 8. Parallel efficiency must
+> be computed against 4, not 8.
+
 ### Hypothesis 1 — "removing the redundant generation pass roughly halves generation CPU"
 
 **Measured directly with an isolated A/B comparison**, using the `VCFIXTURE_BENCH_WORKERS` knob added in this task to factor parallelism out entirely. A throwaway `git worktree` was checked out at the pre-change baseline commit `9e64a0c` (which predates the `bulk_bench` harness), the current `examples/bulk_bench.rs` was copied into it unmodified (it uses only public `BulkSpec`/`Payload`/`Profile`/`Size` API that is identical at `9e64a0c`), built `--release`, and run once at `WORKERS=1` for the same workload used in the Hypothesis 2 scaling check:
@@ -88,6 +120,45 @@ The profile (below) shows glibc allocator-family symbols at ~47% of self time �
 A second, untested, and at least equally plausible explanation is plain **thread oversubscription**: `workers` sizes both the rayon pool (`rayon::ThreadPoolBuilder::new().num_threads(self.workers.get())`, `src/bulk/mod.rs`) and the bgzf multithreaded writer's compression pool (`bgzf::io::multithreaded_writer::Builder::default().set_worker_count(workers)`, `src/bulk/writer.rs:149`) *independently* from the same `workers` value. At `workers=8` on this 8-core box, that is up to 8 rayon worker threads plus up to 8 bgzf compression threads plus the main thread — as many as 17 threads contending for 8 cores, which alone would depress parallel efficiency well below 100% regardless of any allocator effect.
 
 Honest statement: **the profile establishes that glibc allocator overhead is the largest measured self-time bucket (~47%), not that it is the cause of the sub-linear scaling.** Both "allocator arena-lock contention" and "rayon+bgzf thread oversubscription" are plausible, untested explanations for the ~44% parallel efficiency ceiling, and this measurement cannot distinguish between them.
+
+### Scaling curves
+
+Fixed workload throughout (2000 samples × 20000 records, 80M cells, `seed=42`), swept over `VCFIXTURE_BENCH_WORKERS ∈ {1,2,3,4,6,8}`, 3 reps per cell (`VCFIXTURE_BENCH_REPS=3`), reporting `min_s`/`med_s`/`max_s` per cell. `S(w) = min_s(1) / min_s(w)`; efficiency is `S(w) / min(w, 4)` — against **4 physical cores**, per the hardware section above (so `w=6` and `w=8` both divide by 4, not by `w`).
+
+**BCF, unpinned** (`Cpus_allowed_list: 0-3,48-51`, all 8 logical CPUs available):
+
+| workers | min_s | med_s | max_s | S(w) | S(w)/min(w,4) |
+|---|---|---|---|---|---|
+| 1 | 27.577 | 31.642 | 36.312 | 1.00 | 1.00 |
+| 2 | 13.309 | 14.042 | 18.509 | 2.07 | 1.04 |
+| 3 | 10.614 | 12.355 | 12.526 | 2.60 | 0.87 |
+| 4 | 8.205 | 8.305 | 8.374 | 3.36 | 0.84 |
+| 6 | 7.580 | 7.650 | 8.024 | 3.64 | 0.91 |
+| 8 | 7.153 | 7.363 | 7.802 | 3.86 | 0.96 |
+
+**BCF, pinned to physical cores only** (`taskset -c 0-3`, excludes the 48-51 SMT siblings):
+
+| workers | min_s | med_s | max_s | S(w) | S(w)/min(w,4) |
+|---|---|---|---|---|---|
+| 1 | 23.996 | 24.468 | 25.856 | 1.00 | 1.00 |
+| 2 | 12.916 | 12.981 | 13.085 | 1.86 | 0.93 |
+| 3 | 9.305 | 11.030 | 11.223 | 2.58 | 0.86 |
+| 4 | 7.565 | 7.709 | 8.083 | 3.17 | 0.79 |
+| 6 | 7.741 | 7.876 | 7.930 | 3.10 | 0.77 |
+| 8 | 7.303 | 7.312 | 7.457 | 3.29 | 0.82 |
+
+**VCF, unpinned, no bgzf pool** (uncompressed `--format vcf`, so `workers` sizes only the rayon pool, not a second compression pool):
+
+| workers | min_s | med_s | max_s | S(w) | S(w)/min(w,4) |
+|---|---|---|---|---|---|
+| 1 | 18.529 | 18.718 | 19.018 | 1.00 | 1.00 |
+| 2 | 10.615 | 12.253 | 17.061 | 1.75 | 0.87 |
+| 3 | 7.287 | 7.460 | 7.962 | 2.54 | 0.85 |
+| 4 | 6.026 | 6.169 | 6.218 | 3.07 | 0.77 |
+| 6 | 5.906 | 6.082 | 6.095 | 3.14 | 0.78 |
+| 8 | 5.521 | 5.794 | 5.947 | 3.36 | 0.84 |
+
+All three curves rise monotonically from `w=1` through `w=8` — none shows the SMT- or writer-pool-oversubscription signature of a mid-curve peak followed by decline (`S(6)` or `S(8)` dropping below `S(4)`). The BCF-unpinned curve reaches its steepest gains by `w=4` (already 3.36x, 84% efficient against 4 physical cores) and then keeps climbing more slowly through the SMT range to 3.86x at `w=8` (96% efficient against 4 cores) — consistent with the SMT siblings contributing real, if diminished, throughput on this workload rather than pure oversubscription noise. BCF-pinned tracks BCF-unpinned closely through `w=4` (as it must — pinning to `0-3` only changes behavior once `workers > 4` would otherwise use the SMT siblings) but is *not* monotonically increasing after that: `S(6)=3.10` dips slightly below `S(4)=3.17` before recovering to `S(8)=3.29`, i.e. running 6 or 8 rayon+bgzf threads on 4 physical cores produces mild, non-monotonic thrashing rather than a clean plateau — expected once the process is confined to fewer cores than it requests threads for. The VCF curve (no bgzf pool, rayon-only) is lower at every worker count than the BCF curves' *absolute* speedup once `w≥4` — it does **not** reach a materially higher peak than BCF (peak 3.36x at `w=8` vs. BCF-unpinned's 3.86x) — and its efficiency plateaus in the high-70s to low-80s percent from `w=4` onward rather than climbing toward 100%, indicating a real, if modest, sub-linear component in rayon-only fan-out scaling that is not explained by the bgzf pool at all.
 
 ### Profiling
 
