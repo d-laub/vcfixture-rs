@@ -28,9 +28,10 @@
 //! comment for the threshold and the determinism argument.
 //!
 //! [`block_rng`] is the determinism guarantee for parallel generation: a
-//! block's RNG stream is a pure function of `(seed, block_idx)`, never of
-//! thread identity or a shared mutable RNG, so output is byte-identical
-//! regardless of how many worker threads produced it.
+//! block's RNG stream is a pure function of `(seed, block_idx, stream)`,
+//! never of thread identity or a shared mutable RNG, so output is
+//! byte-identical regardless of how many worker threads produced it. See
+//! [`Stream`] for why positions and content draw from separate streams.
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -63,19 +64,50 @@ pub struct GenRecord {
     pub ploidy: u8,
 }
 
-/// Seeds a `ChaCha8Rng` stream that depends only on `(seed, block_idx)`.
+/// Which of a block's two independent PRNG streams to draw from.
+///
+/// Positions and record content are deliberately separate streams so that a
+/// block's positions are a pure function of `(seed, block_idx, count)` —
+/// independent of `n_samples`, ploidy, and payload. That is what lets
+/// contig spans be computed by a gap-only pass instead of by generating
+/// every genotype and discarding it (issue #22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stream {
+    /// Gap draws, and nothing else.
+    Position,
+    /// Class, REF/ALT, allele count, missingness, alt placement, phasing.
+    Content,
+}
+
+impl Stream {
+    fn domain(self) -> u64 {
+        match self {
+            Stream::Position => 1,
+            Stream::Content => 2,
+        }
+    }
+}
+
+/// splitmix64 finalizer.
+fn mix(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Seeds a `ChaCha8Rng` stream that depends only on
+/// `(seed, block_idx, stream)`.
 ///
 /// This is the determinism guarantee for parallel generation: never seed
 /// from a thread ID, and never draw from a shared mutable RNG across
-/// blocks. A splitmix64-style finalizer keeps adjacent block indices'
-/// streams well-separated despite differing from `seed` by a single
-/// multiplication.
-pub fn block_rng(seed: u64, block_idx: u64) -> ChaCha8Rng {
-    let mut z = seed ^ block_idx.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^= z >> 31;
-    ChaCha8Rng::seed_from_u64(z)
+/// blocks. The block index is mixed first, then the stream domain in a
+/// second finalizer round, so the two domains separate under the same
+/// 2^-64 collision assumption the per-block separation already makes.
+pub fn block_rng(seed: u64, block_idx: u64, stream: Stream) -> ChaCha8Rng {
+    let base = mix(seed ^ block_idx.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    ChaCha8Rng::seed_from_u64(mix(
+        base ^ stream.domain().wrapping_mul(0xD1B5_4A32_D192_ED03)
+    ))
 }
 
 /// Draws one variant record: a structural class, REF/ALT bases for that
@@ -314,7 +346,7 @@ impl SampleStats {
 /// Converts a [`GenRecord`] into a noodles [`RecordBuf`], with a FORMAT
 /// payload matching exactly the given [`Payload`] preset's key list, in
 /// order.
-pub fn to_record_buf(r: &GenRecord, payload: Payload, phased: bool) -> RecordBuf {
+pub fn to_record_buf(r: &GenRecord, payload: &Payload, phased: bool) -> RecordBuf {
     let key_names: &[&str] = match payload {
         Payload::GtOnly => &["GT"],
         Payload::GtVaf => &["GT", "VAF"],
@@ -371,16 +403,51 @@ mod tests {
     }
 
     #[test]
-    fn block_rng_is_a_pure_function_of_seed_and_block() {
+    fn block_rng_is_a_pure_function_of_seed_block_and_stream() {
         use rand::Rng;
-        let mut a = block_rng(42, 7);
-        let mut b = block_rng(42, 7);
-        let mut c = block_rng(42, 8);
-        let xa: u64 = a.random();
-        let xb: u64 = b.random();
-        let xc: u64 = c.random();
-        assert_eq!(xa, xb, "same (seed, block) must give the same stream");
-        assert_ne!(xa, xc, "different block must give a different stream");
+        let draw = |seed, blk, s| block_rng(seed, blk, s).random::<u64>();
+
+        assert_eq!(
+            draw(42, 7, Stream::Content),
+            draw(42, 7, Stream::Content),
+            "same (seed, block, stream) must give the same stream"
+        );
+        assert_ne!(
+            draw(42, 7, Stream::Content),
+            draw(42, 8, Stream::Content),
+            "different block must give a different stream"
+        );
+        assert_ne!(
+            draw(42, 7, Stream::Content),
+            draw(42, 7, Stream::Position),
+            "different domain must give a different stream"
+        );
+        assert_ne!(
+            draw(42, 7, Stream::Position),
+            draw(43, 7, Stream::Position),
+            "different seed must give a different stream"
+        );
+    }
+
+    #[test]
+    fn position_stream_is_independent_of_content_draws() {
+        // The point of the split: a position stream's output does not depend on
+        // how many draws a same-indexed content stream makes.
+        let (p, s) = fixture();
+        let mut pos_a = block_rng(11, 3, Stream::Position);
+        let gaps_a: Vec<u64> = (0..20).map(|_| s.gap(&mut pos_a)).collect();
+
+        let mut pos_b = block_rng(11, 3, Stream::Position);
+        let mut content = block_rng(11, 3, Stream::Content);
+        let gaps_b: Vec<u64> = (0..20)
+            .map(|_| {
+                // Interleave a wide-cohort record draw; gaps must not move.
+                let _ = gen_record(&mut content, &s, "chr1", 1, 64, p.dialed.ploidy, &p.fitted);
+                s.gap(&mut pos_b)
+            })
+            .collect();
+
+        assert_eq!(gaps_a, gaps_b);
     }
 
     #[test]
@@ -394,7 +461,7 @@ mod tests {
     #[test]
     fn genotypes_have_expected_shape_and_alphabet() {
         let (p, s) = fixture();
-        let mut rng = block_rng(1, 0);
+        let mut rng = block_rng(1, 0, Stream::Content);
         let r = gen_record(&mut rng, &s, "chr1", 100, 10, 2, &p.fitted);
         assert_eq!(r.gts.len(), 20);
         assert!(r.gts.iter().all(|g| (-1..=1).contains(g)));
@@ -406,7 +473,7 @@ mod tests {
     #[test]
     fn ref_and_alt_are_never_equal() {
         let (p, s) = fixture();
-        let mut rng = block_rng(2, 0);
+        let mut rng = block_rng(2, 0, Stream::Content);
         for i in 0..500 {
             let r = gen_record(&mut rng, &s, "chr1", 100 + i, 4, 2, &p.fitted);
             for a in &r.alts {
@@ -421,7 +488,7 @@ mod tests {
     fn exactly_ac_eff_alt_alleles_are_placed() {
         let (p, s) = fixture();
         for i in 0..200u64 {
-            let mut rng = block_rng(7, i);
+            let mut rng = block_rng(7, i, Stream::Content);
             let r = gen_record(&mut rng, &s, "chr1", 100 + i, 1000, 2, &p.fitted);
             let n_alt = r.gts.iter().filter(|&&g| g == 1).count();
             let n_missing = r.gts.iter().filter(|&&g| g == -1).count();
@@ -435,13 +502,13 @@ mod tests {
         let (p, s) = fixture();
         let a: Vec<_> = (0..50)
             .map(|i| {
-                let mut r = block_rng(9, i);
+                let mut r = block_rng(9, i, Stream::Content);
                 gen_record(&mut r, &s, "chr1", 100 + i, 8, 2, &p.fitted)
             })
             .collect();
         let b: Vec<_> = (0..50)
             .map(|i| {
-                let mut r = block_rng(9, i);
+                let mut r = block_rng(9, i, Stream::Content);
                 gen_record(&mut r, &s, "chr1", 100 + i, 8, 2, &p.fitted)
             })
             .collect();
@@ -456,7 +523,7 @@ mod tests {
         use crate::bulk::profile::Payload;
 
         let (p, s) = fixture();
-        let mut rng = block_rng(3, 0);
+        let mut rng = block_rng(3, 0, Stream::Content);
         let r = gen_record(&mut rng, &s, "chr1", 100, 2, 2, &p.fitted);
         for (payload, expected) in [
             (Payload::GtOnly, vec!["GT"]),
@@ -467,7 +534,7 @@ mod tests {
                 vec!["GT", "AD", "AF", "DP", "F1R2", "F2R1", "SB"],
             ),
         ] {
-            let buf = to_record_buf(&r, payload.clone(), true);
+            let buf = to_record_buf(&r, &payload, true);
             // `record_buf::samples::Keys` wraps an `IndexSet<String>` (order
             // preserved, no `IntoIterator`/`Deref` of its own) — go through
             // `AsRef` to iterate it, rather than the brief's `.keys().map(..)`

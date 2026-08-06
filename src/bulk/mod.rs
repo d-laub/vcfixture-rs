@@ -35,7 +35,7 @@ use noodles_vcf::{
     },
 };
 
-use generate::{block_rng, gen_record, to_record_buf, GenRecord};
+use generate::{block_rng, gen_record, to_record_buf, GenRecord, Stream};
 use profile::{ContigStat, Fitted};
 use sample::Samplers;
 use writer::BulkWriter;
@@ -282,11 +282,11 @@ pub struct BulkSpec {
 
 impl BulkSpec {
     /// Records generated per parallel unit of work ("block"). A block's RNG
-    /// stream is a pure function of `(seed, block_idx)` via [`block_rng`],
-    /// so this is also the granularity at which thread-count independence
-    /// is achieved: rayon may compute blocks on any thread in any order,
-    /// but [`Vec::from_par_iter`]/`.collect()` always assembles the results
-    /// back in index order.
+    /// stream is a pure function of `(seed, block_idx, stream)` via
+    /// [`block_rng`], so this is also the granularity at which thread-count
+    /// independence is achieved: rayon may compute blocks on any thread in
+    /// any order, but [`Vec::from_par_iter`]/`.collect()` always assembles
+    /// the results back in index order.
     // `pub` (not just `pub(crate)`) so that `tests/bulk.rs` -- a separate
     // crate compiled against the public API -- can reference the real
     // constant instead of mirroring its value as a literal, which has
@@ -500,7 +500,7 @@ impl BulkSpec {
         for (i, (id, &n)) in self.contig_ids.iter().zip(&counts).enumerate() {
             let recs = self.generate_contig(&pool, &samplers, fitted, id, i as u64, n);
             for r in &recs {
-                let buf = to_record_buf(&r.g, self.payload.clone(), r.phased);
+                let buf = to_record_buf(&r.g, &self.payload, r.phased);
                 writer.write(&header, &buf)?;
                 summary.observe(id, r.g.pos, r.g.class, &r.g.gts);
             }
@@ -555,9 +555,9 @@ impl BulkSpec {
     /// anything about `pool`'s thread count, is what makes output
     /// thread-count independent: `.collect()` on a rayon parallel iterator
     /// always preserves index order regardless of which thread computed
-    /// which item, and each block's content is a pure function of
-    /// `(seed, block_idx)`, never of thread identity or a shared mutable
-    /// RNG.
+    /// which item, and each block's position and content streams are each a
+    /// pure function of `(seed, block_idx)`, never of thread identity or a
+    /// shared mutable RNG.
     ///
     /// Positions must be strictly increasing across the *whole* contig
     /// (VCF requires sorted records), but each block can only compute
@@ -591,22 +591,24 @@ impl BulkSpec {
                 .into_par_iter()
                 .map(|local_block| {
                     let block_idx = contig_idx * Self::CONTIG_BLOCK_STRIDE + local_block;
-                    let mut rng = block_rng(seed, block_idx);
+                    let mut pos_rng = block_rng(seed, block_idx, Stream::Position);
+                    let mut rng = block_rng(seed, block_idx, Stream::Content);
                     let start = local_block * Self::BLOCK_SIZE;
                     let count = Self::BLOCK_SIZE.min(n_records - start);
 
                     let mut local_pos = 0u64;
                     let mut recs = Vec::with_capacity(count as usize);
                     for _ in 0..count {
-                        local_pos += samplers.gap(&mut rng);
+                        local_pos += samplers.gap(&mut pos_rng);
                         let g = gen_record(
                             &mut rng, samplers, chrom, local_pos, n_samples, ploidy, fitted,
                         );
                         // Phasing is a per-record draw, not part of
                         // `gen_record` (see `Rec`'s doc comment) — drawn
-                        // from the same block-local RNG, right after the
-                        // record it applies to, so the block's stream stays
-                        // a pure function of `(seed, block_idx)` alone.
+                        // from the same block-local Content stream, right
+                        // after the record it applies to, so that stream
+                        // stays a pure function of `(seed, block_idx,
+                        // Stream::Content)` alone.
                         let phased = rng.random::<f64>() < fitted.phased_rate;
                         recs.push(Rec { g, phased });
                     }
@@ -752,7 +754,7 @@ impl BulkSpec {
         for (i, (id, &n)) in self.contig_ids.iter().zip(per_contig_count).enumerate() {
             let recs = self.generate_contig(pool, samplers, fitted, id, i as u64, n);
             for r in &recs {
-                let buf = to_record_buf(&r.g, self.payload.clone(), r.phased);
+                let buf = to_record_buf(&r.g, &self.payload, r.phased);
                 w.write(&header, &buf)?;
                 summary.observe(id, r.g.pos, r.g.class, &r.g.gts);
             }
@@ -842,7 +844,7 @@ impl BulkSpec {
         for (i, (id, &n)) in self.contig_ids.iter().zip(per_contig_count).enumerate() {
             let recs = self.generate_contig(pool, samplers, fitted, id, i as u64, n);
             for r in &recs {
-                let buf = to_record_buf(&r.g, self.payload.clone(), r.phased);
+                let buf = to_record_buf(&r.g, &self.payload, r.phased);
                 w.write(&header, &buf)?;
             }
         }
