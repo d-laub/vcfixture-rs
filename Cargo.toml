@@ -62,3 +62,9 @@ required-features = ["bulk"]
 
 [package.metadata.docs.rs]
 all-features = true
+
+[package.metadata.cargo-semver-checks.lints]
+# Off by default (the lint ships `lint_level: Allow`) and only `Minor`-required,
+# which on a 0.x crate any assumed release already satisfies -- so out of the
+# box this lint can never fire. Both dials have to be turned up.
+enum_no_longer_non_exhaustive = { level = "deny", required-update = "major" }
