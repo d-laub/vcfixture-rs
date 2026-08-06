@@ -430,24 +430,46 @@ mod tests {
     }
 
     #[test]
-    fn position_stream_is_independent_of_content_draws() {
-        // The point of the split: a position stream's output does not depend on
-        // how many draws a same-indexed content stream makes.
+    fn block_gap_sequence_is_invariant_to_cohort_width() {
+        // The point of the split: a block's gap sequence -- drawn from the
+        // Position stream -- must be the same regardless of `n_samples`,
+        // even though `gen_record`'s content draws (on the Content stream)
+        // scale with it. This reproduces `generate_contig`'s actual
+        // per-record loop shape (`src/bulk/mod.rs`): a gap draw on the
+        // position stream, then `gen_record` plus a phasing draw on the
+        // content stream, repeated -- rather than calling `Samplers::gap`
+        // in isolation, which would trivially pass no matter how the two
+        // streams are wired together.
+        use rand::Rng;
+
         let (p, s) = fixture();
-        let mut pos_a = block_rng(11, 3, Stream::Position);
-        let gaps_a: Vec<u64> = (0..20).map(|_| s.gap(&mut pos_a)).collect();
+        let seed = 11;
+        let block_idx = 3;
 
-        let mut pos_b = block_rng(11, 3, Stream::Position);
-        let mut content = block_rng(11, 3, Stream::Content);
-        let gaps_b: Vec<u64> = (0..20)
-            .map(|_| {
-                // Interleave a wide-cohort record draw; gaps must not move.
-                let _ = gen_record(&mut content, &s, "chr1", 1, 64, p.dialed.ploidy, &p.fitted);
-                s.gap(&mut pos_b)
-            })
-            .collect();
+        let run = |n_samples: usize| -> Vec<u64> {
+            let mut pos_rng = block_rng(seed, block_idx, Stream::Position);
+            let mut content_rng = block_rng(seed, block_idx, Stream::Content);
+            let mut local_pos = 0u64;
+            (0..20)
+                .map(|_| {
+                    let gap = s.gap(&mut pos_rng);
+                    local_pos += gap;
+                    let _ = gen_record(
+                        &mut content_rng,
+                        &s,
+                        "chr1",
+                        local_pos,
+                        n_samples,
+                        p.dialed.ploidy,
+                        &p.fitted,
+                    );
+                    let _phased = content_rng.random::<f64>() < p.fitted.phased_rate;
+                    gap
+                })
+                .collect()
+        };
 
-        assert_eq!(gaps_a, gaps_b);
+        assert_eq!(run(2), run(64));
     }
 
     #[test]

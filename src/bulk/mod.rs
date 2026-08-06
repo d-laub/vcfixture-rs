@@ -556,8 +556,8 @@ impl BulkSpec {
     /// thread-count independent: `.collect()` on a rayon parallel iterator
     /// always preserves index order regardless of which thread computed
     /// which item, and each block's position and content streams are each a
-    /// pure function of `(seed, block_idx)`, never of thread identity or a
-    /// shared mutable RNG.
+    /// pure function of `(seed, block_idx, stream)`, never of thread
+    /// identity or a shared mutable RNG.
     ///
     /// Positions must be strictly increasing across the *whole* contig
     /// (VCF requires sorted records), but each block can only compute
@@ -567,7 +567,11 @@ impl BulkSpec {
     /// position is its own first gap draw, `>= 1`), returning both its
     /// records and its local span (the last record's local position); a
     /// cheap sequential prefix sum over blocks then turns those into
-    /// absolute contig positions.
+    /// absolute contig positions. Because gap draws come from their own
+    /// stream, a block's local positions are a pure function of `(seed,
+    /// block_idx, count)` alone — independent of `n_samples`, ploidy, and
+    /// payload — which is the form Task 5's positions-only span pass
+    /// consumes.
     fn generate_contig(
         &self,
         pool: &rayon::ThreadPool,
@@ -647,9 +651,26 @@ impl BulkSpec {
     /// (building the `Summary` for free, since this write is no longer a
     /// throwaway measurement -- it may be the one promoted), and if it's
     /// still short, tops up every contig's count proportionally (via
-    /// [`distribute_by_n_variants`], same as the initial split) using the
-    /// same fitted slope `k`, plus a 2% margin so rounds converge instead of
-    /// oscillating just under the target.
+    /// [`distribute_by_n_variants`], same as the initial split), plus a 2%
+    /// margin so rounds converge instead of oscillating just under the
+    /// target.
+    ///
+    /// The top-up itself does **not** keep using the calibration slope `k`:
+    /// `k` is fitted at the 1-2k-records/contig calibration scale and can
+    /// mis-estimate marginal bytes/record at the (usually much larger)
+    /// target scale, which made the top-up systematically under-buy and
+    /// approach `target_bytes` asymptotically from below without ever
+    /// crossing it within the round budget. From round 1 onward, each
+    /// round instead refits a *local* slope from the two most recent real
+    /// measurements (`(bytes - bytes_prev) / (records - records_prev)`),
+    /// which tracks the true marginal cost at the actual scale in play;
+    /// round 0 and any round where the local refit comes out non-positive
+    /// or non-finite fall back to `k`. As a second guard against
+    /// stalling — a top-up of only 1-2 records near the target can land
+    /// inside an existing bgzf block with zero or even negative byte
+    /// delta, since deflate's output isn't strictly monotonic in input
+    /// size — any round that made no byte progress at all over the
+    /// previous round floors its own top-up at twice the previous round's.
     ///
     /// Both the initial guess and each round's top-up are split
     /// proportional to each contig's fitted per-contig variant count
@@ -684,19 +705,45 @@ impl BulkSpec {
         let want = (((target_bytes as f64 - b0) / k).ceil() as i64).max(r2 as i64) as u64;
         let mut counts = distribute_by_n_variants(fitted, &self.contig_ids, want);
 
-        // Slope-based correction; converges in 1-2 rounds.
-        const MAX_CORRECTIONS: usize = 4;
+        // Slope-based correction; usually converges in 1-2 rounds, but the
+        // local-refit and no-progress guards below (see the doc comment)
+        // can need a few more at the margin.
+        const MAX_CORRECTIONS: usize = 6;
+        let mut prev: Option<(u64, u64, u64)> = None; // (records, bytes, extra) from the last round
         for _ in 0..MAX_CORRECTIONS {
             let (tmp, bytes, summary) = self.write_to_temp(pool, samplers, fitted, &counts)?;
             if bytes >= target_bytes {
                 return Ok((counts, tmp, bytes, summary));
             }
+            let records: u64 = counts.iter().sum();
+
+            let k_eff = prev
+                .and_then(|(prev_records, prev_bytes, _)| {
+                    let dr = records as f64 - prev_records as f64;
+                    let db = bytes as f64 - prev_bytes as f64;
+                    let cand = db / dr;
+                    (cand.is_finite() && cand > 0.0).then_some(cand)
+                })
+                .unwrap_or(k);
+
             let shortfall = (target_bytes - bytes) as f64;
-            let extra = ((shortfall / k) * 1.02).ceil() as u64 + 1;
+            let mut extra = ((shortfall / k_eff) * 1.02).ceil() as u64 + 1;
+
+            // No-progress guard: a top-up this small can be absorbed into
+            // an existing bgzf block with ~zero byte delta, stalling the
+            // slope estimate forever; force forward progress.
+            if let Some((_, prev_bytes, prev_extra)) = prev {
+                if bytes <= prev_bytes {
+                    extra = extra.max(prev_extra.saturating_mul(2)).max(1);
+                }
+            }
+
             let extra_split = distribute_by_n_variants(fitted, &self.contig_ids, extra);
             for (c, e) in counts.iter_mut().zip(&extra_split) {
                 *c += e;
             }
+            prev = Some((records, bytes, extra));
+
             // `write_to_temp` may have left a `<tmp_path>.csi` companion
             // (Bcf only) that `NamedTempFile`'s `Drop` does not know about;
             // best-effort clean it up, mirroring
