@@ -292,6 +292,11 @@ impl ContigLayout {
     /// Records in block `i` — `block_records`, or the remainder for the
     /// final partial block.
     fn block_len(&self, i: usize) -> u64 {
+        debug_assert!(
+            i < self.n_blocks(),
+            "block index {i} out of range (n_blocks={})",
+            self.n_blocks()
+        );
         let start = (i as u64) * self.block_records;
         self.block_records.min(self.n_records - start)
     }
@@ -670,25 +675,40 @@ impl BulkSpec {
         let block_records = Self::block_records(self.n_samples, self.profile.dialed.ploidy);
         let seed = self.seed;
 
+        // Build each contig's `ContigLayout` skeleton (`block_spans` filled
+        // in below, once the parallel gap-sum pass returns) up front, so
+        // `ContigLayout::block_len` is the single place a block's record
+        // count is computed — not re-derived a second time here to build
+        // the job list. Two independent computations of the same partition
+        // is exactly the silent-divergence mode `BulkError::TooManyBlocks`
+        // exists to prevent.
+        let mut layouts: Vec<ContigLayout> = Vec::with_capacity(counts.len());
         // (contig_idx, local_block, records_in_block), flattened so every
         // block in the run is one parallel work item regardless of which
         // contig it belongs to.
         let mut jobs: Vec<(u64, u64, u64)> = Vec::new();
-        let mut per_contig_blocks: Vec<usize> = Vec::with_capacity(counts.len());
         for (ci, (&n, id)) in counts.iter().zip(&self.contig_ids).enumerate() {
             let n_blocks = n.div_ceil(block_records);
-            if n_blocks >= Self::CONTIG_BLOCK_STRIDE {
+            // `>`, not `>=`: the largest local block index is `n_blocks -
+            // 1`, so `block_idx` collides with the next contig's stream
+            // only once `n_blocks` exceeds `CONTIG_BLOCK_STRIDE` --
+            // `n_blocks == CONTIG_BLOCK_STRIDE` fits exactly.
+            if n_blocks > Self::CONTIG_BLOCK_STRIDE {
                 return Err(BulkError::TooManyBlocks {
                     contig: id.clone(),
                     n_blocks,
                     stride: Self::CONTIG_BLOCK_STRIDE,
                 });
             }
-            per_contig_blocks.push(n_blocks as usize);
-            for lb in 0..n_blocks {
-                let start = lb * block_records;
-                jobs.push((ci as u64, lb, block_records.min(n - start)));
+            let layout = ContigLayout {
+                block_records,
+                n_records: n,
+                block_spans: vec![0; n_blocks as usize],
+            };
+            for lb in 0..layout.n_blocks() {
+                jobs.push((ci as u64, lb as u64, layout.block_len(lb)));
             }
+            layouts.push(layout);
         }
 
         let spans: Vec<u64> = pool.install(|| {
@@ -701,17 +721,15 @@ impl BulkSpec {
                 .collect()
         });
 
-        let mut out = Vec::with_capacity(counts.len());
         let mut at = 0usize;
-        for (&n, &n_blocks) in counts.iter().zip(&per_contig_blocks) {
-            out.push(ContigLayout {
-                block_records,
-                n_records: n,
-                block_spans: spans[at..at + n_blocks].to_vec(),
-            });
+        for layout in &mut layouts {
+            let n_blocks = layout.n_blocks();
+            layout
+                .block_spans
+                .copy_from_slice(&spans[at..at + n_blocks]);
             at += n_blocks;
         }
-        Ok(out)
+        Ok(layouts)
     }
 
     /// Generates one contig's records.
@@ -1459,7 +1477,13 @@ mod tests {
             BulkError::PerContigUnknown(vec!["1".into()]),
             BulkError::TooManyBlocks {
                 contig: "chr1".into(),
-                n_blocks: 1_000_000,
+                // Not `stride` itself: `n_blocks == stride` fits exactly
+                // (see the `>` check in `compute_layouts`) and would render
+                // the nonsensical "needs 1000000 blocks, which exceeds the
+                // 1000000-block stride". One past it is the smallest value
+                // that actually triggers the error, so it's what the
+                // message under test should read.
+                n_blocks: 1_000_001,
                 stride: 1_000_000,
             },
         ] {
@@ -1500,5 +1524,46 @@ mod tests {
         assert_eq!(BulkSpec::block_records(32_000, 2), 62);
         // Never zero, however wide.
         assert_eq!(BulkSpec::block_records(100_000_000, 2), 1);
+    }
+
+    #[test]
+    fn contig_layout_arithmetic_matches_block_records_and_offsets() {
+        // `n_records == 0`: no blocks at all, and nothing to sum or offset.
+        let empty = ContigLayout {
+            block_records: 100,
+            n_records: 0,
+            block_spans: vec![],
+        };
+        assert_eq!(empty.n_blocks(), 0);
+        assert_eq!(empty.span(), 0);
+        assert_eq!(empty.offsets(), Vec::<u64>::new());
+
+        // Exact multiple of `block_records`: every block, including the
+        // last, is full-width -- no partial tail to get wrong.
+        let exact = ContigLayout {
+            block_records: 100,
+            n_records: 300,
+            block_spans: vec![1_000, 2_000, 3_000],
+        };
+        assert_eq!(exact.n_blocks(), 3);
+        assert_eq!(exact.block_len(0), 100);
+        assert_eq!(exact.block_len(1), 100);
+        assert_eq!(exact.block_len(2), 100);
+        assert_eq!(exact.span(), 6_000);
+        assert_eq!(exact.offsets(), vec![0, 1_000, 3_000]);
+
+        // Partial tail: 250 records at 100/block is 100, 100, 50 -- the
+        // case `block_len`'s `.min(n_records - start)` exists for.
+        let partial = ContigLayout {
+            block_records: 100,
+            n_records: 250,
+            block_spans: vec![500, 700, 300],
+        };
+        assert_eq!(partial.n_blocks(), 3);
+        assert_eq!(partial.block_len(0), 100);
+        assert_eq!(partial.block_len(1), 100);
+        assert_eq!(partial.block_len(2), 50);
+        assert_eq!(partial.span(), 1_500);
+        assert_eq!(partial.offsets(), vec![0, 500, 1_200]);
     }
 }

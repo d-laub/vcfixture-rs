@@ -57,8 +57,10 @@ fn same_seed_gives_byte_identical_output_across_thread_counts() {
     // own stale copy instead of the source of truth. Block size is now
     // computed from cohort width rather than constant, so the guard passes
     // `SAMPLES` (the same constant `spec()` builds with) and ploidy 2 (the
-    // placeholder profile's dialed ploidy) rather than reading a bare
-    // constant. See `src/bulk/writer.rs`'s
+    // germline-1kgp profile's dialed ploidy -- a real fitted profile, not a
+    // placeholder; see `germline_profile_is_really_fitted_not_placeholder`
+    // in `src/bulk/profile.rs`) rather than reading a bare constant. See
+    // `src/bulk/writer.rs`'s
     // `output_is_byte_identical_regardless_of_worker_count` for the same
     // idiom applied to the writer's own compression layer.
     const RECORDS_PER_CONTIG: u64 = 2_500;
@@ -843,7 +845,27 @@ fn layout_span_equals_the_realized_max_position() {
     // a divergence would silently declare a wrong ##contig length. Check
     // the declared length against what was actually written, across seeds,
     // cohort widths, and record counts.
-    for (seed, samples, records) in [(1u64, 2usize, 50u64), (7, 37, 900), (99, 300, 120)] {
+    //
+    // Every case here is sized to at least 3 blocks per contig at
+    // `BulkSpec::block_records(samples, 2)` (500 records/block at these
+    // cohort widths) -- with only 1 block per contig, every block's
+    // absolute offset is 0 and this assertion degenerates into a pure
+    // identity that cannot catch anything. `(1, 2, 1500)` and `(99, 300,
+    // 2000)` land on an exact multiple of 500 (every block, including the
+    // last, is full-width); `(7, 37, 1300)` leaves a partial final block
+    // (500, 500, 300) -- both shapes are covered because `ContigLayout::
+    // block_len`'s `.min(n_records - start)` only has anything to clamp on
+    // the partial-tail case.
+    //
+    // This is still only a max-position check on the currently-active
+    // `generate_contig`/`contig_span` write path, which computes the header
+    // length from the very same records it writes -- so it cannot catch
+    // drift between the write path and a *different* pass that computes
+    // spans some other way. That stronger cross-check (declared length from
+    // `ContigLayout::span()`, computed by the gap-only pass, against the
+    // realized max position from the write pass that regenerates the same
+    // stream) arrives once the block pipeline replaces this write path.
+    for (seed, samples, records) in [(1u64, 2usize, 1500u64), (7, 37, 1300), (99, 300, 2000)] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.bcf");
         let summary = BulkSpec::new(Profile::builtin("germline-1kgp").unwrap())
@@ -874,10 +896,32 @@ fn layout_span_equals_the_realized_max_position() {
 }
 
 #[test]
-fn positions_do_not_depend_on_cohort_width_or_payload() {
-    // The whole point of the position/content stream split: the same
-    // (seed, contig, n_records) must lay out the same positions no matter
-    // how wide the cohort is or which payload is written.
+fn positions_do_not_depend_on_payload_and_are_stable_across_widths_sharing_a_block_size() {
+    // Positions are independent of payload unconditionally: `Payload` only
+    // selects which FORMAT keys `to_record_buf` renders, and never touches
+    // `Stream::Position`'s gap draws, which come from `Samplers::gap` alone.
+    //
+    // Positions are NOT independent of cohort width in general. Cell-based
+    // block sizing (`BulkSpec::block_records`) deliberately makes block
+    // boundaries a function of `n_samples` once a cohort is wide enough to
+    // shrink below `MAX_BLOCK_RECORDS` (diploid, over ~4,000 samples) --
+    // each block reseeds its `Stream::Position` RNG from `block_idx` alone,
+    // so a different partition draws a different sequence and DOES move
+    // positions. This test can only compare cohort widths that happen to
+    // land on the same `block_records`, which the assertion below checks
+    // and documents explicitly rather than relying on it silently.
+    assert_eq!(
+        BulkSpec::block_records(2, 2),
+        BulkSpec::block_records(64, 2),
+        "this test compares cohort widths 2 and 64 only because they \
+         currently share a block size (both saturate MAX_BLOCK_RECORDS at \
+         these small cell counts); if TARGET_CELLS_PER_BLOCK or \
+         MAX_BLOCK_RECORDS ever change so these two widths land in \
+         different block sizes, the width comparison below stops being \
+         valid and this must fail loudly here rather than silently \
+         comparing incomparable partitions"
+    );
+
     fn positions(samples: usize, payload: Payload) -> Vec<u64> {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.bcf");
@@ -904,7 +948,7 @@ fn positions_do_not_depend_on_cohort_width_or_payload() {
     assert_eq!(
         a,
         positions(64, Payload::GtOnly),
-        "cohort width moved positions"
+        "cohort width moved positions, despite both widths sharing a block size"
     );
     assert_eq!(a, positions(2, Payload::Gatk), "payload moved positions");
 }
