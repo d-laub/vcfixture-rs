@@ -4,9 +4,17 @@ use std::collections::BTreeMap;
 use std::num::NonZero;
 use vcfixture::bulk::{BulkError, BulkSpec, Format, Payload, Profile, Size};
 
+/// Single source of truth for the cohort width `spec()` builds with. Read by
+/// `same_seed_gives_byte_identical_output_across_thread_counts`'s vacuity
+/// guard via `BulkSpec::block_records(SAMPLES, 2)` -- a mirrored literal
+/// there has already silently regressed that guard twice (see its doc
+/// comment), so the guard must derive from this constant instead of
+/// repeating it.
+const SAMPLES: usize = 8;
+
 fn spec() -> BulkSpec {
     BulkSpec::new(Profile::builtin("germline-1kgp").unwrap())
-        .samples(8)
+        .samples(SAMPLES)
         .contigs(["chr1", "chr2", "chr3"])
         .payload(Payload::GtOnly)
         .seed(42)
@@ -28,8 +36,9 @@ fn records_per_contig_is_exact() {
 
 #[test]
 fn same_seed_gives_byte_identical_output_across_thread_counts() {
-    // `BulkSpec::BLOCK_SIZE` (`src/bulk/mod.rs`) is currently 500 records —
-    // the granularity at which `generate_contig`'s rayon `into_par_iter` has
+    // `BulkSpec::block_records(SAMPLES, 2)` (`src/bulk/mod.rs`) is currently
+    // 500 records at this cohort width (8 samples, ploidy 2) — the
+    // granularity at which `generate_contig`'s rayon `into_par_iter` has
     // anything to reorder. At `RecordsPerContig(50)` (the value this test
     // used before this fix), `50.div_ceil(500) == 1` block per contig: there
     // is nothing for rayon to reorder, so both parallel paths (this crate's
@@ -40,18 +49,22 @@ fn same_seed_gives_byte_identical_output_across_thread_counts() {
     // and the assertions further down pin both dimensions of scale down so
     // a future edit can't silently shrink this test back into vacuity.
     //
-    // This guard reads `BulkSpec::BLOCK_SIZE` directly rather than mirroring
-    // its value as a local literal: a mirrored literal would silently stop
-    // catching a vacuous test the moment the real constant changed (it
-    // already regressed twice in this branch), since the guard would keep
-    // comparing against its own stale copy instead of the source of truth.
-    // See `src/bulk/writer.rs`'s `output_is_byte_identical_regardless_of_
-    // worker_count` for the same idiom applied to the writer's own
-    // compression layer.
+    // This guard reads `BulkSpec::block_records` directly rather than
+    // mirroring its value as a local literal: a mirrored literal would
+    // silently stop catching a vacuous test the moment the real sizing
+    // changed (it already regressed twice in this branch when the value was
+    // a flat constant), since the guard would keep comparing against its
+    // own stale copy instead of the source of truth. Block size is now
+    // computed from cohort width rather than constant, so the guard passes
+    // `SAMPLES` (the same constant `spec()` builds with) and ploidy 2 (the
+    // placeholder profile's dialed ploidy) rather than reading a bare
+    // constant. See `src/bulk/writer.rs`'s
+    // `output_is_byte_identical_regardless_of_worker_count` for the same
+    // idiom applied to the writer's own compression layer.
     const RECORDS_PER_CONTIG: u64 = 2_500;
     const MAX_BUF_SIZE: u64 = 65_498; // bgzf's uncompressed staging buffer size
 
-    let blocks_per_contig = RECORDS_PER_CONTIG.div_ceil(BulkSpec::BLOCK_SIZE);
+    let blocks_per_contig = RECORDS_PER_CONTIG.div_ceil(BulkSpec::block_records(SAMPLES, 2));
     assert!(
         blocks_per_contig > 1,
         "test is vacuous: {RECORDS_PER_CONTIG} records/contig gives only \
@@ -822,4 +835,76 @@ fn empty_spec_dimensions_are_rejected_as_spec_errors() {
             "a spec error must not blame the profile, got: {msg}"
         );
     }
+}
+
+#[test]
+fn layout_span_equals_the_realized_max_position() {
+    // Spans are now computed by a pass that never generates genotypes, so
+    // a divergence would silently declare a wrong ##contig length. Check
+    // the declared length against what was actually written, across seeds,
+    // cohort widths, and record counts.
+    for (seed, samples, records) in [(1u64, 2usize, 50u64), (7, 37, 900), (99, 300, 120)] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.bcf");
+        let summary = BulkSpec::new(Profile::builtin("germline-1kgp").unwrap())
+            .samples(samples)
+            .contigs(["chr1", "chr2"])
+            .size(Size::RecordsPerContig(records))
+            .payload(Payload::GtOnly)
+            .seed(seed)
+            .workers(NonZero::new(3).unwrap())
+            .write(&path)
+            .unwrap();
+
+        let mut r = noodles_bcf::io::reader::Builder::default()
+            .build_from_path(&path)
+            .unwrap();
+        let header = r.read_header().unwrap();
+
+        for (id, contig) in header.contigs() {
+            let declared = contig.length().expect("contig length is declared") as u64;
+            let observed = summary.per_contig[id.as_str()].pos_max;
+            assert_eq!(
+                declared, observed,
+                "declared length must equal the realized max position \
+                 (seed={seed}, samples={samples}, records={records}, contig={id})"
+            );
+        }
+    }
+}
+
+#[test]
+fn positions_do_not_depend_on_cohort_width_or_payload() {
+    // The whole point of the position/content stream split: the same
+    // (seed, contig, n_records) must lay out the same positions no matter
+    // how wide the cohort is or which payload is written.
+    fn positions(samples: usize, payload: Payload) -> Vec<u64> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.bcf");
+        BulkSpec::new(Profile::builtin("germline-1kgp").unwrap())
+            .samples(samples)
+            .contigs(["chr1"])
+            .size(Size::RecordsPerContig(300))
+            .payload(payload)
+            .seed(5)
+            .workers(NonZero::new(2).unwrap())
+            .write(&path)
+            .unwrap();
+
+        let mut r = noodles_bcf::io::reader::Builder::default()
+            .build_from_path(&path)
+            .unwrap();
+        let _ = r.read_header().unwrap();
+        r.records()
+            .map(|rec| usize::from(rec.unwrap().variant_start().unwrap().unwrap()) as u64)
+            .collect()
+    }
+
+    let a = positions(2, Payload::GtOnly);
+    assert_eq!(
+        a,
+        positions(64, Payload::GtOnly),
+        "cohort width moved positions"
+    );
+    assert_eq!(a, positions(2, Payload::Gatk), "payload moved positions");
 }

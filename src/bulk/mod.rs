@@ -132,6 +132,21 @@ pub enum BulkError {
          normalization"
     )]
     PerContigUnknown(Vec<String>),
+    /// A contig needs more blocks than `CONTIG_BLOCK_STRIDE` reserves,
+    /// which would make its block indices collide with the next contig's
+    /// and silently reuse that contig's PRNG streams. Smaller blocks (wide
+    /// cohorts) bring this within reach, so it is checked rather than
+    /// documented as unreachable.
+    #[error(
+        "contig {contig:?} needs {n_blocks} blocks, which exceeds the \
+         {stride}-block stride reserved per contig; reduce its record count \
+         or widen CONTIG_BLOCK_STRIDE"
+    )]
+    TooManyBlocks {
+        contig: String,
+        n_blocks: u64,
+        stride: u64,
+    },
 
     // --- argument parsing -------------------------------------------------
     #[error("bad size: {0:?} (expected a byte count, optionally suffixed KB/MB/GB)")]
@@ -241,10 +256,65 @@ struct Rec {
     phased: bool,
 }
 
-/// Records generated for one block (`BulkSpec::BLOCK_SIZE` records, or fewer
-/// for a contig's final partial block), with positions still relative to
-/// the block's own start (see [`BulkSpec::generate_contig`]).
+/// Records generated for one block (`BulkSpec::MAX_BLOCK_RECORDS` records,
+/// or fewer for a contig's final partial block), with positions still
+/// relative to the block's own start (see [`BulkSpec::generate_contig`]).
+// TODO(#22 task 6): deleted along with `generate_contig` and `contig_span`
+// once the block pipeline replaces the regenerate-twice structure.
 type BlockOutput = (Vec<Rec>, u64);
+
+/// How one contig decomposes into blocks, and how long each block's slice
+/// of the contig is.
+///
+/// `block_spans[i]` is the sum of block `i`'s gap draws — computed by a
+/// pass that draws from [`Stream::Position`] only, never generating a
+/// genotype (issue #22). The contig's populated span is their sum, and
+/// block `i`'s absolute position offset is their exclusive prefix sum, so
+/// one `Vec<u64>` carries everything the write pass needs.
+// `#[allow(dead_code)]`: nothing calls `ContigLayout` or `compute_layouts`
+// yet -- the block-pipeline task (#22 task 6) wires them into `write` and
+// removes this allow.
+#[allow(dead_code)]
+pub(crate) struct ContigLayout {
+    /// Records per block for this run (constant except for the final
+    /// partial block).
+    block_records: u64,
+    n_records: u64,
+    block_spans: Vec<u64>,
+}
+
+#[allow(dead_code)]
+impl ContigLayout {
+    fn n_blocks(&self) -> usize {
+        self.block_spans.len()
+    }
+
+    /// Records in block `i` — `block_records`, or the remainder for the
+    /// final partial block.
+    fn block_len(&self, i: usize) -> u64 {
+        let start = (i as u64) * self.block_records;
+        self.block_records.min(self.n_records - start)
+    }
+
+    /// The contig's populated span (its last record's position).
+    fn span(&self) -> u64 {
+        self.block_spans.iter().sum()
+    }
+
+    /// Absolute position offset for each block: the exclusive prefix sum of
+    /// block spans.
+    fn offsets(&self) -> Vec<u64> {
+        let mut acc = 0u64;
+        self.block_spans
+            .iter()
+            .map(|&s| {
+                let o = acc;
+                acc += s;
+                o
+            })
+            .collect()
+    }
+}
 
 /// A builder for one bulk-generation run: samples, contigs, size, payload,
 /// seed, output format, and worker count, ending in [`BulkSpec::write`].
@@ -281,30 +351,55 @@ pub struct BulkSpec {
 }
 
 impl BulkSpec {
-    /// Records generated per parallel unit of work ("block"). A block's RNG
-    /// stream is a pure function of `(seed, block_idx, stream)` via
-    /// [`block_rng`], so this is also the granularity at which thread-count
-    /// independence is achieved: rayon may compute blocks on any thread in
-    /// any order, but [`Vec::from_par_iter`]/`.collect()` always assembles
-    /// the results back in index order.
+    /// Upper bound on records per block. Below this, block size is set by
+    /// cells (see [`BulkSpec::block_records`]).
     // `pub` (not just `pub(crate)`) so that `tests/bulk.rs` -- a separate
     // crate compiled against the public API -- can reference the real
     // constant instead of mirroring its value as a literal, which has
-    // already silently regressed this determinism test's vacuity guard
-    // twice in this branch (see `same_seed_gives_byte_identical_output_
-    // across_thread_counts` in `tests/bulk.rs`). `#[doc(hidden)]` keeps it
-    // out of rendered docs since it's an implementation detail, not part of
-    // the intended public interface.
+    // already silently regressed a determinism test's vacuity guard twice.
+    // `#[doc(hidden)]` keeps it out of rendered docs.
     #[doc(hidden)]
-    pub const BLOCK_SIZE: u64 = 500;
+    pub const MAX_BLOCK_RECORDS: u64 = 500;
+
+    /// Target genotype cells per block. A block holds its records' full
+    /// genotype vectors plus their encoded bytes, so its memory scales with
+    /// `records * n_samples * ploidy`, not with records alone — a flat 500
+    /// records is ~32 MB of genotypes at 32,000 samples, and the pipeline
+    /// keeps `2 * workers` blocks in flight. 4M cells is ~4 MB of encoded
+    /// gt-only output per block, which bounds in-flight memory at a few
+    /// hundred MB on a 48-core run while leaving each block far more work
+    /// than its per-block overhead (one buffer rewind, two RNG inits).
+    const TARGET_CELLS_PER_BLOCK: u64 = 4_000_000;
+
+    /// Records per parallel unit of work ("block"), sized so a block holds
+    /// about [`BulkSpec::TARGET_CELLS_PER_BLOCK`] genotype cells, capped at
+    /// [`BulkSpec::MAX_BLOCK_RECORDS`] and never below 1.
+    ///
+    /// A block's RNG streams are a pure function of
+    /// `(seed, block_idx, stream)`, so this is also the granularity at
+    /// which thread-count independence is achieved: rayon may compute
+    /// blocks on any thread in any order, but `.collect()` assembles them
+    /// back in index order. Block boundaries depend on `n_samples`,
+    /// `ploidy`, and the record count — deliberately never on `workers`,
+    /// which is what keeps output independent of thread count.
+    #[doc(hidden)]
+    pub fn block_records(n_samples: usize, ploidy: u8) -> u64 {
+        let cells = (n_samples as u64)
+            .saturating_mul(ploidy.max(1) as u64)
+            .max(1);
+        (Self::TARGET_CELLS_PER_BLOCK / cells).clamp(1, Self::MAX_BLOCK_RECORDS)
+    }
 
     /// `block_idx` is derived as `contig_idx * CONTIG_BLOCK_STRIDE +
     /// local_block`, so a contig's stream never depends on how many
-    /// contigs precede it. At `BLOCK_SIZE` records per block this allows up
-    /// to `CONTIG_BLOCK_STRIDE * BLOCK_SIZE` (500 billion) records per
-    /// contig before colliding with the next contig's block-index space —
-    /// far beyond any realistic run (a 100 MB benchmark BCF is ~265k
-    /// records total).
+    /// contigs precede it. At `MAX_BLOCK_RECORDS` records per block this
+    /// allows up to `CONTIG_BLOCK_STRIDE * MAX_BLOCK_RECORDS` (500 billion)
+    /// records per contig before colliding with the next contig's
+    /// block-index space — far beyond any realistic run (a 100 MB benchmark
+    /// BCF is ~265k records total). [`BulkSpec::compute_layouts`] checks
+    /// this bound explicitly rather than leaving it merely documented,
+    /// since a wide cohort's smaller [`BulkSpec::block_records`] brings a
+    /// pathologically large single-contig request within reach.
     const CONTIG_BLOCK_STRIDE: u64 = 1_000_000;
 
     /// Builds a spec from a profile, with defaults matching a small smoke
@@ -547,11 +642,83 @@ impl BulkSpec {
         hb.build()
     }
 
+    /// Computes every contig's [`ContigLayout`] in one flat parallel pass
+    /// that draws **only** gaps.
+    ///
+    /// This is the fix for issue #22's Finding 1. Contig lengths must be
+    /// known before the header is written, and the header must precede any
+    /// record; the old structure got them by generating every contig in
+    /// full and keeping one `u64`, which meant every genotype in the file
+    /// was drawn twice. Because positions now come from
+    /// [`Stream::Position`] (see [`block_rng`]), the same numbers fall out
+    /// of `O(total_records)` gap draws with no per-sample work at all.
+    // `#[allow(dead_code)]`: not called yet -- the block-pipeline task (#22
+    // task 6) wires this into `write` and removes this allow.
+    #[allow(dead_code)]
+    fn compute_layouts(
+        &self,
+        pool: &rayon::ThreadPool,
+        samplers: &Samplers,
+        _fitted: &Fitted,
+        counts: &[u64],
+    ) -> Result<Vec<ContigLayout>, BulkError> {
+        // Ploidy lives on `self.profile.dialed`, not `Fitted` -- the brief's
+        // sketch of this signature named `fitted.ploidy`, which does not
+        // exist on `Fitted` (see `src/bulk/profile.rs`); `fitted` is kept as
+        // a parameter to match the brief's interface and `generate_contig`'s
+        // sibling signature, but ploidy is read from `self` instead.
+        let block_records = Self::block_records(self.n_samples, self.profile.dialed.ploidy);
+        let seed = self.seed;
+
+        // (contig_idx, local_block, records_in_block), flattened so every
+        // block in the run is one parallel work item regardless of which
+        // contig it belongs to.
+        let mut jobs: Vec<(u64, u64, u64)> = Vec::new();
+        let mut per_contig_blocks: Vec<usize> = Vec::with_capacity(counts.len());
+        for (ci, (&n, id)) in counts.iter().zip(&self.contig_ids).enumerate() {
+            let n_blocks = n.div_ceil(block_records);
+            if n_blocks >= Self::CONTIG_BLOCK_STRIDE {
+                return Err(BulkError::TooManyBlocks {
+                    contig: id.clone(),
+                    n_blocks,
+                    stride: Self::CONTIG_BLOCK_STRIDE,
+                });
+            }
+            per_contig_blocks.push(n_blocks as usize);
+            for lb in 0..n_blocks {
+                let start = lb * block_records;
+                jobs.push((ci as u64, lb, block_records.min(n - start)));
+            }
+        }
+
+        let spans: Vec<u64> = pool.install(|| {
+            jobs.par_iter()
+                .map(|&(ci, lb, count)| {
+                    let block_idx = ci * Self::CONTIG_BLOCK_STRIDE + lb;
+                    let mut rng = block_rng(seed, block_idx, Stream::Position);
+                    (0..count).map(|_| samplers.gap(&mut rng)).sum()
+                })
+                .collect()
+        });
+
+        let mut out = Vec::with_capacity(counts.len());
+        let mut at = 0usize;
+        for (&n, &n_blocks) in counts.iter().zip(&per_contig_blocks) {
+            out.push(ContigLayout {
+                block_records,
+                n_records: n,
+                block_spans: spans[at..at + n_blocks].to_vec(),
+            });
+            at += n_blocks;
+        }
+        Ok(out)
+    }
+
     /// Generates one contig's records.
     ///
-    /// Parallelizes across `Self::BLOCK_SIZE`-record blocks with rayon
-    /// (`into_par_iter` over block indices, each seeded independently via
-    /// [`block_rng`]), then reassembles them in index order — this, not
+    /// Parallelizes across `Self::MAX_BLOCK_RECORDS`-record blocks with
+    /// rayon (`into_par_iter` over block indices, each seeded independently
+    /// via [`block_rng`]), then reassembles them in index order — this, not
     /// anything about `pool`'s thread count, is what makes output
     /// thread-count independent: `.collect()` on a rayon parallel iterator
     /// always preserves index order regardless of which thread computed
@@ -588,7 +755,12 @@ impl BulkSpec {
         let ploidy = self.profile.dialed.ploidy;
         let n_samples = self.n_samples;
         let seed = self.seed;
-        let n_blocks = n_records.div_ceil(Self::BLOCK_SIZE);
+        // Flat `MAX_BLOCK_RECORDS`, not cell-sized `Self::block_records`:
+        // `generate_contig` is deleted in #22 task 6 once the block
+        // pipeline replaces this regenerate-twice structure, so it keeps
+        // its pre-task-5 sizing (previously the `BLOCK_SIZE` constant, same
+        // value) rather than adopting cell-based sizing here too.
+        let n_blocks = n_records.div_ceil(Self::MAX_BLOCK_RECORDS);
 
         let blocks: Vec<BlockOutput> = pool.install(|| {
             (0..n_blocks)
@@ -597,8 +769,8 @@ impl BulkSpec {
                     let block_idx = contig_idx * Self::CONTIG_BLOCK_STRIDE + local_block;
                     let mut pos_rng = block_rng(seed, block_idx, Stream::Position);
                     let mut rng = block_rng(seed, block_idx, Stream::Content);
-                    let start = local_block * Self::BLOCK_SIZE;
-                    let count = Self::BLOCK_SIZE.min(n_records - start);
+                    let start = local_block * Self::MAX_BLOCK_RECORDS;
+                    let count = Self::MAX_BLOCK_RECORDS.min(n_records - start);
 
                     let mut local_pos = 0u64;
                     let mut recs = Vec::with_capacity(count as usize);
@@ -1285,6 +1457,11 @@ mod tests {
             BulkError::BadRecordsFor("expected NAME=COUNT in --records-for, got \"x\"".into()),
             BulkError::PerContigMissing(vec!["chr2".into()]),
             BulkError::PerContigUnknown(vec!["1".into()]),
+            BulkError::TooManyBlocks {
+                contig: "chr1".into(),
+                n_blocks: 1_000_000,
+                stride: 1_000_000,
+            },
         ] {
             let msg = e.to_string();
             assert!(
@@ -1309,5 +1486,19 @@ mod tests {
             .to_string(),
             "could not reach target size 1024 bytes within 4 corrective rounds"
         );
+    }
+
+    #[test]
+    fn block_records_is_bounded_by_cells_and_by_the_record_cap() {
+        // Narrow cohorts saturate at the record cap.
+        assert_eq!(BulkSpec::block_records(1, 2), BulkSpec::MAX_BLOCK_RECORDS);
+        assert_eq!(
+            BulkSpec::block_records(4_000, 2),
+            BulkSpec::MAX_BLOCK_RECORDS
+        );
+        // Wide cohorts are bounded by cells: 4e6 / (32000*2) = 62.
+        assert_eq!(BulkSpec::block_records(32_000, 2), 62);
+        // Never zero, however wide.
+        assert_eq!(BulkSpec::block_records(100_000_000, 2), 1);
     }
 }
