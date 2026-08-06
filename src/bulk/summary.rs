@@ -349,11 +349,37 @@ mod tests {
     }
 
     #[test]
+    fn class_index_and_class_by_index_round_trip() {
+        for i in 0..N_VARIANT_CLASSES {
+            assert_eq!(class_index(class_by_index(i)), i);
+        }
+    }
+
+    #[test]
     fn serializes_to_json() {
         let mut s = Summary::new(1);
         s.merge_block("chr1", &block(&[(1, VariantClass::Snp, &[0, 1])]));
         let j = s.to_json().unwrap();
-        assert!(j.contains("\"n_samples\""));
-        assert!(j.contains("\"genotype_checksum\""));
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+
+        let obj = v.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "class_counts",
+                "genotype_checksum",
+                "n_alleles_nonref",
+                "n_alleles_total",
+                "n_samples",
+                "per_contig",
+            ]
+        );
+
+        let contig = v["per_contig"]["chr1"].as_object().unwrap();
+        let mut contig_keys: Vec<&str> = contig.keys().map(String::as_str).collect();
+        contig_keys.sort_unstable();
+        assert_eq!(contig_keys, vec!["n_records", "pos_max", "pos_min"]);
     }
 }
