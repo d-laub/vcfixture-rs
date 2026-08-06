@@ -660,9 +660,10 @@ impl BulkSpec {
         // in below, once the parallel gap-sum pass returns) up front, so
         // `ContigLayout::block_len` is the single place a block's record
         // count is computed — not re-derived a second time here to build
-        // the job list. Two independent computations of the same partition
-        // is exactly the silent-divergence mode `BulkError::TooManyBlocks`
-        // exists to prevent.
+        // the job list. `BulkError::TooManyBlocks` guards a different
+        // hazard: a contig with more blocks than `CONTIG_BLOCK_STRIDE`
+        // reserves would have its block indices collide with the next
+        // contig's PRNG stream space (see the `>` check just below).
         let mut layouts: Vec<ContigLayout> = Vec::with_capacity(counts.len());
         // (contig_idx, local_block, records_in_block), flattened so every
         // block in the run is one parallel work item regardless of which
@@ -942,7 +943,7 @@ impl BulkSpec {
             // slope estimate forever; force forward progress.
             if let Some((_, prev_bytes, prev_extra)) = prev {
                 if bytes <= prev_bytes {
-                    extra = extra.max(prev_extra.saturating_mul(2)).max(1);
+                    extra = extra.max(prev_extra.saturating_mul(2));
                 }
             }
 

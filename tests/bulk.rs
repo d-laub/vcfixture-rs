@@ -174,10 +174,13 @@ fn declared_contig_length_equals_populated_span() {
 
 #[test]
 fn target_size_lands_near_the_target() {
-    // `Size::Target`'s overshoot is a *proportional* margin (the 15% top-up
-    // margin in `BulkSpec::resolve_target_counts`, observed on the order of
-    // ~9.4% in practice -- a 4 MB target overshot by +377,520 bytes, i.e.
-    // ~9.0%), not a fixed byte budget. An absolute cap (e.g. `target + 256
+    // `Size::Target`'s overshoot is a *proportional* margin, not a fixed
+    // byte budget: each corrective round in `BulkSpec::resolve_target_counts`
+    // refits a local slope `k_eff` from the last two rounds' actual
+    // records/bytes, tops up by `shortfall / k_eff` plus a 2% margin, and
+    // doubles the top-up on a round that made no byte progress. Observed on
+    // the order of ~9.4% in practice -- a 4 MB target overshot by +377,520
+    // bytes, i.e. ~9.0%. An absolute cap (e.g. `target + 256
     // KiB`) only looks like it bounds the real behavior at whatever target
     // size makes the two coincide -- 256 KiB happens to be 50% of the 512
     // KiB target this test used to use, which is why that version of this

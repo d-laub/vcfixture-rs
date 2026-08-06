@@ -43,7 +43,7 @@ fn class_name(c: VariantClass) -> &'static str {
 /// Number of [`VariantClass`] variants. A fixed-size array indexed by class
 /// replaces a `BTreeMap<String, u64>` probed by name once per record, so a
 /// block's class counts cost no allocation and merge by elementwise add.
-pub const N_VARIANT_CLASSES: usize = 6;
+pub(crate) const N_VARIANT_CLASSES: usize = 6;
 
 fn class_index(c: VariantClass) -> usize {
     match c {
@@ -74,15 +74,15 @@ fn class_by_index(i: usize) -> VariantClass {
 /// per-record fold runs in the fan-out, not on the serial writer thread),
 /// then merged in O(1) by [`Summary::merge_block`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockSummary {
-    pub n_records: u64,
-    pub pos_min: u64,
-    pub pos_max: u64,
-    pub n_alleles_total: u64,
-    pub n_alleles_nonref: u64,
-    pub class_counts: [u64; N_VARIANT_CLASSES],
+pub(crate) struct BlockSummary {
+    pub(crate) n_records: u64,
+    pub(crate) pos_min: u64,
+    pub(crate) pos_max: u64,
+    pub(crate) n_alleles_total: u64,
+    pub(crate) n_alleles_nonref: u64,
+    pub(crate) class_counts: [u64; N_VARIANT_CLASSES],
     /// FNV-1a over this block's allele bytes, in record-then-slot order.
-    pub checksum: u64,
+    pub(crate) checksum: u64,
 }
 
 impl Default for BlockSummary {
@@ -92,7 +92,7 @@ impl Default for BlockSummary {
 }
 
 impl BlockSummary {
-    pub fn new() -> BlockSummary {
+    pub(crate) fn new() -> BlockSummary {
         BlockSummary {
             n_records: 0,
             // `pos_min` starts at the maximum so the first `min` wins; an
@@ -109,7 +109,7 @@ impl BlockSummary {
 
     /// Fold one record's genotypes into this block. `O(gts.len())`, no
     /// allocation.
-    pub fn observe(&mut self, pos: u64, class: VariantClass, gts: &[i8]) {
+    pub(crate) fn observe(&mut self, pos: u64, class: VariantClass, gts: &[i8]) {
         self.n_records += 1;
         self.pos_min = self.pos_min.min(pos);
         self.pos_max = self.pos_max.max(pos);
@@ -148,7 +148,7 @@ impl Summary {
     /// independent of worker count and of how many blocks are in flight
     /// (block boundaries depend only on record count and cohort width,
     /// never on `workers`).
-    pub fn merge_block(&mut self, chrom: &str, b: &BlockSummary) {
+    pub(crate) fn merge_block(&mut self, chrom: &str, b: &BlockSummary) {
         // An empty block must not perturb the checksum: folding its
         // untouched `FNV_OFFSET` would make the result depend on how many
         // empty blocks happened to exist.
