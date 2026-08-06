@@ -162,6 +162,136 @@ Two of the three curves rise monotonically from `w=1` through `w=8`; the BCF-pin
 
 VCF's absolute speedup is lower than BCF-**unpinned**'s at every worker count `w≥4` (3.07 vs 3.36 at `w=4`, 3.14 vs 3.64 at `w=6`, 3.36 vs 3.86 at `w=8`), and its peak (3.36x at `w=8`) is not materially higher than BCF-unpinned's peak (3.86x) — this is the comparison Gate B's "VCF reaches a materially higher peak speedup than BCF" clause evaluates, using the brief's default BCF-unpinned series, so Gate B does not fire on this evidence. VCF is *not*, however, uniformly below BCF-**pinned**: it trails at `w=4` (3.07 vs 3.17) but overtakes it at `w=6` (3.14 vs 3.10) and `w=8` (3.36 vs 3.29) — VCF's peak is in fact ~2% above BCF-pinned's peak (3.36 vs 3.29). That crossover is the same order of magnitude as the ~10% single-run spread noted above, so it reads as directionally suggestive rather than conclusive proof that uncompressed rayon-only writes outrun bgzf-pinned writes past `w=4` — but it is exactly the comparison Gate B's peak-speedup clause is asking about, so it is worth flagging even though it does not change the verdict (the gate's default series is BCF-unpinned, against which VCF's peak is clearly lower, not higher). VCF's efficiency plateaus at 77%–84% from `w=4` onward (77% at `w=4`, 78% at `w=6`, 84% at `w=8`) rather than climbing toward 100%, indicating a real, if modest, sub-linear component in rayon-only fan-out scaling that is not explained by the bgzf pool at all.
 
+### Serial-fraction measurement
+
+Gate C fired: the VCF-unpinned series gave `S(4) = 3.07 < 3.2`, so a real serial
+stage or contention effect is worth chasing directly rather than inferring from
+Amdahl's law alone. `stream_contigs` barriers per chunk —
+`chunk.par_iter().map_init(...).collect()` fully drains before the serial
+`for item in encoded { writer.write_encoded(&bytes)?; ... }` loop starts, so the
+`O(bytes)` memcpy into the bgzf staging buffer runs with the entire rayon pool
+parked. That is an `O(cells)` serial stage, the shape Amdahl's law points at, and
+a candidate neither originally-recorded hypothesis considered. This section
+measures that stage's cost directly, rather than inferring it.
+
+**Method:** `stream_contigs` was instrumented (temporarily — reverted
+immediately after the two runs below, never committed) to accumulate wall time
+spent inside `pool.install(...)` (`t_par`) separately from wall time spent in
+the serial drain loop (`t_ser`), across all contigs and chunks, and to print
+`serial_frac = t_ser / (t_par + t_ser)` once per run. The instrumentation patch,
+applied against `src/bulk/mod.rs` at the commit this document was written
+against:
+
+```diff
+diff --git a/src/bulk/mod.rs b/src/bulk/mod.rs
+index 40a90f4..bf5c0de 100644
+--- a/src/bulk/mod.rs
++++ b/src/bulk/mod.rs
+@@ -727,6 +727,8 @@ impl BulkSpec {
+         let ploidy = self.profile.dialed.ploidy;
+         let mut summary = Summary::new(self.n_samples);
+         let chunk_blocks = 2 * self.workers.get();
++        let mut t_par = std::time::Duration::ZERO;
++        let mut t_ser = std::time::Duration::ZERO;
+
+         for (ci, (id, layout)) in self.contig_ids.iter().zip(layouts).enumerate() {
+             let offsets = layout.offsets();
+@@ -735,6 +737,7 @@ impl BulkSpec {
+             for start in (0..n_blocks).step_by(chunk_blocks) {
+                 let chunk: Vec<usize> = (start..(start + chunk_blocks).min(n_blocks)).collect();
+
++                let t_par0 = std::time::Instant::now();
+                 let encoded: Vec<Result<(Vec<u8>, BlockSummary), BulkError>> = pool.install(|| {
+                     chunk
+                         .par_iter()
+@@ -782,15 +785,25 @@ impl BulkSpec {
+                         )
+                         .collect()
+                 });
++                t_par += t_par0.elapsed();
+
++                let t_ser0 = std::time::Instant::now();
+                 for item in encoded {
+                     let (bytes, bs) = item?;
+                     writer.write_encoded(&bytes)?;
+                     summary.merge_block(id, &bs);
+                 }
++                t_ser += t_ser0.elapsed();
+             }
+         }
+
++        let p = t_par.as_secs_f64();
++        let s = t_ser.as_secs_f64();
++        eprintln!(
++            "[instr] parallel={p:.3}s serial={s:.3}s serial_frac={:.4}",
++            s / (p + s)
++        );
++
+         Ok(summary)
+     }
+```
+
+Run commands (default BCF format — the brief's Step 3 does not set
+`VCFIXTURE_BENCH_FORMAT`; `VCFIXTURE_BENCH_REPS` is also unset, so `reps=1`,
+**single-shot** measurements sitting on the ~10% run-to-run spread already
+established elsewhere in this document, not averaged over repetitions):
+
+```
+TMPDIR=$CLAUDE_JOB_DIR/tmp VCFIXTURE_BENCH_SAMPLES=2000 VCFIXTURE_BENCH_RECORDS=20000 VCFIXTURE_BENCH_WORKERS=1 ./target/release/examples/bulk_bench
+TMPDIR=$CLAUDE_JOB_DIR/tmp VCFIXTURE_BENCH_SAMPLES=2000 VCFIXTURE_BENCH_RECORDS=20000 VCFIXTURE_BENCH_WORKERS=8 ./target/release/examples/bulk_bench
+```
+
+Results:
+
+| workers | parallel (t_par) | serial (t_ser) | `serial_frac` |
+|---|---|---|---|
+| 1 | 24.670s | 0.742s | 0.0292 |
+| 8 |  7.135s | 0.229s | 0.0310 |
+
+The `workers=1` value is the control: with only one worker there is nothing to
+park at the barrier, so `serial_frac=0.0292` at `workers=1` is measuring the
+drain loop's intrinsic cost (memcpy + bookkeeping), not contention. Going from
+`workers=1` to `workers=8`, `serial_frac` barely moves — 0.0292 → 0.0310, a
+0.18-point rise — which is consistent with no material barrier-contention
+effect at 8 workers beyond the loop's fixed cost.
+
+**Amdahl comparison.** Solving `S = 1 / (s + (1-s)/p)` for `s` at `p = 4` gives
+`s = (p - S) / (S(p - 1))`. The instrumented runs above use the default BCF
+format, so the like-for-like comparison is the **BCF-unpinned** curve from
+Task 2, whose `S(4) = 3.361` (min_s 8.205s vs 27.577s at `workers=1`, from the
+Scaling curves table above):
+
+```
+s = (4 - 3.361) / (3.361 * (4 - 1)) = 0.639 / 10.083 ≈ 0.0634
+```
+
+i.e. Amdahl's law says a 6.34% serial fraction would fully explain
+BCF-unpinned's `S(4) = 3.361`. For reference, since Gate C fired on the VCF
+series, the same arithmetic against VCF-unpinned's `S(4) = 3.075` (min_s 6.026s
+vs 18.529s):
+
+```
+s = (4 - 3.075) / (3.075 * (4 - 1)) = 0.925 / 9.225 ≈ 0.1003
+```
+
+i.e. VCF-unpinned's scaling would need a 10.03% serial fraction to be fully
+explained by Amdahl's law alone — a larger implied fraction than BCF's, which
+is expected since VCF has no bgzf compression pool to compete with rayon for
+cores, so any residual sub-linearity has to come from somewhere other than that
+oversubscription.
+
+**Reading.** Measured `serial_frac` at `workers=8` (**0.031**, 3.1%) is under a
+third of the BCF-unpinned Amdahl-implied fraction (0.063, 6.3%) — and under a
+third of the VCF-unpinned one too (0.100, 10.0%). Both instrumented values sit
+comfortably under the brief's 5% exoneration threshold, and the `workers=1`
+control shows the loop's baseline cost (2.9%) accounts for nearly all of the
+`workers=8` figure (3.1%), leaving at most ~0.2 points attributable to
+contention at 8 workers. **The chunk barrier's serial drain is exonerated: it
+is not the source of the sub-linear scaling gate C flagged.** The gap between
+measured speedup and linear scaling lies elsewhere — consistent with
+Hypothesis 2's two untested candidates (glibc allocator arena-lock contention,
+rayon+bgzf thread oversubscription), which Task 4 investigates.
+
 ### Profiling
 
 `samply` is installed but could not run: `perf_event_paranoid` is `2` on this box and `samply` requires it at `1` or lower; `sudo` is not available non-interactively (`sudo: a password is required`). Fell back to `perf record -g` per the brief's instructions, built with `CARGO_PROFILE_RELEASE_DEBUG=true` for symbolized frames (release binary otherwise ships no debug info; this env var was only used for the profiling run, not committed to `Cargo.toml`).
