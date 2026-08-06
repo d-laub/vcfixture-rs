@@ -45,6 +45,7 @@ enum Sink {
 /// block rewinds to it with `truncate`. At 32,000 samples the header text
 /// is ~200 KB of sample names, which is exactly why this is per worker
 /// rather than per block.
+///
 /// Driven by [`crate::bulk::BulkSpec`]'s block pipeline, whose serial
 /// consumer hands the resulting bytes to [`BulkWriter::write_encoded`].
 pub(crate) enum BlockEncoder {

@@ -964,13 +964,27 @@ fn output_is_byte_identical_across_thread_counts_and_chunkings() {
     // sets both the rayon pool size and the in-flight chunk width), the
     // bytes and the Summary must be identical. Worker count 1 is the
     // serial reference — one block encoded and written at a time.
+    //
+    // The spec dimensions are constants so that the vacuity guards below
+    // derive from the very values `run` builds with, rather than mirroring
+    // them -- a mirrored literal stops catching a vacuous test the moment
+    // the real sizing changes, which has already silently regressed a
+    // guard twice in this branch.
+    const N_SAMPLES: usize = 40;
+    const RECORDS_PER_CONTIG: u64 = 1_500;
+    /// Worker counts under test, ascending. Index 0 is the serial
+    /// reference; it is also the count with the *narrowest* chunk
+    /// (`chunk_blocks = 2 * workers`), so it is what the chunk-boundary
+    /// guard below is computed from.
+    const WORKERS: [usize; 4] = [1, 2, 5, 16];
+
     fn run(workers: usize) -> (Vec<u8>, vcfixture::bulk::Summary) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.bcf");
         let summary = BulkSpec::new(Profile::builtin("germline-1kgp").unwrap())
-            .samples(40)
+            .samples(N_SAMPLES)
             .contigs(["chr1", "chr2"])
-            .size(Size::RecordsPerContig(1_500))
+            .size(Size::RecordsPerContig(RECORDS_PER_CONTIG))
             .payload(Payload::Gatk)
             .seed(21)
             .workers(NonZero::new(workers).unwrap())
@@ -979,8 +993,42 @@ fn output_is_byte_identical_across_thread_counts_and_chunkings() {
         (std::fs::read(&path).unwrap(), summary)
     }
 
-    let (bytes1, sum1) = run(1);
-    for workers in [2usize, 5, 16] {
+    // Vacuity guard 1 -- RAYON BLOCKS. This test's whole subject is the
+    // block fan-out, and with a single block per contig `par_iter` has
+    // nothing to compute out of order and `.collect()` nothing to reassemble:
+    // the test would pass no matter how badly ordering was broken. Ploidy 2
+    // is the germline-1kgp profile's dialed ploidy (see
+    // `germline_profile_is_really_fitted_not_placeholder` in
+    // `src/bulk/profile.rs`). Same idiom as
+    // `same_seed_gives_byte_identical_output_across_thread_counts` above.
+    let blocks_per_contig = RECORDS_PER_CONTIG.div_ceil(BulkSpec::block_records(N_SAMPLES, 2));
+    assert!(
+        blocks_per_contig > 1,
+        "test is vacuous: {RECORDS_PER_CONTIG} records/contig at {N_SAMPLES} \
+         samples gives only {blocks_per_contig} rayon block(s) per contig, so \
+         there is nothing for the fan-out to reorder"
+    );
+
+    // Vacuity guard 2 -- CHUNK BOUNDARIES. The other half of what this test
+    // claims: that `chunk_blocks = 2 * workers` bounds only how many blocks
+    // are in flight, never the bytes. If every worker count swallowed a
+    // whole contig in one chunk, no contig would ever be split across a
+    // chunk boundary and the chunking half would go untested. Only the
+    // smallest worker count needs to split (a wider chunk at a larger
+    // worker count is the degenerate case this is comparing *against*), so
+    // the guard is over `WORKERS[0]` alone.
+    let narrowest_chunk_blocks = 2 * WORKERS[0] as u64;
+    assert!(
+        narrowest_chunk_blocks < blocks_per_contig,
+        "test is vacuous for chunking: at {} workers a chunk holds \
+         {narrowest_chunk_blocks} blocks and a contig is only \
+         {blocks_per_contig} blocks, so no contig is ever split across a \
+         chunk boundary",
+        WORKERS[0]
+    );
+
+    let (bytes1, sum1) = run(WORKERS[0]);
+    for workers in WORKERS.into_iter().skip(1) {
         let (bytes, sum) = run(workers);
         assert_eq!(
             bytes1, bytes,
