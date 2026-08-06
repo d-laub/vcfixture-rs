@@ -195,17 +195,37 @@ add the block's absolute offset, synthesise records from `Stream::Content`,
 `to_record_buf`, encode into a per-block byte buffer, and fold the block's own
 `BlockSummary`. `self.payload` is borrowed, not cloned per record.
 
-Encoding uses a header-less writer over an in-memory buffer —
-`bcf::io::Writer::from(Vec::new())` (or `vcf::io::Writer` for `VcfGz`/`Vcf`),
-`write_variant_record` per record, never `write_header`. String-map indices
-come from the `&header` argument, so a block's bytes are exactly what the real
-writer would have emitted for those records in that order. `BulkWriter` gains
-`write_encoded(&[u8])`, which reaches the underlying sink via
-`noodles_bcf::io::Writer::get_mut` (present in 0.81; `vcf::io::Writer` and the
-plain-`Vcf` `File` sink get the same treatment).
+Encoding runs against an in-memory buffer. A header-*less* writer does not
+work: `noodles_bcf::io::Writer` builds its `StringMaps` inside `write_header`
+and keeps it in a private field, so `write_variant_record` on a fresh writer
+fails with `chromosome not in string map`. (Empirically confirmed, not
+assumed.) The working construction is a **per-worker** writer that wrote its
+header once and rewinds per block:
 
-**Risk:** that byte-identity claim is the load-bearing assumption of this whole
-design. It is verified by test, not by argument — see Testing.
+```rust
+// rayon `map_init`: once per worker thread, not once per block
+let mut blk = bcf::io::Writer::from(Vec::new());
+blk.write_header(&header)?;                 // populates StringMaps
+let header_len = blk.get_ref().len();
+// ... per block:
+blk.get_mut().truncate(header_len);         // rewind, keep the string map
+for r in &recs { blk.write_variant_record(&header, &buf)?; }
+let bytes = &blk.get_ref()[header_len..];   // this block's records only
+```
+
+Header formatting therefore happens once per worker (it is not free: at 32,000
+samples the header text is ~200 KB of sample names), and the record buffer is
+reused across that worker's blocks. `vcf::io::Writer` takes the same shape for
+`VcfGz`/`Vcf`.
+
+`BulkWriter` gains `write_encoded(&[u8])`, which reaches the underlying sink
+via `noodles_bcf::io::Writer::get_mut` (present in 0.81; `vcf::io::Writer` and
+the plain-`Vcf` `File` sink get the same treatment).
+
+**Risk:** the byte-identity claim is the load-bearing assumption of this whole
+design. A scratch test has already confirmed it for both BCF and VCF text at
+small scale; the plan promotes that into a permanent test against the real
+generator — see Testing.
 
 ### 4. Block size scales with cohort width
 
