@@ -13,12 +13,17 @@
 //! Override the worker count (passed to both the rayon pool and the bgzf
 //! writer) with `VCFIXTURE_BENCH_WORKERS`, e.g. to measure scaling:
 //!   VCFIXTURE_BENCH_WORKERS=1 cargo run --release --example bulk_bench --features bulk
+//!
+//! `VCFIXTURE_BENCH_REPS=3` repeats each sweep cell and reports min/median/max
+//! seconds; `s/cell` is computed from the min. `VCFIXTURE_BENCH_FORMAT=vcf`
+//! writes uncompressed VCF, which removes the bgzf compression pool entirely —
+//! the ablation that separates rayon scaling from writer-pool contention.
 
 use std::env;
 use std::num::NonZeroUsize;
 use std::time::Instant;
 
-use vcfixture::bulk::{BulkSpec, Payload, Profile, Size};
+use vcfixture::bulk::{BulkSpec, Format, Payload, Profile, Size};
 
 /// Peak resident set size in KiB, from `/proc/self/status` (Linux only;
 /// returns 0 elsewhere, so the column is informational, never asserted on).
@@ -60,6 +65,35 @@ fn workers() -> NonZeroUsize {
     }
 }
 
+/// Repetitions per sweep cell. Benchmarks on this box show ~10% run-to-run
+/// spread, so a single shot cannot distinguish a real 5% effect from noise.
+/// Reported as min/median/max; `s/cell` uses the min, the standard robust
+/// estimator for "how fast can this machine do it" (noise only ever adds
+/// time).
+fn reps() -> usize {
+    match env::var("VCFIXTURE_BENCH_REPS") {
+        Ok(v) => {
+            let n: usize = v.trim().parse().expect("reps must be a positive integer");
+            assert!(n > 0, "reps must be a positive integer");
+            n
+        }
+        Err(_) => 1,
+    }
+}
+
+/// Output format, with the file extension to use for the bench output path.
+/// `Vcf` is the ablation that matters: it is the only variant with no bgzf
+/// compression pool, so it measures rayon scaling with nothing else competing
+/// for cores.
+fn format() -> (Format, &'static str) {
+    match env::var("VCFIXTURE_BENCH_FORMAT").as_deref() {
+        Ok("bcf") | Err(_) => (Format::Bcf, "bcf"),
+        Ok("vcf") => (Format::Vcf, "vcf"),
+        Ok("vcf.gz") => (Format::VcfGz, "vcf.gz"),
+        Ok(other) => panic!("VCFIXTURE_BENCH_FORMAT must be bcf, vcf, or vcf.gz; got {other:?}"),
+    }
+}
+
 fn main() {
     let dir = env::temp_dir().join("vcfixture_bulk_bench");
     std::fs::create_dir_all(&dir).expect("create bench output dir");
@@ -68,41 +102,61 @@ fn main() {
     let records = sweep("VCFIXTURE_BENCH_RECORDS", &[5_000, 20_000]);
 
     let workers = workers();
-    println!("workers={workers}");
+    let reps = reps();
+    let (format, ext) = format();
+    println!("workers={workers} reps={reps} format={ext}");
     println!(
-        "{:>8} {:>9} {:>12} {:>10} {:>12} {:>10}",
-        "samples", "records", "cells", "secs", "s/cell", "peakRSS_MB"
+        "{:>8} {:>9} {:>12} {:>5} {:>9} {:>9} {:>9} {:>12} {:>10}",
+        "samples", "records", "cells", "reps", "min_s", "med_s", "max_s", "s/cell", "peakRSS_MB"
     );
 
     for &n_samples in &samples {
         for &n_records in &records {
-            let profile = Profile::builtin("germline-1kgp").expect("built-in profile loads");
-            let path = dir.join(format!("bench_{n_samples}_{n_records}.bcf"));
+            let path = dir.join(format!("bench_{n_samples}_{n_records}.{ext}"));
 
-            let t0 = Instant::now();
-            let summary = BulkSpec::new(profile)
-                .samples(n_samples as usize)
-                .contigs(["chr1", "chr2"])
-                .size(Size::Records(n_records))
-                .payload(Payload::GtOnly)
-                .seed(42)
-                .workers(workers)
-                .write(&path)
-                .expect("bulk generation succeeds");
-            let secs = t0.elapsed().as_secs_f64();
+            let mut times: Vec<f64> = Vec::with_capacity(reps);
+            let mut n_records_total = 0u64;
 
-            // Ploidy 2 is the germline-1kgp profile's dialed value; the
-            // cell count is what cost is linear in.
-            let cells = summary.n_records_total() * n_samples * 2;
+            for _ in 0..reps {
+                let profile = Profile::builtin("germline-1kgp").expect("built-in profile loads");
+
+                let t0 = Instant::now();
+                let summary = BulkSpec::new(profile)
+                    .samples(n_samples as usize)
+                    .contigs(["chr1", "chr2"])
+                    .size(Size::Records(n_records))
+                    .payload(Payload::GtOnly)
+                    .seed(42)
+                    .format(format)
+                    .workers(workers)
+                    .write(&path)
+                    .expect("bulk generation succeeds");
+                times.push(t0.elapsed().as_secs_f64());
+                n_records_total = summary.n_records_total();
+
+                // Clean between reps: every rep must write a fresh file, and
+                // the index/summary siblings must not accumulate. The library
+                // appends `.csi` to the full path (only for `Bcf`; see
+                // `BulkWriter::finish_and_index`), not to the stem.
+                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_file(format!("{}.csi", path.display()));
+                let _ = std::fs::remove_file(format!("{}.summary.json", path.display()));
+            }
+
+            times.sort_by(|a, b| a.partial_cmp(b).expect("elapsed times are finite"));
+            let min = times[0];
+            let med = times[times.len() / 2];
+            let max = times[times.len() - 1];
+
+            // Ploidy 2 is the germline-1kgp profile's dialed value; the cell
+            // count is what cost is linear in.
+            let cells = n_records_total * n_samples * 2;
             println!(
-                "{n_samples:>8} {n_records:>9} {cells:>12} {secs:>10.3} {:>12.3e} {:>10.1}",
-                secs / cells as f64,
+                "{n_samples:>8} {n_records:>9} {cells:>12} {reps:>5} {min:>9.3} {med:>9.3} \
+                 {max:>9.3} {:>12.3e} {:>10.1}",
+                min / cells as f64,
                 peak_rss_kib() as f64 / 1024.0,
             );
-
-            let _ = std::fs::remove_file(&path);
-            let _ = std::fs::remove_file(path.with_extension("bcf.csi"));
-            let _ = std::fs::remove_file(format!("{}.summary.json", path.display()));
         }
     }
 }
