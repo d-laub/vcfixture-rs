@@ -50,6 +50,10 @@ required-features = ["proptest"]
 name = "bulk"
 required-features = ["bulk"]
 
+[[example]]
+name = "bulk_bench"
+required-features = ["bulk"]
+
 [[bin]]
 name = "vcfixture"
 path = "src/bin/vcfixture.rs"
