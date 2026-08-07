@@ -88,28 +88,37 @@ assignment and cloning. They cost about three allocations per *record*, some
 60k over the reference workload against ~160M for the sample path — chasing
 them would add code for no measurable gain.
 
-### GT becomes a structured genotype
+### GT stays a string — attempted and rejected
 
-`SampleStats.gt: String` becomes a structured `Genotype`, and `value_for`
-yields `Value::Genotype` rather than `Value::String`. This is what makes the
-in-place refill of item 1 possible, and it pays twice more: it removes our
-`write!("{a}")` integer formatting from the ~20% bucket, and it removes
-noodles' `encode_genotype_str` reparse from the ~11% bucket, since the BCF
-encoder dispatches `Value::Genotype` straight to `encode_genotype`.
+**Original design, since abandoned.** `SampleStats.gt: String` was to become a
+structured `Genotype` yielding `Value::Genotype` rather than `Value::String`,
+which would additionally have removed our `write!("{a}")` integer formatting
+from the ~20% bucket and noodles' `encode_genotype_str` reparse from the ~11%
+bucket, since the BCF encoder dispatches `Value::Genotype` straight to
+`encode_genotype`.
 
-**Byte-compatibility constraint.** Both encoders compute the same value,
-`(allele + 1) << 1`, with `| 0x01` when phased. They agree only if the first
-allele is constructed `Phasing::Unphased`: `encode_genotype_str` initialises
-`last_phasing = "/"` and so never sets the phase bit on position 0, whatever
-the separator. Note that noodles' *parser* is not symmetric here — it maps the
-single-allele string `"0"` to `Phasing::Phased` — so the parser's behaviour
-must not be used to infer the encoder's. Construct position 0 as `Unphased`
-and every subsequent position from the record's phasing draw.
+**Why it was rejected.** It changes the *text* VCF output. `build_header`
+declares `VCFv4.5`, so noodles' text writer takes its VCF-4.4-and-later
+genotype branch (`io::writer::record::samples::sample::value::genotype`),
+which writes a phasing separator before **every** allele including position 0.
+A diploid `0|0` renders as `/0|0`. The leading indicator is 4.4-conformant in
+principle, but it is not what this crate emitted before and not what consumers
+of these fixtures expect.
 
-This constraint is stated because reading the code is not sufficient evidence
-that it holds end to end, particularly for the *text* VCF writer, whose
-rendering of `Value::Genotype` versus `Value::String` has not been verified.
-The byte-equality gate below is what actually establishes it.
+This was caught by the byte-equality gate, in exactly the shape the gate was
+built to detect: **all four BCF goldens passed while all eight VCF and VCF.gz
+goldens failed.** That split is itself the evidence that the two BCF encoders
+agree — the byte-compatibility reasoning about the phase bit on position 0 was
+correct — and that the problem is confined to the text writer.
+
+**What ships instead.** GT remains a `Value::String` whose buffer is cleared
+and refilled rather than reallocated. This preserves the entire allocation
+win, which is what issue #26 is actually about; only the CPU saving from
+skipping the format/reparse round-trip is forgone. A single-digit fast path
+(`gt.push((b'0' + a) as char)` for `a < 10`) recovers the `core::fmt` /
+`pad_integral` portion of that without touching the output.
+
+The allocation count is unchanged by this decision: four to one either way.
 
 ### Expected effect
 
@@ -230,7 +239,7 @@ that should be reported plainly rather than absorbed into a joint number.
 
 | Risk | Handling |
 |---|---|
-| `Value::Genotype` renders differently in text VCF | Byte-equality gate covers VCF and VCF.gz, not just BCF |
+| ~~`Value::Genotype` renders differently in text VCF~~ | **Occurred.** Caught by the gate: 4 BCF goldens passed, 8 text goldens failed. `Value::Genotype` abandoned; see "GT stays a string" above |
 | Scratch reuse leaks state between records (stale slot from a previous record) | Uniform clear-then-refill for every key every record; byte-equality gate across all payload presets |
 | `NamedTempFile::new_in` needs the destination's parent to exist | `BulkWriter::create` already required a writable destination, so this is not a new precondition; surface a clear error if the parent is missing |
 | mimalloc's `cc` dependency breaks a consumer's build | Feature is opt-out via `--no-default-features`; library target never sets a global allocator |
