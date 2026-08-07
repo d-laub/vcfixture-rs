@@ -1,7 +1,9 @@
 # Bulk generation measurements (issue #22)
 
 Harness: `cargo run --release --example bulk_bench --features bulk`
-Machine: 8 cores, 4.18.0-553.36.1.el8_10.x86_64
+Machine: `carter-cn-03`, Slurm allocation of **4 physical cores** plus their SMT
+siblings (see "Hardware and allocation" below — *not* 8 independent cores, even
+though `nproc` reports 8), 4.18.0-553.36.1.el8_10.x86_64
 
 ## Baseline — v0.4.0 (`9e64a0c`), before any change
 
@@ -19,7 +21,8 @@ workers=8
 ## After the change — parallel encode + gap-only span pass (`a222aae`, `cf18a72`)
 
 Harness: `cargo run --release --example bulk_bench --features bulk` (worker-count control added in `7bb2f6d`)
-Machine: same box (8 cores, 4.18.0-553.36.1.el8_10.x86_64)
+Machine: same box and same allocation (`carter-cn-03`, 4 physical cores plus SMT
+siblings; see "Hardware and allocation" below), 4.18.0-553.36.1.el8_10.x86_64
 
 ```
 workers=8
@@ -47,7 +50,7 @@ workers=8
 
 Speedup range 2.51x–3.08x, average ~2.81x. This clears the "wins" bar plainly — not a 1.1x rounding-error result. RSS falls at the largest workload (200.9 → 140.3 MB, the redundant generation pass no longer holds a second full copy of record state) but *rises* at 8000×5000 (83.9 → 117.3 MB): the parallel fan-out now holds several blocks' `RecordBuf`s and encoded byte buffers in flight concurrently across workers, instead of one block's data alive at a time in the old serial encode stage. Net RSS stays well under 1 order of magnitude change either way and the largest workload is the best RSS case, so this is not a concern, just a real trade-off worth naming.
 
-All (samples, records) points, workers, and workload sizes above are **single-shot measurements**, not averaged over repeated runs. The same (2000, 20000) workload was independently re-measured three times over the course of this task (7.049s in the full sweep, 7.502s in the Step 4 scaling run, 7.762s in the Step 5 profiling run) — a ~10% spread. The overall win is far larger than this noise, so no conclusion above changes, but individual row speedups should be read as accurate to roughly ±10%, not to the three significant figures the table prints.
+All (samples, records) points, workers, and workload sizes above are **single-shot measurements**, not averaged over repeated runs. The same (2000, 20000) workload at `workers=8` was independently re-measured three times over the course of this task (7.049s in the full sweep, 7.502s in the Step 4 scaling run, 7.762s in the Step 5 profiling run) — a 10% spread. That figure describes `workers=8` runs only and **must not be generalized**: the per-cell spreads measured later in this document (see "Measurement noise and anchor stability", below) run from 1% to 61% depending on worker count, and the low-worker-count cells are far noisier than the high ones. Every row in the sweep above is a `workers=8` row, so ±10% is the right band to read them at; the overall 2.5x–3.1x win is far larger than that, so no conclusion above changes, but individual row speedups should be read as accurate to roughly ±10%, not to the three significant figures the table prints.
 
 ## Hardware and allocation
 
@@ -92,7 +95,7 @@ NEW code (HEAD),    WORKERS=1: 26.103s  (3.263e-7 s/cell)
 
 At 1 worker there is no parallelism benefit to factor out — this isolates whatever the pipeline-shape change (gap-only span pass + moving encode/summary into a single interleaved pass) is worth on its own, end to end. Result: **1.31x speedup, a 23.6% reduction in end-to-end single-threaded wall clock** (26.103s / 34.179s = 0.7637; 34.179 − 26.103 = 8.076s saved).
 
-This A/B is one run per side, not averaged, on top of the ~10% run-to-run spread already established above for this exact workload — so the ~1.31x/23.6% figures should be read as accurate in direction but not pinned to three significant figures. Even at a worst-case reading (old run 5% low, new run 5% high: 32.470s vs. 27.408s) the ratio is still ~1.18x, safely above 1x — the *direction* of the result is not noise, only its precise magnitude is uncertain by a few points. Also worth flagging: the two binaries were run at the same `seed=42`, but `block_rng` changed from `(seed, block_idx)` to `(seed, block_idx, stream)` in an earlier task in this same body of work, so the old and new binaries generate different variant *content* at that seed — same distributions, same record and cell counts (verified: both `n_records_total()` values and both `cells` denominators are 80,000,000), but not byte-identical records. At 20k records this is very unlikely to move timing, but it is an unstated difference between the two sides worth naming for completeness.
+This A/B is one run per side, not averaged, and both sides are `workers=1` runs — the noisiest regime in this study (see "Measurement noise and anchor stability", below) — so the ~1.31x/23.6% figures should be read as accurate in direction but not pinned to three significant figures. The anchor re-measurement in that section puts *clean-window* single-shot variability at `workers=1` at about ±3% (five spread-out BCF `workers=1` single-shots landed in 25.193s–26.829s), and the new-code side of this A/B, 26.103s, sits comfortably inside that cluster. Under a conservative ±10% band the worst-case reading (old run 10% low, new run 10% high: 30.761s vs. 28.713s) still gives ~1.07x — above 1x, but only just. The honest statement is therefore: in a clean measurement window the *direction* of this result is secure; what a single-shot A/B cannot defend against is one side landing in a contaminated window, which is exactly what the min-of-3 estimator used for the scaling curves guards against and this A/B does not. Also worth flagging: the two binaries were run at the same `seed=42`, but `block_rng` changed from `(seed, block_idx)` to `(seed, block_idx, stream)` in an earlier task in this same body of work, so the old and new binaries generate different variant *content* at that seed — same distributions, same record and cell counts (verified: both `n_records_total()` values and both `cells` denominators are 80,000,000), but not byte-identical records. At 20k records this is very unlikely to move timing, but it is an unstated difference between the two sides worth naming for completeness.
 
 **Read against what H1 actually claims — generation CPU, not end-to-end wall clock:** H1 says removing the redundant pass roughly halves *generation CPU*, not that it halves total single-threaded time. At `9e64a0c`, the spans loop calls `generate_contig` to lay out the file, and the write loop calls it again to produce records — two identical full-genotype generation passes. Deleting one of two identical passes halves generation CPU **by construction**; that mechanism is not in question.
 
@@ -119,21 +122,24 @@ which count logical CPUs and cannot see that distinction. Against the correct
 denominator of 4, 3.48x is **87% parallel efficiency**, not 43.5%. The full
 six-point sweep in Scaling curves (below) gives a cleaner reading of the same
 quantity from one consistent series rather than this single two-point A/B:
-BCF-unpinned reaches `S(4)=3.36` (**84% efficient**) by `workers=4` and keeps
-climbing through the SMT range to `S(8)=3.86` (**96% efficient**) at
+BCF-unpinned reaches `S(4)=3.07` (**77% efficient**) by `workers=4` and keeps
+climbing through the SMT range to `S(8)=3.52` (**88% efficient**) at
 `workers=8`. VCF-unpinned (no bgzf pool) climbs monotonically to `S(4)=3.07`
 (77%) and `S(8)=3.36` (84%); BCF-pinned (`taskset -c 0-3`) does not climb
 monotonically — it dips slightly at `workers=6` before recovering — but
-covers a similar high-70s-to-mid-80s-percent efficiency range from
-`workers=4` onward. Wall clock falls sharply from `workers=1` to `workers=4`
-in all three curves (27.577s→8.205s BCF-unpinned, 23.996s→7.565s BCF-pinned,
+covers a similar high-70s-to-low-80s-percent efficiency range from
+`workers=4` onward. (The 3.48x two-point reading above and the six-point
+BCF-unpinned curve's `S(8)=3.52` agree closely, which they did not before the
+`workers=1` anchor was re-measured — see "Measurement noise and anchor
+stability", below.) Wall clock falls sharply from `workers=1` to `workers=4`
+in all three curves (25.193s→8.205s BCF-unpinned, 23.996s→7.565s BCF-pinned,
 18.529s→6.026s VCF-unpinned), confirming the serial `O(cells)` stage
 Hypothesis 2 targeted is gone as a *dominant* cost. What remains is a
 smaller, genuine sub-linear component, not the near-50%-efficiency shortfall
 first reported.
 
 One caveat applies to every `S(w)` figure in this document, including the
-84%/96% above: the `workers=1` baseline is not itself single-threaded for the
+77%/88% above: the `workers=1` baseline is not itself single-threaded for the
 BCF and VCF.gz paths. `workers` sizes both the rayon pool
 (`rayon::ThreadPoolBuilder::new().num_threads(self.workers.get())`,
 `src/bulk/mod.rs`) and the bgzf multithreaded writer's compression pool
@@ -141,13 +147,24 @@ BCF and VCF.gz paths. `workers` sizes both the rayon pool
 `src/bulk/writer.rs:149`) from the same value, so `workers=1` still runs a
 second bgzf compression thread overlapping with generation — a two-thread
 run is standing in as the "1" in `S(w) = min_s(1) / min_s(w)`. A genuinely
-single-threaded baseline would be faster, so every BCF/VCF.gz `S(w)` in this
-document *understates* true parallel speedup rather than overstating it.
-Uncompressed VCF is the exception, and the data shows the asymmetry: with no
-bgzf pool to size, its `workers=1` is genuinely single-threaded, and its
-`min_s(1)` of 18.529s is correspondingly much faster than BCF's 27.577s for
-the identical workload — consistent with BCF's `workers=1` baseline carrying
-compression overlap that VCF's does not.
+single-threaded BCF baseline would be **slower**, not faster: with no second
+thread, DEFLATE would run serialized after each block's generation instead of
+overlapping with it. Because the recorded baseline already has that overlap,
+it is smaller than a true 1-thread time, and dividing by a too-small baseline
+*understates* `S(w)`. So every BCF/VCF.gz `S(w)` in this document is a lower
+bound on true parallel speedup rather than an overstatement — the conclusion
+is unchanged, but note the mechanism runs through the baseline being fast, not
+slow.
+
+Uncompressed VCF is the exception: with no bgzf pool to size, its `workers=1`
+is genuinely single-threaded, so its `S(w)` column needs no such correction.
+Its `min_s(1)` of 18.529s is lower than BCF's 25.193s, but that is **not**
+evidence for or against the overlap mechanism — overlap is a speedup
+mechanism, and the gap is simply DEFLATE work that the VCF path never
+performs. The two `workers=1` numbers are also not strictly like-for-like:
+same `BulkSpec`, same seed, same 80M cells, but a different encoder path and a
+materially different output file, so read the 18.529 vs 25.193 difference as
+"compressed output costs more to produce", nothing finer.
 
 The two candidates originally named here — allocator arena-lock contention
 and rayon+bgzf thread oversubscription — were both tested by direct
@@ -160,17 +177,22 @@ and tested as well:
   (`MALLOC_ARENA_MAX=1`) made `workers=8` 9.16x slower, so per-thread arenas
   are load-bearing — but that is exactly glibc's default behavior, already in
   effect under every measurement in this document. Swapping to mimalloc made
-  every worker count 1.63x–1.79x faster in absolute wall clock, but
-  mimalloc's own `S(4)`/`S(8)` (3.26/3.52) were flat to slightly *lower* than
-  glibc's (3.36/3.86) — a contention-avoiding allocator did not unlock extra
-  scaling headroom. Verdict: allocator cost is large and real, but it is
-  per-thread overhead, not the cause of the sub-linear curve.
+  every worker count 1.63x–1.73x faster in absolute wall clock, but
+  mimalloc's own `S(4)`/`S(8)` (3.26/3.52) land level with glibc's
+  (3.07/3.52) — and, decisively, mimalloc's *own* `S(4)` of 3.26 is itself
+  only 81% efficient against 4 physical cores, so even an allocator built to
+  avoid arena-lock contention entirely does not scale linearly on this
+  workload. Verdict: allocator cost is large and real, but it is per-thread
+  overhead, not the cause of the sub-linear curve.
 - **Thread oversubscription.** The VCF ablation settles this directly: VCF
   has no bgzf pool at all, so at `workers=4` it is 4 rayon threads on 4
   physical cores with nothing else competing for them — and it still only
   reaches `S(4)=3.07`, 77% efficient (Scaling curves, below). Oversubscription
   cannot explain a shortfall that persists with no second thread pool to
-  oversubscribe with. A genuine oversubscription signature *is* visible, but
+  oversubscribe with — and after the `workers=1` anchor re-measurement the two
+  unpinned curves' `S(4)` values are indistinguishable (VCF 3.075 with no bgzf
+  pool, BCF 3.070 with one), so removing the pool entirely buys no scaling at
+  all at the physical-core count. A genuine oversubscription signature *is* visible, but
   only in the BCF-pinned curve at worker counts above the physical core count
   (`S(6)=3.10` dipping below `S(4)=3.17` before recovering to `S(8)=3.29`) —
   real, but too small and too narrowly scoped to account for the residual
@@ -180,9 +202,9 @@ and tested as well:
   Amdahl-implied figure alone: `stream_contigs` collects each chunk's encoded
   records with `par_iter().collect()`, which drains the rayon pool fully
   before a serial `write_encoded` loop runs. Measured `serial_frac` is
-  0.029–0.031, well under the 0.063 (BCF)–0.100 (VCF) Amdahl's law implies is
-  needed to explain the measured `S(4)`. The barrier costs about 3%, not the
-  6–10% the curve would require.
+  0.029–0.031, well under the ~0.100 Amdahl's law implies is needed to explain
+  the measured `S(4)` (0.1009 BCF-unpinned, 0.1003 VCF-unpinned). The barrier
+  costs about 3%, not the ~10% the curve would require.
 
 **Verdict: held, but the residual is real and, after this task, genuinely
 unexplained.** All three candidates examined — allocator contention, bgzf
@@ -190,8 +212,8 @@ thread oversubscription, and the chunk-write serial barrier — were tested by
 direct measurement or intervention, not left as speculation, and none of them
 accounts for the gap between the measured curves and ideal linear scaling
 against 4 physical cores. That gap is smaller than the original
-43.5%-efficiency framing suggested (84%–96% efficient at the top of the
-BCF-unpinned curve, 77% at the low end of the VCF-unpinned curve), but it has
+43.5%-efficiency framing suggested (77%–88% across the BCF-unpinned curve from
+`w=4` to `w=8`, and 77% at `w=4` on the VCF-unpinned curve), but it has
 not been explained, and this document should say so plainly rather than
 retire the question behind a plausible-sounding cause that was never tested.
 Closing it is future work, not a conclusion this investigation reached:
@@ -205,7 +227,7 @@ this box contributing measurably less than a full physical core each.
 
 Task 3 instrumented `stream_contigs`'s chunk barrier directly and exonerated
 it: measured `serial_frac` (2.9%-3.1%) sits well under the Amdahl-implied
-serial fraction (6.3% BCF, 10.0% VCF) needed to explain the measured `S(4)`.
+serial fraction (10.1% BCF, 10.0% VCF) needed to explain the measured `S(4)`.
 The gap between measured and ideal-linear speedup is therefore still
 unexplained, and the allocator — the other untested candidate from Hypothesis
 2 above — is the next one to test. Comparing glibc self-time share between a
@@ -231,14 +253,19 @@ TMPDIR=$CLAUDE_JOB_DIR/tmp VCFIXTURE_BENCH_SAMPLES=2000 VCFIXTURE_BENCH_RECORDS=
 | default | 8.467 | 9.021 | 9.460 |
 
 Forcing a single arena makes `workers=8` **9.16x slower** (`77.558 / 8.467`)
-— two orders of magnitude past the ~10% run-to-run spread this document
-otherwise treats as noise, so this is unambiguously a real effect. (The
-default arm here, 8.467s, reads ~18% above Task 2's originally recorded
-BCF-unpinned `workers=8` figure of 7.153s from a separate session — wider
-than the ~10% spread quoted elsewhere, and worth flagging as the true
-session-to-session noise band on this box, but it changes nothing about the
-Step 1 reading: the arena effect is ~9x, dwarfing either baseline by close to
-an order of magnitude.)
+— a 9.16x degradation against a widest-measured noise band of 61% (see
+"Measurement noise and anchor stability", below), so the effect is more than
+an order of magnitude past anything noise could produce and is unambiguously
+real. (The default arm here, 8.467s, reads 18%
+above Task 2's originally recorded BCF-unpinned `workers=8` `min_s` of 7.153s
+from a separate session. That 18% is a *cross-session* shift in a min-of-3
+estimator, not a within-cell spread: within Task 2's own `workers=8` cell the
+three reps spanned only 9% (7.153–7.802). The two figures are measuring
+different things and both are real — the honest band for comparing a `min_s`
+from one session against a `min_s` from another is therefore ~20%, wider than
+any single cell's internal spread. It changes nothing about the Step 1
+reading: the arena effect is ~9x, dwarfing either baseline by close to an
+order of magnitude.)
 
 Per the brief's reading rule, sharply degrading `min_s` means **per-thread
 arenas are load-bearing and allocator contention is real** in the sense that
@@ -263,92 +290,101 @@ TMPDIR=$CLAUDE_JOB_DIR/tmp VCFIXTURE_BENCH_SAMPLES=2000 VCFIXTURE_BENCH_RECORDS=
 TMPDIR=$CLAUDE_JOB_DIR/tmp VCFIXTURE_BENCH_SAMPLES=2000 VCFIXTURE_BENCH_RECORDS=20000 VCFIXTURE_BENCH_REPS=3 VCFIXTURE_BENCH_WORKERS=8 ./target/release/examples/bulk_bench
 ```
 
-| workers | mimalloc min_s | glibc min_s (Task 2, BCF-unpinned) | speedup |
+| workers | mimalloc min_s | glibc min_s (BCF-unpinned) | speedup |
 |---|---|---|---|
-| 1 | 15.416 | 27.577 | 1.79x |
+| 1 | 15.416 | 25.193 | 1.63x |
 | 4 | 4.736 | 8.205 | 1.73x |
 | 8 | 4.375 | 7.153 | 1.63x |
 
-The glibc column is Task 2's original series, not a fresh remeasurement in
-this session — per the baseline-discrepancy note under Step 1 above, a
-same-session default-arm rerun read ~18% higher (8.467s vs 7.153s at
-`workers=8`), which is the honest size of the session-to-session noise band
-this comparison is subject to; Task 2's series is used here because the brief
-mandates it as the like-for-like baseline, not because it was reverified this
-session.
+The glibc column is the BCF-unpinned series used throughout this document, not
+a fresh remeasurement in this session. Its `workers=1` entry is the
+re-measured anchor (25.193s, min over 8 samples — see "Measurement noise and
+anchor stability", below), which replaced the originally recorded 27.577s;
+`workers=4` and `workers=8` are Task 2's originals. Per the
+baseline-discrepancy note under Step 1 above, a same-session default-arm rerun
+of `workers=8` read 18% higher (8.467s vs 7.153s), which is the honest size of
+the session-to-session noise band this comparison is subject to; Task 2's
+series is used here because the brief mandates it as the like-for-like
+baseline, not because `w=4`/`w=8` were reverified this session. Note the
+asymmetry this creates and read the comparison accordingly: glibc's
+`workers=1` figure rests on 8 samples while mimalloc's rests on 3, and a
+min-over-more-samples is biased low, so glibc's `w=1` number is the better
+sampled — and the more pessimistic — of the two.
 
 mimalloc's own scaling, `S(w) = mimalloc_min_s(1) / mimalloc_min_s(w)`,
 against the same BCF-unpinned series used throughout this document:
 
-| workers | mimalloc `S(w)` | glibc `S(w)` (Task 2) | gap |
-|---|---|---|---|
-| 4 | 3.26 (`15.416/4.736`) | 3.36 | 3.2% lower |
-| 8 | 3.52 (`15.416/4.375`) | 3.86 | 8.6% lower |
+| workers | mimalloc `S(w)` | glibc `S(w)` | mimalloc vs glibc | mimalloc efficiency vs 4 cores |
+|---|---|---|---|---|
+| 4 | 3.26 (`15.416/4.736`) | 3.07 (`25.193/8.205`) | 6.0% higher | 81% |
+| 8 | 3.52 (`15.416/4.375`) | 3.52 (`25.193/7.153`) | 0.05% higher | 88% |
 
-Two separate findings here, and they point in different directions. mimalloc
-makes every worker count **uniformly faster in absolute terms** — 1.63x to
-1.79x faster wall clock at `w=1`, `4`, and `8` alike, with no trend toward a
-*larger* speedup at higher worker counts. That is consistent with the
-profile's ~47% allocator self-time finding: allocation cost is a large, real,
-per-call overhead, and a faster allocator removes a roughly constant fraction
-of it independent of thread count — exactly the "swap that makes everything
-uniformly faster without changing the shape of the curve" case, not one that
-changes scaling. But mimalloc's *own* `S(w)` is not higher than glibc's: 3.2%
-lower at `w=4` (inside the noise band) and 8.6% lower at `w=8` — smaller than
-the ~18% session-to-session spread Step 1's own default-arm reading showed
-for the identical configuration, so this cannot be read as a confirmed
-degradation either, only as "not better." If arena-lock contention were
-capping scaling under the default allocator, swapping to mimalloc's
-fundamentally different, contention-avoiding design (thread-local heaps, no
-shared arena lock) would be expected to *raise* `S(w)`; the raw numbers show
-no such rise. That reading needs one caveat before it can stand, addressed
-next.
+Two separate findings here. mimalloc makes every worker count **uniformly
+faster in absolute terms** — 1.63x to 1.73x faster wall clock at `w=1`, `4`,
+and `8` alike, with no trend toward a *larger* speedup at higher worker
+counts. That is consistent with the profile's ~47% allocator self-time
+finding: allocation cost is a large, real, per-call overhead, and a faster
+allocator removes a roughly constant fraction of it independent of thread
+count — exactly the "swap that makes everything uniformly faster without
+changing the shape of the curve" case, not one that changes scaling.
 
-**Caveat — an Amdahl-mechanical alternative for the lower `S(8)`.** "mimalloc's
-`S(w)` did not rise" does not, by itself, rule out that mimalloc relieved real
-contention. If some cost is roughly fixed in absolute seconds regardless of
-allocator (Task 3's chunk-barrier serial drain, `finish_and_index`, the
-summary JSON write, process startup), then shrinking the parallel portion —
-exactly what a faster allocator does — makes that fixed cost a *larger share*
-of a smaller total, which mechanically depresses `S(w)` with no change in
-contention whatsoever. Sanity-checking the size of this effect against Task
-3's own measured fixed cost (`t_ser = 0.229s` at `workers=8`, glibc; up to
-0.313s worst-case including the untimed residual — see the Serial-fraction
-measurement section's reconciliation): treat that as a fixed cost `F` present
-in both allocators' totals, and solve for the `F` that would make mimalloc's
-fixed-cost-corrected scaling equal glibc's fixed-cost-corrected scaling at the
-same `F`:
+The scaling comparison itself is a dead heat. mimalloc's `S(8)` equals
+glibc's to within 0.05% (3.5237 vs 3.5220 — a difference far below any noise
+band this document measures), and its `S(4)` is 6.0% higher, which is inside
+the noise band *and* is exactly the direction the sampling asymmetry noted
+above would produce on its own (glibc's `w=1` anchor is a min over 8 samples,
+mimalloc's over 3). So the raw numbers support neither "mimalloc raised
+`S(w)`" nor "mimalloc lowered `S(w)`" — they support "no measurable
+difference."
+
+The decisive observation is not the comparison at all, but mimalloc's own
+efficiency column: **3.26 at `w=4` is 81% of linear, and 3.52 at `w=8` is 88%
+of 4 cores.** An allocator with thread-local heaps and no shared arena lock —
+a design that cannot suffer arena-lock contention — still falls well short of
+linear scaling on this workload. Whatever caps `S(w)` here is therefore not
+arena-lock contention, and that conclusion does not depend on the
+glibc-vs-mimalloc delta being resolvable above the noise. One caveat on the
+comparison is addressed next for completeness.
+
+**Caveat — the Amdahl-mechanical artifact, and why it no longer bites.** If
+some cost is roughly fixed in absolute seconds regardless of allocator (Task
+3's chunk-barrier serial drain, `finish_and_index`, the summary JSON write,
+process startup), then shrinking the parallel portion — exactly what a faster
+allocator does — makes that fixed cost a *larger share* of a smaller total,
+which mechanically depresses the faster allocator's `S(w)` with no change in
+contention whatsoever. Under the originally recorded `workers=1` anchor
+(27.577s) this mattered a great deal, because mimalloc's `S(8)` appeared 8.6%
+*below* glibc's and the artifact was the leading candidate explanation for
+that gap. With the re-measured anchor (25.193s) there is no such gap left to
+explain: the two `S(8)` values are 3.5237 and 3.5220. Solving for the fixed
+cost `F` that would equalize the two allocators' fixed-cost-corrected scaling,
 
 ```
 (mimalloc_min_s(1) - F) / (mimalloc_min_s(8) - F)
   = (glibc_min_s(1) - F) / (glibc_min_s(8) - F)
 
-(15.416 - F) / (4.375 - F) = (27.577 - F) / (7.153 - F)
-=> F ≈ 1.106s
+(15.416 - F) / (4.375 - F) = (25.193 - F) / (7.153 - F)
+=> F ≈ -0.007s
 ```
 
-Task 3's measured fixed cost (0.229s, or 0.313s worst-case) is only 21%-28%
-of the ~1.106s a fixed cost would need to be to fully account for the gap by
-this mechanism alone — plugging either measured value back in as `F` only
-closes 14%-19% of the raw `S(8)` gap: at `F=0.229s`, glibc's corrected `S(8)`
-rises `3.86 → 3.95` and mimalloc's rises `3.52 → 3.66`, leaving a residual gap
-of 0.29 (down from the raw 0.33); at `F=0.313s`, `3.86 → 3.99` and
-`3.52 → 3.72`, a residual gap of 0.27. Either way most of the gap survives
-the correction. So the Amdahl-compression artifact is real in
-principle, but on the only fixed-cost measurement available, it is too small
-— by a factor of roughly 3.5x-4.8x — to be the primary explanation for
-mimalloc's lower `S(8)`. It plausibly accounts for a minority of the gap
-(order of magnitude ~15%-30%, per the sanity-check above), not most of it.
-The evidence therefore does not support a strong claim that mimalloc
-*definitely* relieved no contention — only that, after accounting for the
-fixed-cost artifact as best this document can measure it, most of the gap
-remains unexplained by that mechanism, and "mimalloc did not measurably
-unlock additional scaling headroom" is the better-supported reading than a
-flat "it did not."
+i.e. the equalizing `F` is indistinguishable from zero — the raw numbers are
+already equal without any correction. Applying Task 3's actually measured
+fixed cost anyway moves things marginally in mimalloc's *favour* rather than
+against it: at `F = 0.229s`, glibc's corrected `S(8)` rises `3.52 → 3.61` and
+mimalloc's rises `3.52 → 3.66`; at `F = 0.313s` (the worst case including the
+untimed residual — see the Serial-fraction measurement section's
+reconciliation), `3.52 → 3.64` and `3.52 → 3.72`. So the artifact is real in
+principle, but it cannot be masking relieved contention here, because there is
+no residual deficit in mimalloc's `S(8)` for it to mask; if anything the
+correction says mimalloc scales fractionally better, by an amount far inside
+the noise. The supportable reading is the neutral one: **on this evidence
+mimalloc neither raised nor lowered `S(w)` measurably**, and the load-bearing
+finding is instead that mimalloc's own curve is itself sub-linear (81% at
+`w=4`, 88% at `w=8`).
 
 **Verdict.** Combining both interventions: allocator cost is large and real
 — Step 2 confirms this causally, not just as a profile bucket, since a
-different allocator saves 1.6x-1.8x of wall time at every worker count — but
+different allocator saves 1.6x-1.7x of wall time at every worker count — but
 it is **not the primary cause of the sub-linear scaling curves** in the
 Scaling curves section below. Step 1 shows glibc's per-thread arenas are
 load-bearing scaffolding that, if removed, produces catastrophic (9.16x)
@@ -356,34 +392,44 @@ contention; but that scaffolding is exactly what the default configuration
 under which every scaling curve in this document was measured already has,
 and Step 2 shows a qualitatively different, more contention-resistant
 allocator does not measurably unlock additional scaling headroom on top of
-it — the Amdahl-compression caveat above bounds how much of that null result
-could be masking relieved contention at roughly 15%-30% of the observed gap,
-not most of it, so the reading is not fully dispositive but is the
-best-supported one on the evidence gathered. At this thread count, allocator
-behavior reads as **mostly pure per-thread overhead, not primarily a scaling
-limiter** — the concern belongs to issue #26 (allocation count/size), not to
-this investigation's search for what caps `S(w)` below linear. The gap
-between measured `S(4)`/`S(8)` and the ideal 4x/8x — Amdahl-implied serial
-fractions of 6.3% (BCF) to 10.0% (VCF) against a measured chunk-barrier
-serial fraction of only ~3% (Task 3) — **remains open** after this task, with
+it — and, more directly, that this contention-immune allocator's *own* curve
+is sub-linear to essentially the same degree (81% at `w=4`, 88% at `w=8`),
+which no amount of relieved-but-masked contention can explain away. At this
+thread count, allocator behavior reads as **mostly pure per-thread overhead,
+not primarily a scaling limiter** — the concern belongs to issue #26
+(allocation count/size), not to this investigation's search for what caps
+`S(w)` below linear. The gap between measured `S(4)`/`S(8)` and the ideal
+4x/8x — Amdahl-implied serial fractions of ~10% (10.1% BCF, 10.0% VCF)
+against a measured chunk-barrier serial fraction of only ~3% (Task 3) —
+**remains open** after this task, with
 both originally-proposed candidates (chunk-barrier serial drain, allocator
-contention) now tested and substantially, though not with 100% certainty on
-the allocator side, exonerated.
+contention) now tested and exonerated — the allocator one on two independent
+grounds: swapping allocators does not move `S(w)` measurably, and the
+contention-immune allocator's own curve is sub-linear by the same margin.
 
 ### Scaling curves
 
-Fixed workload throughout (2000 samples × 20000 records, 80M cells, `seed=42`), swept over `VCFIXTURE_BENCH_WORKERS ∈ {1,2,3,4,6,8}`, 3 reps per cell (`VCFIXTURE_BENCH_REPS=3`), reporting `min_s`/`med_s`/`max_s` per cell. `S(w) = min_s(1) / min_s(w)`; efficiency is `S(w) / min(w, 4)` — against **4 physical cores**, per the hardware section above (so `w=6` and `w=8` both divide by 4, not by `w`).
+Fixed workload throughout (2000 samples × 20000 records, 80M cells, `seed=42`), swept over `VCFIXTURE_BENCH_WORKERS ∈ {1,2,3,4,6,8}`, 3 reps per cell (`VCFIXTURE_BENCH_REPS=3`), reporting `min_s`/`med_s`/`max_s` per cell. `S(w) = min_s(1) / min_s(w)`; efficiency is `S(w) / min(w, 4)` — against **4 physical cores**, per the hardware section above (so `w=6` and `w=8` both divide by 4, not by `w`). The BCF-unpinned `workers=1` anchor was subsequently re-measured and revised downward; see "Measurement noise and anchor stability" immediately below for the samples, the decision rule, and which curves it changed.
 
 **BCF, unpinned** (`Cpus_allowed_list: 0-3,48-51`, all 8 logical CPUs available):
 
 | workers | min_s | med_s | max_s | S(w) | S(w)/min(w,4) |
 |---|---|---|---|---|---|
-| 1 | 27.577 | 31.642 | 36.312 | 1.00 | 1.00 |
-| 2 | 13.309 | 14.042 | 18.509 | 2.07 | 1.04 |
-| 3 | 10.614 | 12.355 | 12.526 | 2.60 | 0.87 |
-| 4 | 8.205 | 8.305 | 8.374 | 3.36 | 0.84 |
-| 6 | 7.580 | 7.650 | 8.024 | 3.64 | 0.91 |
-| 8 | 7.153 | 7.363 | 7.802 | 3.86 | 0.96 |
+| 1 † | 25.193 | 26.829 | 36.312 | 1.00 | 1.00 |
+| 2 | 13.309 | 14.042 | 18.509 | 1.89 | 0.95 |
+| 3 | 10.614 | 12.355 | 12.526 | 2.37 | 0.79 |
+| 4 | 8.205 | 8.305 | 8.374 | 3.07 | 0.77 |
+| 6 | 7.580 | 7.650 | 8.024 | 3.32 | 0.83 |
+| 8 | 7.153 | 7.363 | 7.802 | 3.52 | 0.88 |
+
+† This cell pools **8 samples**, not 3: the original 3-rep cell
+(27.577/31.642/36.312) plus the five spread-out single-shots from the anchor
+re-measurement below, which found the original cell had landed in a
+contaminated window. `min_s` is the min over all eight; `med_s` is the same
+upper-middle order statistic the harness reports, applied to the pooled eight.
+Every other cell in every curve still rests on 3 reps — see "Measurement noise
+and anchor stability" below for the decision rule and for why this asymmetry
+is disclosed rather than removed.
 
 **BCF, pinned to physical cores only** (`taskset -c 0-3`, excludes the 48-51 SMT siblings):
 
@@ -407,9 +453,137 @@ Fixed workload throughout (2000 samples × 20000 records, 80M cells, `seed=42`),
 | 6 | 5.906 | 6.082 | 6.095 | 3.14 | 0.78 |
 | 8 | 5.521 | 5.794 | 5.947 | 3.36 | 0.84 |
 
-Two of the three curves rise monotonically from `w=1` through `w=8`; the BCF-pinned curve does not. BCF-unpinned reaches 3.36x by `w=4` (84% efficient against 4 physical cores) and keeps climbing more slowly through the SMT range to 3.86x at `w=8` (96% efficient) — consistent with the SMT siblings contributing real, if diminished, throughput on this workload rather than pure oversubscription noise. VCF-unpinned also climbs monotonically throughout, from 3.07x at `w=4` to 3.36x at `w=8`. BCF-pinned tracks BCF-unpinned reasonably closely through `w=4` (within the ~10% single-run spread already established elsewhere in this document for this exact workload, see Hypothesis 1) but shows the oversubscription signature the other two curves don't: `S(6)=3.10` dips slightly below `S(4)=3.17` before recovering to `S(8)=3.29` — running 6 or 8 rayon+bgzf threads on 4 pinned physical cores produces mild, non-monotonic thrashing rather than a clean plateau, expected once the process is confined to fewer cores than it requests threads for.
+Two of the three curves rise monotonically from `w=1` through `w=8`; the BCF-pinned curve does not. BCF-unpinned reaches 3.07x by `w=4` (77% efficient against 4 physical cores) and keeps climbing more slowly through the SMT range to 3.52x at `w=8` (88% efficient) — consistent with the SMT siblings contributing real, if diminished, throughput on this workload rather than pure oversubscription noise. VCF-unpinned also climbs monotonically throughout, from 3.07x at `w=4` to 3.36x at `w=8`. BCF-pinned tracks BCF-unpinned reasonably closely through `w=4` (their `min_s` values differ by 8% at `w=4`, inside the cross-session `min_s` band characterized below) but shows the oversubscription signature the other two curves don't: `S(6)=3.10` dips slightly below `S(4)=3.17` before recovering to `S(8)=3.29` — running 6 or 8 rayon+bgzf threads on 4 pinned physical cores produces mild, non-monotonic thrashing rather than a clean plateau, expected once the process is confined to fewer cores than it requests threads for.
 
-VCF's absolute speedup is lower than BCF-**unpinned**'s at every worker count `w≥4` (3.07 vs 3.36 at `w=4`, 3.14 vs 3.64 at `w=6`, 3.36 vs 3.86 at `w=8`), and its peak (3.36x at `w=8`) is not materially higher than BCF-unpinned's peak (3.86x) — this is the comparison Gate B's "VCF reaches a materially higher peak speedup than BCF" clause evaluates, using the brief's default BCF-unpinned series, so Gate B does not fire on this evidence. VCF is *not*, however, uniformly below BCF-**pinned**: it trails at `w=4` (3.07 vs 3.17) but overtakes it at `w=6` (3.14 vs 3.10) and `w=8` (3.36 vs 3.29) — VCF's peak is in fact ~2% above BCF-pinned's peak (3.36 vs 3.29). That crossover is the same order of magnitude as the ~10% single-run spread noted above, so it reads as directionally suggestive rather than conclusive proof that uncompressed rayon-only writes outrun bgzf-pinned writes past `w=4` — but it is exactly the comparison Gate B's peak-speedup clause is asking about, so it is worth flagging even though it does not change the verdict (the gate's default series is BCF-unpinned, against which VCF's peak is clearly lower, not higher). VCF's efficiency plateaus at 77%–84% from `w=4` onward (77% at `w=4`, 78% at `w=6`, 84% at `w=8`) rather than climbing toward 100%, indicating a real, if modest, sub-linear component in rayon-only fan-out scaling that is not explained by the bgzf pool at all.
+VCF's *relative* speedup — `S(w)` is normalized against each curve's own `workers=1` baseline, and the three baselines differ (25.193s, 23.996s, 18.529s), so an `S` comparison across curves compares two differently-normalized quantities and cannot be read as an absolute throughput comparison — is at or below BCF-**unpinned**'s from `w=4` onward: a statistical tie at `w=4` (3.075 vs 3.070, a 0.1% difference), then 3.14 vs 3.32 at `w=6` and 3.36 vs 3.52 at `w=8`. In absolute wall clock VCF is of course faster everywhere (6.026s vs 8.205s at `w=4`), because it does no DEFLATE work; that is a different statement from scaling better. VCF's peak (3.36x at `w=8`) is not materially higher than BCF-unpinned's peak (3.52x) — this is the comparison Gate B's "VCF reaches a materially higher peak speedup than BCF" clause evaluates, using the brief's default BCF-unpinned series, so Gate B does not fire on this evidence. VCF is *not*, however, uniformly below BCF-**pinned**: it trails at `w=4` (3.07 vs 3.17) but overtakes it at `w=6` (3.14 vs 3.10) and `w=8` (3.36 vs 3.29) — VCF's peak is in fact ~2% above BCF-pinned's peak (3.36 vs 3.29). A 2% crossover is far inside every noise band this document measures, so it reads as directionally suggestive rather than conclusive proof that uncompressed rayon-only writes outrun bgzf-pinned writes past `w=4` — but it is exactly the comparison Gate B's peak-speedup clause is asking about, so it is worth flagging even though it does not change the verdict (the gate's default series is BCF-unpinned, against which VCF's peak is lower, not higher). VCF's efficiency plateaus at 77%–84% from `w=4` onward (77% at `w=4`, 78% at `w=6`, 84% at `w=8`) rather than climbing toward 100%, indicating a real, if modest, sub-linear component in rayon-only fan-out scaling that is not explained by the bgzf pool at all — and the BCF-unpinned curve now plateaus over a similar 77%–88% range *with* the pool present, coinciding exactly at `w=4`, which is the cleanest single statement of how little the pool matters to scaling here.
+
+### Measurement noise and anchor stability
+
+This document previously carried three mutually inconsistent noise models — a
+"~10%" figure quoted in several places, an "~18%" figure quoted in one, and
+the scaling tables themselves, which imply neither. This section replaces all
+of them with one model derived from the recorded data.
+
+**Per-cell spread.** Every scaling-curve cell above is 3 reps taken back to
+back, so `max_s/min_s - 1` is a direct read of within-cell, within-session
+run-to-run spread. (The BCF-unpinned `workers=1` cell is shown here as its
+*original* 3-rep cell, before the pooling described below, so that all 18
+entries are like-for-like.)
+
+| workers | BCF-unpinned | BCF-pinned | VCF-unpinned |
+|---|---|---|---|
+| 1 | 32% ‡ | 8% | 3% |
+| 2 | 39% | 1% | 61% |
+| 3 | 18% | 21% | 9% |
+| 4 | 2% | 7% | 3% |
+| 6 | 6% | 2% | 3% |
+| 8 | 9% | 2% | 8% |
+
+‡ the original 3-rep cell, before the anchor re-measurement below.
+
+The structure is unmistakable and it is not "~10%" anywhere: **every spread of
+18% or more occurs at `w ≤ 3`, and every cell at `w ≥ 4` falls between 2% and
+9%.** Median spread is 18% for `w ≤ 3` and 3% for `w ≥ 4`. Two plausible
+mechanisms compound, both pointing the same way. First, exposure: a `w=1` run
+occupies the allocation for ~25s against ~7s at `w=8`, a 3.5x wider window in
+which another tenant of this 96-CPU node, or the node's own background load,
+can collide with it. Second, and more important, redundancy: when a run has
+eight rayon threads and one is descheduled, the other seven keep working and
+work-stealing rebalances around it, so an interruption costs a fraction of the
+run; when a run has one thread, that thread's wall clock *is* the run's wall
+clock and any stall lands on the total at full weight. Long, undiversified
+runs are noisy; short, many-threaded ones are not.
+
+**Per-run spread is not estimator error.** The two must not be conflated. The
+tables report `min_s`, and a minimum over 3 draws is far more stable than any
+single draw — that is precisely why `min_s` was chosen. The 61% spread in
+VCF's `w=2` cell, for instance, comes from one 17.061s outlier against a
+10.615s minimum; the minimum is what `S(w)` uses and the outlier does not
+touch it. What the min-of-3 estimator does *not* protect against is all three
+reps landing inside the same contaminated window, which is what happened at
+BCF-unpinned `w=1` and is the subject of the re-measurement below.
+
+**The ~18% figure, reconciled.** The Allocator interventions section observed
+a same-configuration `workers=8` `min_s` of 8.467s against Task 2's 7.153s, an
+18% difference. That is a *cross-session* shift in the estimator, a different
+quantity from within-cell spread (9% for that same cell). Both are real. The
+resulting rule of thumb, which the rest of this document now uses: **within a
+session at `w ≥ 4`, single runs vary by 2%–9% and `min_s` is stable to a few
+percent; across sessions, a `min_s`-to-`min_s` comparison carries about ±20%;
+at `w ≤ 3` single runs can vary by tens of percent and no single-shot
+comparison at those worker counts should be trusted to better than that.**
+
+**Anchor re-measurement.** Because `S(w) = min_s(1) / min_s(w)`, every speedup
+in this document divides by a `workers=1` cell — and BCF-unpinned's was the
+noisiest cell in the study (32% spread, and it implied `S(2)=2.07`, i.e. 104%
+efficiency: super-linear speedup, which is the standard red flag for an
+inflated baseline). Two independent `workers=1` BCF measurements elsewhere in
+this document (26.103s in the Hypothesis 1/2 sections, 25.485s in the
+*instrumented* Serial-fraction run — i.e. carrying extra overhead and still
+faster) both sat well below it. So the anchor was stress-tested directly.
+
+Method: the release binary was rebuilt and verified free of instrumentation
+(`strings ./target/release/examples/bulk_bench | grep -c '\[instr\]'` returned
+0), then **five independent passes** were
+run, each measuring the three `workers=1` configurations once each
+(`VCFIXTURE_BENCH_REPS=1`) in the order BCF-unpinned, BCF-pinned
+(`taskset -c 0-3`), VCF-unpinned. Spreading five single samples across ~7
+minutes, rather than taking `REPS=5` on one cell, is deliberate: a single
+contaminated window can swallow a whole `REPS=n` cell but cannot swallow five
+passes separated in time. Individual times, in seconds:
+
+| pass | BCF-unpinned | BCF-pinned | VCF-unpinned |
+|---|---|---|---|
+| 1 | 26.061 | 26.162 | 20.796 |
+| 2 | 26.250 | 26.079 | 19.292 |
+| 3 | 25.193 | 25.860 | 20.561 |
+| 4 | 25.620 | 25.258 | 19.220 |
+| 5 | 26.829 | 25.755 | 19.637 |
+
+Decision rule, fixed in advance: for each curve take the minimum over *all*
+samples now available (the five new ones plus the original cell's three) —
+the same min estimator the study already uses, given more data. If that new
+minimum is more than 5% below the recorded `min_s(1)`, adopt it and re-derive
+the curve; otherwise keep the recorded anchor and record the stability check.
+
+| curve | recorded `min_s(1)` | min over 5 new | min over all 8 | below recorded | branch |
+|---|---|---|---|---|---|
+| BCF-unpinned | 27.577 | 25.193 | **25.193** | 8.6% | **adopt** |
+| BCF-pinned | 23.996 | 25.258 | **23.996** | 0.0% | keep |
+| VCF-unpinned | 18.529 | 19.220 | **18.529** | 0.0% | keep |
+
+So only BCF-unpinned changed: its anchor moved 27.577s → **25.193s**, and its
+`S(w)` and efficiency columns above are computed against 25.193s. BCF-pinned
+and VCF-unpinned are unchanged — for both, five fresh spread-out samples
+failed to beat the recorded minimum at all, which is the stability check
+passing.
+
+Three things this makes visible, all worth recording:
+
+- **The original `w=1` cell was a contaminated window, not a slow
+  configuration.** The five new BCF-unpinned samples span 25.193–26.829, a 6.5%
+  spread; the original three span 27.577–36.312. Six of the eight samples now
+  lie within 9.5% of each other and the two outliers are both from the original
+  triple. That is the signature of three consecutive reps hitting interference,
+  exactly the failure mode `REPS=n` cannot detect and time-separated passes can.
+- **The implausible readings are gone.** `S(2)` was 2.07 — super-linear, 104%
+  efficient at two workers; it is now 1.89 (95%). And
+  BCF-pinned's `w=1` was 13% *faster* than BCF-unpinned's, which would have
+  meant restricting a 1-worker run to 4 of 8 logical CPUs sped it up; the two
+  are now 4.8% apart, with the fresh samples showing them essentially level
+  (unpinned 25.193–26.829, pinned 25.258–26.162).
+- **BCF-pinned's anchor is now the under-sampled one.** It rests on 3 samples
+  where BCF-unpinned's rests on 8, and 23.996s sits below all five fresh pinned
+  samples. Since a min over more samples is biased low, BCF-pinned's `S(w)`
+  column is, if anything, slightly *deflated* relative to BCF-unpinned's. This
+  asymmetry — anchors sampled 8-and-3 deep while every other cell has 3 — is
+  disclosed rather than removed; closing it would mean re-running the whole
+  sweep, which would answer no open question in this document.
+
+None of this changes any verdict. It does move the BCF-unpinned headline
+efficiencies down (84% → 77% at `w=4`, 96% → 88% at `w=8`), which makes the
+residual sub-linearity *larger* than previously published, not smaller — the
+correction is in the conservative direction.
 
 ### Serial-fraction measurement
 
@@ -467,8 +641,10 @@ index 40a90f4..bf5c0de 100644
 
 Run commands (default BCF format — the brief's Step 3 does not set
 `VCFIXTURE_BENCH_FORMAT`; `VCFIXTURE_BENCH_REPS` is also unset, so `reps=1`,
-**single-shot** measurements sitting on the ~10% run-to-run spread already
-established elsewhere in this document, not averaged over repetitions):
+**single-shot** measurements, not averaged over repetitions — read them at the
+per-worker-count bands characterized in "Measurement noise and anchor
+stability" above, which is tens of percent for the `workers=1` run and 2%–9%
+for the `workers=8` one):
 
 ```
 TMPDIR=$CLAUDE_JOB_DIR/tmp VCFIXTURE_BENCH_SAMPLES=2000 VCFIXTURE_BENCH_RECORDS=20000 VCFIXTURE_BENCH_WORKERS=1 ./target/release/examples/bulk_bench
@@ -482,12 +658,35 @@ Results:
 | 1 | 24.670s | 0.742s | 0.0292 |
 | 8 |  7.135s | 0.229s | 0.0310 |
 
-The `workers=1` value is the control: with only one worker there is nothing to
-park at the barrier, so `serial_frac=0.0292` at `workers=1` is measuring the
-drain loop's intrinsic cost (memcpy + bookkeeping), not contention. Going from
+The `workers=1` value is the control: with only one worker there is no rayon
+pool to park at the barrier, so `serial_frac=0.0292` at `workers=1` bounds the
+drain loop's cost in the absence of any barrier contention (the next paragraph
+shows part of even that is bgzf back-pressure rather than the loop's own
+memcpy). Going from
 `workers=1` to `workers=8`, `serial_frac` barely moves — 0.0292 → 0.0310, a
 0.18-point rise — which is consistent with no material barrier-contention
 effect at 8 workers beyond the loop's fixed cost.
+
+One feature of the table deserves naming because it cuts *for* the
+exoneration. In absolute seconds `t_ser` falls 0.742s → 0.229s from
+`workers=1` to `workers=8` — 3.2x faster. A genuinely serial memcpy cannot get
+3.2x faster by adding workers, so a large part of what the serial timer
+captures is evidently not fixed serial work at all but bgzf back-pressure: at
+`workers=1` the single compression thread cannot drain the staging buffer as
+fast as `write_encoded` fills it, and the drain loop blocks; at `workers=8` the
+compression pool keeps up and the same loop is nearly free. The genuinely fixed
+component is therefore *at most* 0.229s, not 0.742s — which makes the barrier
+an even smaller candidate for the residual than the `serial_frac` figures
+alone suggest.
+
+This also puts Task 4's Amdahl-mechanical caveat, which models a fixed cost
+`F` constant across worker counts, in tension with these very numbers. That
+tension does not change its conclusion: recomputing that caveat's `S(8)`
+comparison with a *variable* fixed cost — 0.742s at `w=1`, 0.229s at `w=8` —
+gives glibc 3.531 and mimalloc 3.539, a gap of −0.008 against a raw gap of
+−0.002. Both are indistinguishable from zero, exactly as the constant-`F`
+treatment found, so the caveat's reading survives its own assumption being
+imperfect.
 
 **Denominator reconciliation.** `serial_frac`'s denominator is
 `t_par + t_ser` (instrumented time only, summed across `stream_contigs`'s
@@ -512,19 +711,19 @@ strengthens rather than weakens the exoneration reading below.
 `s = (p - S) / (S(p - 1))`. Inverting for `s` is sensitive to the third
 decimal of `S`, so the arithmetic below uses `S(4)` computed directly from the
 underlying `min_s` ratio to 3 decimal places, not the Scaling curves table's
-2-decimal display (`27.577 / 8.205 = 3.361`, `18.529 / 6.026 = 3.075`; the
-table rounds these to `3.36` and `3.07` respectively — same numbers, tighter
-precision here). The instrumented runs above use the default BCF format, so
-the like-for-like comparison is the **BCF-unpinned** curve from Task 2, whose
-`S(4) = 3.361` (min_s 8.205s vs 27.577s at `workers=1`, from the Scaling
-curves table above):
+2-decimal display (`25.193 / 8.205 = 3.070`, `18.529 / 6.026 = 3.075`; the
+table rounds both to `3.07` — same numbers, tighter precision here). The
+instrumented runs above use the default BCF format, so the like-for-like
+comparison is the **BCF-unpinned** curve, whose `S(4) = 3.070` (min_s 8.205s
+against the re-measured 25.193s anchor at `workers=1`, from the Scaling curves
+table above):
 
 ```
-s = (4 - 3.361) / (3.361 * (4 - 1)) = 0.639 / 10.083 ≈ 0.0634
+s = (4 - 3.070) / (3.070 * (4 - 1)) = 0.930 / 9.211 ≈ 0.1009
 ```
 
-i.e. Amdahl's law says a 6.34% serial fraction would fully explain
-BCF-unpinned's `S(4) = 3.361`. For reference, since Gate C fired on the VCF
+i.e. Amdahl's law says a 10.09% serial fraction would fully explain
+BCF-unpinned's `S(4) = 3.070`. For reference, since Gate C fired on the VCF
 series, the same arithmetic against VCF-unpinned's `S(4) = 3.075` (min_s 6.026s
 vs 18.529s):
 
@@ -533,22 +732,31 @@ s = (4 - 3.075) / (3.075 * (4 - 1)) = 0.925 / 9.225 ≈ 0.1003
 ```
 
 i.e. VCF-unpinned's scaling would need a 10.03% serial fraction to be fully
-explained by Amdahl's law alone — a larger implied fraction than BCF's, which
-is expected since VCF has no bgzf compression pool to compete with rayon for
-cores, so any residual sub-linearity has to come from somewhere other than that
-oversubscription.
+explained by Amdahl's law alone. The two implied fractions are effectively
+identical — 10.09% with a bgzf compression pool competing for cores, 10.03%
+with no such pool at all. That coincidence is itself informative: whatever
+serial-or-serializing component Amdahl's law is inferring here is the same
+size with and without the pool, which independently corroborates the
+oversubscription exoneration recorded under Hypothesis 2.
 
-**Reading.** Measured `serial_frac` at `workers=8` (**0.031**, 3.1%) is under a
-third of the BCF-unpinned Amdahl-implied fraction (0.063, 6.3%) — and under a
-third of the VCF-unpinned one too (0.100, 10.0%). Both instrumented values sit
-comfortably under the brief's 5% exoneration threshold, and the `workers=1`
-control shows the loop's baseline cost (2.9%) accounts for nearly all of the
-`workers=8` figure (3.1%), leaving at most ~0.2 points attributable to
-contention at 8 workers. **The chunk barrier's serial drain is exonerated: it
-is not the source of the sub-linear scaling gate C flagged.** The gap between
-measured speedup and linear scaling lies elsewhere — consistent with
-Hypothesis 2's two untested candidates (glibc allocator arena-lock contention,
-rayon+bgzf thread oversubscription), which Task 4 investigates.
+**Reading.** Amdahl's `s` is defined as the serial fraction of the
+*sequential* run, so the like-for-like measured quantity is the `workers=1`
+control: **0.0292 (2.9%) against BCF-unpinned's implied 0.1009 (10.1%)** —
+under a third, and likewise under a third of VCF-unpinned's implied 0.1003.
+The `workers=8` figure (0.031, 3.1%) tells the same story against the same
+implied fractions, and its near-identity with the `workers=1` control is what
+shows the barrier is not *becoming* more expensive under contention: the loop's
+baseline cost accounts for nearly all of it, leaving at most ~0.2 points
+attributable to contention at 8 workers. Both instrumented values sit
+comfortably under the brief's 5% exoneration threshold. **The chunk barrier's
+serial drain is exonerated: it is not the source of the sub-linear scaling
+gate C flagged.** Where the gap does lie is not settled by this document. Both
+of Hypothesis 2's originally named candidates were subsequently tested and
+neither survived — the allocator by Task 4's two interventions (and by the
+observation that mimalloc's own curve is sub-linear), thread oversubscription
+by Task 2's uncompressed-VCF ablation, which has no bgzf pool at all and still
+falls short. See the Hypothesis 2 verdict above for the resulting list of
+candidates that remain genuinely untested.
 
 ### Profiling
 
