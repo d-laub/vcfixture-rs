@@ -515,7 +515,7 @@ comparison at those worker counts should be trusted to better than that.**
 
 **Anchor re-measurement.** Because `S(w) = min_s(1) / min_s(w)`, every speedup
 in this document divides by a `workers=1` cell — and BCF-unpinned's was the
-noisiest cell in the study (32% spread, and it implied `S(2)=2.07`, i.e. 104%
+noisiest `workers=1` cell in the study (32% spread, and it implied `S(2)=2.07`, i.e. 104%
 efficiency: super-linear speedup, which is the standard red flag for an
 inflated baseline). Two independent `workers=1` BCF measurements elsewhere in
 this document (26.103s in the Hypothesis 1/2 sections, 25.485s in the
@@ -573,12 +573,20 @@ Three things this makes visible, all worth recording:
   are now 4.8% apart, with the fresh samples showing them essentially level
   (unpinned 25.193–26.829, pinned 25.258–26.162).
 - **BCF-pinned's anchor is now the under-sampled one.** It rests on 3 samples
-  where BCF-unpinned's rests on 8, and 23.996s sits below all five fresh pinned
-  samples. Since a min over more samples is biased low, BCF-pinned's `S(w)`
-  column is, if anything, slightly *deflated* relative to BCF-unpinned's. This
-  asymmetry — anchors sampled 8-and-3 deep while every other cell has 3 — is
-  disclosed rather than removed; closing it would mean re-running the whole
-  sweep, which would answer no open question in this document.
+  where BCF-unpinned's rests on 8. A min over more samples is biased low, so
+  it is BCF-unpinned's own anchor that is pulled down the most — meaning
+  BCF-unpinned's `S(w)` column is, if anything, the more *deflated* of the
+  three, not the least: its published speedups are the most conservative in
+  the document, the same direction noted above for glibc vs. mimalloc.
+  Separately, and worth recording on its own: 23.996s also sits below all
+  five of BCF-pinned's fresh samples, which speaks to 23.996s being a
+  reasonable minimum for that curve, not to which curve's `S(w)` is biased
+  relative to the other. Between the two effects, the net relative direction
+  between BCF-pinned's and BCF-unpinned's `S(w)` columns is not determinable
+  from this data. This asymmetry — anchors sampled 8-and-3 deep while every
+  other cell has 3 — is disclosed rather than removed; closing it would mean
+  re-running the whole sweep, which would answer no open question in this
+  document.
 
 None of this changes any verdict. It does move the BCF-unpinned headline
 efficiencies down (84% → 77% at `w=4`, 96% → 88% at `w=8`), which makes the
