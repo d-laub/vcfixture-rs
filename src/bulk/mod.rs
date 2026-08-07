@@ -551,6 +551,14 @@ impl BulkSpec {
             .num_threads(self.workers.get())
             .build()?;
 
+        // Every `Size` variant generates into a temp file beside the
+        // destination and is promoted by a single rename once the output is
+        // complete and indexed. Writing straight to `path` would leave a
+        // truncated, un-indexed file there if encoding or I/O failed
+        // mid-stream (issue #27); with this shape a failure leaves the
+        // destination untouched.
+        let tmp_dir = temp_dir_for(path);
+
         // `&self.size` rather than `self.size`: `Size` is no longer `Copy`
         // (`PerContig` carries a map), and moving it out of `self` here
         // would forbid the `&self` method calls further down.
@@ -560,35 +568,21 @@ impl BulkSpec {
             Size::PerContig(map) => per_contig_counts(map, &self.contig_ids)?,
             Size::Target(target_bytes) => {
                 let (_counts, tmp, _bytes, summary) =
-                    self.resolve_target_counts(&pool, &samplers, fitted, *target_bytes)?;
+                    self.resolve_target_counts(&pool, &samplers, fitted, *target_bytes, tmp_dir)?;
                 Self::promote_temp(tmp, path, self.format)?;
-                let json = summary.to_json()?;
-                let mut summary_path = path.as_os_str().to_os_string();
-                summary_path.push(".summary.json");
-                std::fs::write(&summary_path, json)?;
+                write_summary_json(path, &summary)?;
                 return Ok(summary);
             }
         };
 
-        let layouts = self.compute_layouts(&pool, &samplers, fitted, &counts)?;
-        let spans: Vec<u64> = layouts.iter().map(|l| l.span()).collect();
-
-        let header = self.build_header(&spans);
-        let mut writer = BulkWriter::create(
-            path,
-            self.format,
-            &header,
-            self.compression_level,
-            self.workers,
-        )?;
-        let summary =
-            self.stream_contigs(&pool, &samplers, fitted, &layouts, &header, &mut writer)?;
-        writer.finish_and_index(path)?;
-
-        let json = summary.to_json()?;
-        let mut summary_path = path.as_os_str().to_os_string();
-        summary_path.push(".summary.json");
-        std::fs::write(&summary_path, json)?;
+        // `write_to_temp` performs exactly the compute_layouts /
+        // build_header / create / stream_contigs / finish_and_index
+        // sequence that used to be inlined here, and its doc comment
+        // already committed to being byte-exact against this path.
+        let (tmp, _bytes, summary) =
+            self.write_to_temp(&pool, &samplers, fitted, &counts, tmp_dir)?;
+        Self::promote_temp(tmp, path, self.format)?;
+        write_summary_json(path, &summary)?;
 
         Ok(summary)
     }
@@ -898,14 +892,15 @@ impl BulkSpec {
         samplers: &Samplers,
         fitted: &Fitted,
         target_bytes: u64,
+        dir: &Path,
     ) -> Result<(Vec<u64>, tempfile::NamedTempFile, u64, Summary), BulkError> {
         let n_contigs = self.contig_ids.len() as u64;
 
         // Two calibration points; c2 = 2*c1 so the slope is well-conditioned.
         let split1 = distribute_by_n_variants(fitted, &self.contig_ids, 1_000 * n_contigs);
         let split2 = distribute_by_n_variants(fitted, &self.contig_ids, 2_000 * n_contigs);
-        let bytes1 = self.measured_bytes(pool, samplers, fitted, &split1)?;
-        let bytes2 = self.measured_bytes(pool, samplers, fitted, &split2)?;
+        let bytes1 = self.measured_bytes(pool, samplers, fitted, &split1, dir)?;
+        let bytes2 = self.measured_bytes(pool, samplers, fitted, &split2, dir)?;
 
         let r1 = split1.iter().sum::<u64>() as f64;
         let r2 = split2.iter().sum::<u64>() as f64;
@@ -924,7 +919,7 @@ impl BulkSpec {
         const MAX_CORRECTIONS: usize = 6;
         let mut prev: Option<(u64, u64, u64)> = None; // (records, bytes, extra) from the last round
         for _ in 0..MAX_CORRECTIONS {
-            let (tmp, bytes, summary) = self.write_to_temp(pool, samplers, fitted, &counts)?;
+            let (tmp, bytes, summary) = self.write_to_temp(pool, samplers, fitted, &counts, dir)?;
             if bytes >= target_bytes {
                 return Ok((counts, tmp, bytes, summary));
             }
@@ -957,16 +952,7 @@ impl BulkSpec {
             }
             prev = Some((records, bytes, extra));
 
-            // `write_to_temp` may have left a `<tmp_path>.csi` companion
-            // (Bcf only) that `NamedTempFile`'s `Drop` does not know about;
-            // best-effort clean it up, mirroring
-            // `BulkSpec::measured_bytes`, so repeated corrective rounds
-            // don't litter the temp dir.
-            if matches!(self.format, Format::Bcf) {
-                let mut csi_path = tmp.path().as_os_str().to_os_string();
-                csi_path.push(".csi");
-                let _ = std::fs::remove_file(csi_path);
-            }
+            cleanup_csi(tmp.path(), self.format);
             drop(tmp); // discard the under-target temp before regenerating
         }
 
@@ -995,12 +981,13 @@ impl BulkSpec {
         samplers: &Samplers,
         fitted: &Fitted,
         per_contig_count: &[u64],
+        dir: &Path,
     ) -> Result<(tempfile::NamedTempFile, u64, Summary), BulkError> {
         let layouts = self.compute_layouts(pool, samplers, fitted, per_contig_count)?;
         let spans: Vec<u64> = layouts.iter().map(|l| l.span()).collect();
 
         let header = self.build_header(&spans);
-        let tmp = tempfile::NamedTempFile::new()?;
+        let tmp = tempfile::NamedTempFile::new_in(dir)?;
         let tmp_path = tmp.path().to_path_buf();
 
         let mut w = BulkWriter::create(
@@ -1028,18 +1015,11 @@ impl BulkSpec {
         samplers: &Samplers,
         fitted: &Fitted,
         per_contig_count: &[u64],
+        dir: &Path,
     ) -> Result<u64, BulkError> {
         let (tmp, bytes, _summary) =
-            self.write_to_temp(pool, samplers, fitted, per_contig_count)?;
-        // `finish_and_index` may have written a `<tmp>.csi` companion (Bcf
-        // only) that `NamedTempFile`'s `Drop` does not know about;
-        // best-effort clean it up so repeated calibration rounds don't
-        // litter the temp dir.
-        if matches!(self.format, Format::Bcf) {
-            let mut csi_path = tmp.path().as_os_str().to_os_string();
-            csi_path.push(".csi");
-            let _ = std::fs::remove_file(csi_path);
-        }
+            self.write_to_temp(pool, samplers, fitted, per_contig_count, dir)?;
+        cleanup_csi(tmp.path(), self.format);
         Ok(bytes)
     }
 
@@ -1314,6 +1294,45 @@ fn distribute_by_n_variants(fitted: &Fitted, contig_ids: &[String], total: u64) 
     counts
 }
 
+/// The directory temp files are created in for a given destination.
+///
+/// Deliberately not `TMPDIR`: `NamedTempFile::new` puts temps there, which
+/// is routinely a `tmpfs` or a different filesystem from the output. A
+/// cross-filesystem `persist` falls back to `std::fs::copy`, which for
+/// bulk-scale output doubles the I/O and can fail outright when `TMPDIR` is
+/// too small to hold a second copy. Creating the temp beside the destination
+/// makes promotion a same-filesystem rename in every case.
+fn temp_dir_for(dest: &Path) -> &Path {
+    match dest.parent() {
+        // A bare filename like `out.bcf` has a parent of `""`, which is not
+        // a usable directory.
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
+}
+
+/// Best-effort removal of a temp file's `.csi` companion, which
+/// `NamedTempFile`'s `Drop` does not know about.
+///
+/// Centralised so a new temp call site cannot forget it; this used to be two
+/// duplicated inline blocks, the second commented as "mirroring" the first.
+fn cleanup_csi(tmp_path: &Path, format: Format) {
+    if matches!(format, Format::Bcf) {
+        let mut csi_path = tmp_path.as_os_str().to_os_string();
+        csi_path.push(".csi");
+        let _ = std::fs::remove_file(csi_path);
+    }
+}
+
+/// Writes `<dest>.summary.json` alongside a promoted output file.
+fn write_summary_json(dest: &Path, summary: &Summary) -> Result<(), BulkError> {
+    let json = summary.to_json()?;
+    let mut summary_path = dest.as_os_str().to_os_string();
+    summary_path.push(".summary.json");
+    std::fs::write(&summary_path, json)?;
+    Ok(())
+}
+
 /// The header `##FORMAT` definition for one FORMAT key.
 ///
 /// `noodles-bcf`'s encoder looks up each key's declared `Number`/`Type` in
@@ -1355,6 +1374,29 @@ fn format_map(key: &str) -> Map<HeaderFormatMap> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Temps must be created beside the destination, never in `TMPDIR`.
+    ///
+    /// If this regresses, `promote_temp` silently falls back to
+    /// `std::fs::copy` whenever `TMPDIR` is on a different filesystem from
+    /// the output — doubling the I/O for a bulk-scale write, and failing
+    /// outright when `TMPDIR` is a `tmpfs` too small to hold a second copy.
+    /// Nothing else in the suite would notice, because the output is
+    /// correct either way.
+    #[test]
+    fn temps_are_created_beside_the_destination() {
+        assert_eq!(
+            temp_dir_for(Path::new("/data/out/a.bcf")),
+            Path::new("/data/out")
+        );
+        assert_eq!(
+            temp_dir_for(Path::new("relative/dir/a.bcf")),
+            Path::new("relative/dir")
+        );
+        // A bare filename's parent is `""`, which is not a usable
+        // directory; it must become the current directory instead.
+        assert_eq!(temp_dir_for(Path::new("a.bcf")), Path::new("."));
+    }
 
     // A profile where n_variants order != density order, so the two split
     // strategies give different answers.

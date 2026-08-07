@@ -1250,3 +1250,72 @@ fn realized_positions_match_an_independently_recomputed_gap_walk() {
         }
     }
 }
+
+/// The #27 regression guard: a failed write must leave nothing behind at the
+/// caller's destination — no truncated output, no stray `.csi`, no
+/// `.summary.json`.
+///
+/// Before the temp-then-promote change, `BulkWriter::create` made the
+/// destination file up front and a mid-stream failure propagated past
+/// `finish_and_index`, leaving a headerless, un-indexed artifact sitting
+/// where a valid one was expected. The caller did see the `Err`, so this is
+/// not about error reporting — it is about the debris.
+///
+/// # Why this specific setup
+///
+/// The failure is induced by making the output *directory* read-only while
+/// the destination file itself already exists and is writable. On Unix,
+/// opening an existing file for writing needs write permission on the file,
+/// not on its directory — so the old `BulkWriter::create(path, ..)` succeeded
+/// and **truncated the destination**, then failed later when
+/// `finish_and_index` tried to create the `.csi` entry. That is exactly the
+/// issue #27 scenario: a retry into a path that already holds a good file
+/// leaves a corrupt one there instead.
+///
+/// A read-only directory with no pre-existing destination would be a vacuous
+/// test — the old code's `create` would fail up front and leave nothing
+/// behind either. The pre-existing file is what makes this discriminate.
+#[test]
+#[cfg(unix)]
+fn failed_write_leaves_the_destination_untouched() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out_dir = dir.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+    let path = out_dir.join("a.bcf");
+
+    const SENTINEL: &[u8] = b"a previously generated file that must survive a failed retry";
+    std::fs::write(&path, SENTINEL).unwrap();
+
+    let set_mode = |mode: u32| {
+        let mut perms = std::fs::metadata(&out_dir).unwrap().permissions();
+        perms.set_mode(mode);
+        std::fs::set_permissions(&out_dir, perms).unwrap();
+    };
+
+    set_mode(0o500); // r-x: traversable, and existing files stay writable.
+    let result = spec().size(Size::RecordsPerContig(600)).write(&path);
+    set_mode(0o700); // Restore so the assertions and cleanup can proceed.
+
+    assert!(
+        result.is_err(),
+        "writing into a read-only directory must fail"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        SENTINEL,
+        "a failed write must not touch the destination file"
+    );
+
+    let mut leftovers: Vec<_> = std::fs::read_dir(&out_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    leftovers.sort();
+    assert_eq!(
+        leftovers,
+        vec![std::ffi::OsString::from("a.bcf")],
+        "a failed write must leave no debris beside the destination"
+    );
+}
