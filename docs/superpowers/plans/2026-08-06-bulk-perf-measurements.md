@@ -121,6 +121,118 @@ A second, untested, and at least equally plausible explanation is plain **thread
 
 Honest statement: **the profile establishes that glibc allocator overhead is the largest measured self-time bucket (~47%), not that it is the cause of the sub-linear scaling.** Both "allocator arena-lock contention" and "rayon+bgzf thread oversubscription" are plausible, untested explanations for the ~44% parallel efficiency ceiling, and this measurement cannot distinguish between them.
 
+### Allocator interventions
+
+Task 3 instrumented `stream_contigs`'s chunk barrier directly and exonerated
+it: measured `serial_frac` (2.9%-3.1%) sits well under the Amdahl-implied
+serial fraction (6.3% BCF, 10.0% VCF) needed to explain the measured `S(4)`.
+The gap between measured and ideal-linear speedup is therefore still
+unexplained, and the allocator — the other untested candidate from Hypothesis
+2 above — is the next one to test. Comparing glibc self-time share between a
+1-worker and an 8-worker profile would be **correlational**: a higher share
+at 8 workers is equally consistent with "more allocation work" and with
+"lock contention," and no such comparison was even collected (Hypothesis 2
+notes only a single 8-worker profile was taken). The two probes below are
+**interventions** instead — each changes the allocator's behavior and
+observes whether `S(w)` changes, which a self-time comparison cannot do.
+
+**Step 1 — arena-count intervention.** Reference workload (BCF, unpinned),
+`workers=8`, `reps=3`, `MALLOC_ARENA_MAX=1` versus glibc's default, back to
+back, same freshly rebuilt `bulk_bench` binary:
+
+```
+MALLOC_ARENA_MAX=1 TMPDIR=$CLAUDE_JOB_DIR/tmp VCFIXTURE_BENCH_SAMPLES=2000 VCFIXTURE_BENCH_RECORDS=20000 VCFIXTURE_BENCH_REPS=3 VCFIXTURE_BENCH_WORKERS=8 ./target/release/examples/bulk_bench
+TMPDIR=$CLAUDE_JOB_DIR/tmp VCFIXTURE_BENCH_SAMPLES=2000 VCFIXTURE_BENCH_RECORDS=20000 VCFIXTURE_BENCH_REPS=3 VCFIXTURE_BENCH_WORKERS=8 ./target/release/examples/bulk_bench
+```
+
+| arena config | min_s | med_s | max_s |
+|---|---|---|---|
+| `MALLOC_ARENA_MAX=1` | 77.558 | 77.678 | 78.908 |
+| default | 8.467 | 9.021 | 9.460 |
+
+Forcing a single arena makes `workers=8` **9.16x slower** (`77.558 / 8.467`)
+— two orders of magnitude past the ~10% run-to-run spread this document
+otherwise treats as noise, so this is unambiguously a real effect. (The
+default arm here, 8.467s, reads ~18% above Task 2's originally recorded
+BCF-unpinned `workers=8` figure of 7.153s from a separate session — wider
+than the ~10% spread quoted elsewhere, and worth flagging as the true
+session-to-session noise band on this box, but it changes nothing about the
+Step 1 reading: the arena effect is ~9x, dwarfing either baseline by close to
+an order of magnitude.)
+
+Per the brief's reading rule, sharply degrading `min_s` means **per-thread
+arenas are load-bearing and allocator contention is real** in the sense that
+removing glibc's per-thread-arena mitigation causes catastrophic contention.
+It does not by itself say whether that mitigation is *complete* under the
+default configuration every other measurement in this document was taken
+under — Step 2 tests that directly.
+
+**Step 2 — allocator-swap intervention.** `mimalloc = { version = "0.1",
+default-features = false }` added to `[dev-dependencies]`, and
+`#[global_allocator] static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;`
+added to `examples/bulk_bench.rs` after the `use` block — both temporary,
+reverted immediately after the runs below (`git checkout -- Cargo.toml
+examples/bulk_bench.rs Cargo.lock`, confirmed with a clean `git status
+--short`; see the commit this section belongs to). Built cleanly against
+crates.io (`mimalloc 0.1.52`, `libmimalloc-sys 0.1.49`, `cc 1.4.0`). Reference
+workload, BCF, unpinned, `reps=3`, `workers ∈ {1,4,8}`:
+
+```
+TMPDIR=$CLAUDE_JOB_DIR/tmp VCFIXTURE_BENCH_SAMPLES=2000 VCFIXTURE_BENCH_RECORDS=20000 VCFIXTURE_BENCH_REPS=3 VCFIXTURE_BENCH_WORKERS=1 ./target/release/examples/bulk_bench
+TMPDIR=$CLAUDE_JOB_DIR/tmp VCFIXTURE_BENCH_SAMPLES=2000 VCFIXTURE_BENCH_RECORDS=20000 VCFIXTURE_BENCH_REPS=3 VCFIXTURE_BENCH_WORKERS=4 ./target/release/examples/bulk_bench
+TMPDIR=$CLAUDE_JOB_DIR/tmp VCFIXTURE_BENCH_SAMPLES=2000 VCFIXTURE_BENCH_RECORDS=20000 VCFIXTURE_BENCH_REPS=3 VCFIXTURE_BENCH_WORKERS=8 ./target/release/examples/bulk_bench
+```
+
+| workers | mimalloc min_s | glibc min_s (Task 2, BCF-unpinned) | speedup |
+|---|---|---|---|
+| 1 | 15.416 | 27.577 | 1.79x |
+| 4 | 4.736 | 8.205 | 1.73x |
+| 8 | 4.375 | 7.153 | 1.63x |
+
+mimalloc's own scaling, `S(w) = mimalloc_min_s(1) / mimalloc_min_s(w)`,
+against the same BCF-unpinned series used throughout this document:
+
+| workers | mimalloc `S(w)` | glibc `S(w)` (Task 2) | gap |
+|---|---|---|---|
+| 4 | 3.26 (`15.416/4.736`) | 3.36 | 3.2% lower |
+| 8 | 3.52 (`15.416/4.375`) | 3.86 | 8.6% lower |
+
+Two separate findings here, and they point in different directions. mimalloc
+makes every worker count **uniformly faster in absolute terms** — 1.63x to
+1.79x faster wall clock at `w=1`, `4`, and `8` alike, with no trend toward a
+*larger* speedup at higher worker counts. That is consistent with the
+profile's ~47% allocator self-time finding: allocation cost is a large, real,
+per-call overhead, and a faster allocator removes a roughly constant fraction
+of it independent of thread count — exactly the "swap that makes everything
+uniformly faster without changing the shape of the curve" case, not one that
+changes scaling. But mimalloc's *own* `S(w)` is not higher than glibc's: 3.2%
+lower at `w=4` (inside the noise band) and 8.6% lower at `w=8` — smaller than
+the ~18% session-to-session spread Step 1's own default-arm reading showed
+for the identical configuration, so this cannot be read as a confirmed
+degradation either, only as "not better." If arena-lock contention were
+capping scaling under the default allocator, swapping to mimalloc's
+fundamentally different, contention-avoiding design (thread-local heaps, no
+shared arena lock) should have *raised* `S(w)`. It did not.
+
+**Verdict.** Combining both interventions: allocator cost is large and real
+— Step 2 confirms this causally, not just as a profile bucket, since a
+different allocator saves 1.6x-1.8x of wall time at every worker count — but
+it is **not the cause of the sub-linear scaling curves** in the Scaling
+curves section below. Step 1 shows glibc's per-thread arenas are load-bearing
+scaffolding that, if removed, produces catastrophic (9.16x) contention; but
+that scaffolding is exactly what the default configuration under which every
+scaling curve in this document was measured already has, and Step 2 shows a
+qualitatively different, more contention-resistant allocator does not unlock
+additional scaling headroom on top of it. At this thread count, allocator
+behavior reads as **pure per-thread overhead, not a scaling limiter** — the
+concern belongs to issue #26 (allocation count/size), not to this
+investigation's search for what caps `S(w)` below linear. The gap between
+measured `S(4)`/`S(8)` and the ideal 4x/8x — Amdahl-implied serial fractions
+of 6.3% (BCF) to 10.0% (VCF) against a measured chunk-barrier serial fraction
+of only ~3% (Task 3) — **remains open** after this task, with both
+originally-proposed candidates (chunk-barrier serial drain, allocator
+contention) now tested and exonerated.
+
 ### Scaling curves
 
 Fixed workload throughout (2000 samples × 20000 records, 80M cells, `seed=42`), swept over `VCFIXTURE_BENCH_WORKERS ∈ {1,2,3,4,6,8}`, 3 reps per cell (`VCFIXTURE_BENCH_REPS=3`), reporting `min_s`/`med_s`/`max_s` per cell. `S(w) = min_s(1) / min_s(w)`; efficiency is `S(w) / min(w, 4)` — against **4 physical cores**, per the hardware section above (so `w=6` and `w=8` both divide by 4, not by `w`).
