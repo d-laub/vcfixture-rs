@@ -1,3 +1,48 @@
+## v0.5.0 (2026-08-07)
+
+### BREAKING CHANGE
+
+- `BulkError` is now `#[non_exhaustive]`, so downstream `match` expressions over it require a wildcard arm; `BlockSummary`, `N_VARIANT_CLASSES`, and `Summary::merge_block` are now crate-private. This release also changes the source API in ways the output-bytes footer on a222aae did not name: `Summary::observe` and `BulkSpec::BLOCK_SIZE` were removed, `generate::block_rng` gained a `Stream` parameter, and `generate::to_record_buf` now takes `&Payload`.
+- generated output for a given seed differs from v0.4.0.
+Positions are drawn from their own PRNG stream and block boundaries now
+depend on cohort width, and summary.json's genotype_checksum is now folded
+per block rather than per record. Same seed plus same spec still produces
+byte-identical output across thread counts; byte-stability holds within a
+major version, not across one. Existing corpora must be regenerated.
+- BulkError and BuildError are #[non_exhaustive], so a
+downstream `match` on either needs a wildcard arm.
+BulkError::CompressionLevel changed from CompressionLevel(String) to
+CompressionLevel(u8), and its Display now names the accepted range.
+
+### Feat
+
+- **bulk**: size blocks by cells and compute spans from gaps alone (#22)
+- **bulk**: add a reusable per-worker block encoder and raw sink write (#22)
+
+### Fix
+
+- **bulk**: never leave a partial file at the destination
+- **guards**: cover TooManyBlocks in the exhaustiveness guards
+- **bulk**: correct the H1 generation-share arithmetic (#22)
+- **bulk**: fix H1 verdict to distinguish generation CPU from wall clock (#22)
+- **bulk**: correct the Task 8 measurement writeup per review (#22)
+- **bulk**: fix TooManyBlocks off-by-one and de-duplicate block partitioning (#22)
+- **bulk**: non-vacuous stream test and target-size convergence (#22)
+
+### Refactor
+
+- **bulk**: narrow the block-summary surface and seal BulkError (#22)
+- **bulk**: fold summaries per block and merge in O(1) (#22)
+- **bulk**: give positions their own PRNG stream (#22)
+- non-exhaustive error enums, structured CompressionLevel
+
+### Perf
+
+- **bulk**: reuse a per-thread scratch record across records
+- **bulk**: use mimalloc in the binaries and bench harness
+- **bulk**: add repetition and format knobs to the bench harness (#22)
+- **bulk**: encode records in the block fan-out, not on the writer thread (#22)
+
 ## v0.4.0 (2026-08-05)
 
 ### BREAKING CHANGE
