@@ -1,0 +1,5 @@
+---
+source: tests/bulk_golden.rs
+expression: "generate(Format::Bcf, Payload::GtOnly, \"a.bcf\")"
+---
+17729 bytes, fnv1a64=06eedb6148dc7657

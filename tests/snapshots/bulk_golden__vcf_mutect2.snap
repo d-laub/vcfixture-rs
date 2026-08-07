@@ -1,0 +1,5 @@
+---
+source: tests/bulk_golden.rs
+expression: "generate(Format::Vcf, Payload::Mutect2, \"a.vcf\")"
+---
+660274 bytes, fnv1a64=7a3ed8dbfa435343

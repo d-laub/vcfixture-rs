@@ -1,0 +1,5 @@
+---
+source: tests/bulk_golden.rs
+expression: "generate(Format::VcfGz, Payload::Gatk, \"a.vcf.gz\")"
+---
+22101 bytes, fnv1a64=490b2696ca16e4fb
