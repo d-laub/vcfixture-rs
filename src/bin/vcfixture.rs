@@ -2,6 +2,16 @@
 //! BCF/VCF generation). See `vcfixture::bulk` for the library API this
 //! wraps, and `docs/book/src/bulk-generation.md` for the user-facing guide.
 
+// mimalloc, not glibc malloc: bulk generation is allocation-dominated
+// (~47% of profile self time, issue #26) and swapping the allocator measured
+// 1.63x-1.73x lower wall clock at every worker count. Installed here rather
+// than in the library because a library that sets a global allocator imposes
+// it on every dependent binary in the graph, which is not a library's
+// decision to make. On by default; opt out with `--no-default-features`.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::num::NonZero;
 use std::path::PathBuf;
 use std::process::ExitCode;

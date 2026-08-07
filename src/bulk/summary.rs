@@ -40,6 +40,91 @@ fn class_name(c: VariantClass) -> &'static str {
     }
 }
 
+/// Number of [`VariantClass`] variants. A fixed-size array indexed by class
+/// replaces a `BTreeMap<String, u64>` probed by name once per record, so a
+/// block's class counts cost no allocation and merge by elementwise add.
+pub(crate) const N_VARIANT_CLASSES: usize = 6;
+
+fn class_index(c: VariantClass) -> usize {
+    match c {
+        VariantClass::Snp => 0,
+        VariantClass::Insertion => 1,
+        VariantClass::Deletion => 2,
+        VariantClass::Mnp => 3,
+        VariantClass::Complex => 4,
+        VariantClass::Symbolic => 5,
+    }
+}
+
+fn class_by_index(i: usize) -> VariantClass {
+    match i {
+        0 => VariantClass::Snp,
+        1 => VariantClass::Insertion,
+        2 => VariantClass::Deletion,
+        3 => VariantClass::Mnp,
+        4 => VariantClass::Complex,
+        5 => VariantClass::Symbolic,
+        _ => unreachable!("class index {i} is out of range 0..{N_VARIANT_CLASSES}"),
+    }
+}
+
+/// One block's folded contribution to a [`Summary`].
+///
+/// Accumulated entirely inside a rayon block task (so the `O(n_samples)`
+/// per-record fold runs in the fan-out, not on the serial writer thread),
+/// then merged in O(1) by [`Summary::merge_block`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockSummary {
+    pub(crate) n_records: u64,
+    pub(crate) pos_min: u64,
+    pub(crate) pos_max: u64,
+    pub(crate) n_alleles_total: u64,
+    pub(crate) n_alleles_nonref: u64,
+    pub(crate) class_counts: [u64; N_VARIANT_CLASSES],
+    /// FNV-1a over this block's allele bytes, in record-then-slot order.
+    pub(crate) checksum: u64,
+}
+
+impl Default for BlockSummary {
+    fn default() -> BlockSummary {
+        BlockSummary::new()
+    }
+}
+
+impl BlockSummary {
+    pub(crate) fn new() -> BlockSummary {
+        BlockSummary {
+            n_records: 0,
+            // `pos_min` starts at the maximum so the first `min` wins; an
+            // empty block is never merged (see `Summary::merge_block`), so
+            // this sentinel can never reach a `Summary`.
+            pos_min: u64::MAX,
+            pos_max: 0,
+            n_alleles_total: 0,
+            n_alleles_nonref: 0,
+            class_counts: [0; N_VARIANT_CLASSES],
+            checksum: FNV_OFFSET,
+        }
+    }
+
+    /// Fold one record's genotypes into this block. `O(gts.len())`, no
+    /// allocation.
+    pub(crate) fn observe(&mut self, pos: u64, class: VariantClass, gts: &[i8]) {
+        self.n_records += 1;
+        self.pos_min = self.pos_min.min(pos);
+        self.pos_max = self.pos_max.max(pos);
+        self.class_counts[class_index(class)] += 1;
+        self.n_alleles_total += gts.len() as u64;
+        for &g in gts {
+            if g > 0 {
+                self.n_alleles_nonref += 1;
+            }
+            self.checksum ^= g as u8 as u64;
+            self.checksum = self.checksum.wrapping_mul(FNV_PRIME);
+        }
+    }
+}
+
 impl Summary {
     pub fn new(n_samples: usize) -> Summary {
         Summary {
@@ -52,51 +137,61 @@ impl Summary {
         }
     }
 
-    /// Fold one record's genotypes into the running summary.
+    /// Merge one block's fold into the running summary, in block order.
     ///
-    /// Called once per record (~265k times for a benchmark-scale run), so
-    /// this must be O(`gts.len()`) with no allocation in the common case.
-    /// `BTreeMap::entry` always takes its key by value, which would force a
-    /// `String` allocation on *every* call even when the contig/class entry
-    /// already exists. Instead we probe with `get_mut` using a borrowed key
-    /// (`&str` / `&'static str` — free, since `String: Borrow<str>`) and
-    /// only allocate a `String` the first time a given contig or class is
-    /// seen; every subsequent call for that key updates the existing entry
-    /// in place with zero allocation. The genotype loop itself never
-    /// allocates.
-    pub fn observe(&mut self, chrom: &str, pos: u64, class: VariantClass, gts: &[i8]) {
+    /// O(1) in the block's record and allele counts: the per-allele work
+    /// already happened in [`BlockSummary::observe`] inside the worker.
+    ///
+    /// `genotype_checksum` is hierarchical — FNV-1a over each block's own
+    /// checksum bytes, in the order blocks are merged. It therefore stays
+    /// order-sensitive both within a block and across blocks, while being
+    /// independent of worker count and of how many blocks are in flight
+    /// (block boundaries depend only on record count and cohort width,
+    /// never on `workers`).
+    pub(crate) fn merge_block(&mut self, chrom: &str, b: &BlockSummary) {
+        // An empty block must not perturb the checksum: folding its
+        // untouched `FNV_OFFSET` would make the result depend on how many
+        // empty blocks happened to exist.
+        if b.n_records == 0 {
+            return;
+        }
+
         match self.per_contig.get_mut(chrom) {
             Some(e) => {
-                e.n_records += 1;
-                e.pos_min = e.pos_min.min(pos);
-                e.pos_max = e.pos_max.max(pos);
+                e.n_records += b.n_records;
+                e.pos_min = e.pos_min.min(b.pos_min);
+                e.pos_max = e.pos_max.max(b.pos_max);
             }
             None => {
                 self.per_contig.insert(
                     chrom.to_string(),
                     ContigSummary {
-                        n_records: 1,
-                        pos_min: pos,
-                        pos_max: pos,
+                        n_records: b.n_records,
+                        pos_min: b.pos_min,
+                        pos_max: b.pos_max,
                     },
                 );
             }
         }
 
-        let cname = class_name(class);
-        match self.class_counts.get_mut(cname) {
-            Some(count) => *count += 1,
-            None => {
-                self.class_counts.insert(cname.to_string(), 1);
+        for (i, &n) in b.class_counts.iter().enumerate() {
+            if n == 0 {
+                continue;
+            }
+            let name = class_name(class_by_index(i));
+            match self.class_counts.get_mut(name) {
+                Some(count) => *count += n,
+                None => {
+                    self.class_counts.insert(name.to_string(), n);
+                }
             }
         }
 
-        self.n_alleles_total += gts.len() as u64;
-        for &g in gts {
-            if g > 0 {
-                self.n_alleles_nonref += 1;
-            }
-            self.genotype_checksum ^= g as u8 as u64;
+        self.n_alleles_total += b.n_alleles_total;
+        self.n_alleles_nonref += b.n_alleles_nonref;
+
+        for byte in b.checksum.to_le_bytes() {
+            self.genotype_checksum ^= byte as u64;
             self.genotype_checksum = self.genotype_checksum.wrapping_mul(FNV_PRIME);
         }
     }
@@ -115,12 +210,25 @@ mod tests {
     use super::*;
     use crate::bulk::sample::VariantClass;
 
+    fn block(records: &[(u64, VariantClass, &[i8])]) -> BlockSummary {
+        let mut b = BlockSummary::new();
+        for (pos, class, gts) in records {
+            b.observe(*pos, *class, gts);
+        }
+        b
+    }
+
     #[test]
     fn tracks_counts_and_ranges() {
         let mut s = Summary::new(2);
-        s.observe("chr1", 100, VariantClass::Snp, &[0, 1, 1, 1]);
-        s.observe("chr1", 500, VariantClass::Deletion, &[0, 0, 0, 0]);
-        s.observe("chr2", 7, VariantClass::Snp, &[1, 1, 0, 0]);
+        s.merge_block(
+            "chr1",
+            &block(&[
+                (100, VariantClass::Snp, &[0, 1, 1, 1]),
+                (500, VariantClass::Deletion, &[0, 0, 0, 0]),
+            ]),
+        );
+        s.merge_block("chr2", &block(&[(7, VariantClass::Snp, &[1, 1, 0, 0])]));
 
         assert_eq!(s.n_records_total(), 3);
         assert_eq!(s.per_contig["chr1"].n_records, 2);
@@ -136,37 +244,128 @@ mod tests {
     #[test]
     fn missing_alleles_are_not_counted_as_nonref() {
         let mut s = Summary::new(1);
-        s.observe("chr1", 1, VariantClass::Snp, &[-1, 1]);
+        s.merge_block("chr1", &block(&[(1, VariantClass::Snp, &[-1, 1])]));
         assert_eq!(s.n_alleles_nonref, 1);
     }
 
     #[test]
     fn checksum_detects_a_dropped_record() {
         let mut a = Summary::new(1);
-        a.observe("chr1", 1, VariantClass::Snp, &[0, 1]);
-        a.observe("chr1", 2, VariantClass::Snp, &[1, 1]);
+        a.merge_block(
+            "chr1",
+            &block(&[
+                (1, VariantClass::Snp, &[0, 1]),
+                (2, VariantClass::Snp, &[1, 1]),
+            ]),
+        );
         let mut b = Summary::new(1);
-        b.observe("chr1", 1, VariantClass::Snp, &[0, 1]);
+        b.merge_block("chr1", &block(&[(1, VariantClass::Snp, &[0, 1])]));
         assert_ne!(a.genotype_checksum, b.genotype_checksum);
     }
 
     #[test]
-    fn checksum_detects_reordering() {
+    fn checksum_detects_reordering_within_a_block() {
         let mut a = Summary::new(1);
-        a.observe("chr1", 1, VariantClass::Snp, &[0, 1]);
-        a.observe("chr1", 2, VariantClass::Snp, &[1, 0]);
+        a.merge_block(
+            "chr1",
+            &block(&[
+                (1, VariantClass::Snp, &[0, 1]),
+                (2, VariantClass::Snp, &[1, 0]),
+            ]),
+        );
         let mut b = Summary::new(1);
-        b.observe("chr1", 1, VariantClass::Snp, &[1, 0]);
-        b.observe("chr1", 2, VariantClass::Snp, &[0, 1]);
+        b.merge_block(
+            "chr1",
+            &block(&[
+                (1, VariantClass::Snp, &[1, 0]),
+                (2, VariantClass::Snp, &[0, 1]),
+            ]),
+        );
         assert_ne!(a.genotype_checksum, b.genotype_checksum);
+    }
+
+    #[test]
+    fn checksum_detects_reordering_of_blocks() {
+        let b0 = block(&[(1, VariantClass::Snp, &[0, 1])]);
+        let b1 = block(&[(2, VariantClass::Snp, &[1, 1])]);
+
+        let mut a = Summary::new(1);
+        a.merge_block("chr1", &b0);
+        a.merge_block("chr1", &b1);
+
+        let mut b = Summary::new(1);
+        b.merge_block("chr1", &b1);
+        b.merge_block("chr1", &b0);
+
+        assert_ne!(a.genotype_checksum, b.genotype_checksum);
+    }
+
+    #[test]
+    fn block_decomposition_does_not_change_the_summary_except_the_checksum() {
+        // Same records, one block vs two: every count and range must agree.
+        // (The checksum is deliberately block-structured and is expected to
+        // differ — that is what `checksum_detects_reordering_of_blocks` pins.)
+        let recs: [(u64, VariantClass, &[i8]); 4] = [
+            (1, VariantClass::Snp, &[0, 1]),
+            (2, VariantClass::Deletion, &[1, 1]),
+            (3, VariantClass::Snp, &[-1, -1]),
+            (4, VariantClass::Mnp, &[0, 0]),
+        ];
+
+        let mut one = Summary::new(1);
+        one.merge_block("chr1", &block(&recs));
+
+        let mut two = Summary::new(1);
+        two.merge_block("chr1", &block(&recs[..2]));
+        two.merge_block("chr1", &block(&recs[2..]));
+
+        assert_eq!(one.per_contig, two.per_contig);
+        assert_eq!(one.n_alleles_total, two.n_alleles_total);
+        assert_eq!(one.n_alleles_nonref, two.n_alleles_nonref);
+        assert_eq!(one.class_counts, two.class_counts);
+    }
+
+    #[test]
+    fn merging_an_empty_block_is_a_no_op() {
+        let mut a = Summary::new(1);
+        a.merge_block("chr1", &block(&[(1, VariantClass::Snp, &[0, 1])]));
+        let before = a.clone();
+        a.merge_block("chr1", &BlockSummary::new());
+        assert_eq!(a, before);
+    }
+
+    #[test]
+    fn class_index_and_class_by_index_round_trip() {
+        for i in 0..N_VARIANT_CLASSES {
+            assert_eq!(class_index(class_by_index(i)), i);
+        }
     }
 
     #[test]
     fn serializes_to_json() {
         let mut s = Summary::new(1);
-        s.observe("chr1", 1, VariantClass::Snp, &[0, 1]);
+        s.merge_block("chr1", &block(&[(1, VariantClass::Snp, &[0, 1])]));
         let j = s.to_json().unwrap();
-        assert!(j.contains("\"n_samples\""));
-        assert!(j.contains("\"genotype_checksum\""));
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+
+        let obj = v.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "class_counts",
+                "genotype_checksum",
+                "n_alleles_nonref",
+                "n_alleles_total",
+                "n_samples",
+                "per_contig",
+            ]
+        );
+
+        let contig = v["per_contig"]["chr1"].as_object().unwrap();
+        let mut contig_keys: Vec<&str> = contig.keys().map(String::as_str).collect();
+        contig_keys.sort_unstable();
+        assert_eq!(contig_keys, vec!["n_records", "pos_max", "pos_min"]);
     }
 }

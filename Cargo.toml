@@ -29,6 +29,9 @@ serde_json = { version = "1", optional = true }
 rayon = { version = "1", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 tempfile = { version = "3", optional = true }
+# Used only by the [[bin]] and [[example]] targets, never by the library --
+# see the `#[global_allocator]` comment in `src/bin/vcfixture.rs`.
+mimalloc = { version = "0.1", default-features = false, optional = true }
 
 [dev-dependencies]
 insta = "1"
@@ -37,10 +40,14 @@ tempfile = "3"
 noodles-bcf = "0.81"
 
 [features]
-default = []
+default = ["mimalloc"]
 proptest = ["dep:proptest"]
 bulk = ["dep:noodles-bcf", "dep:serde", "dep:serde_json", "dep:rayon", "dep:tempfile"]
 cli = ["bulk", "dep:clap"]
+# Swaps the *binaries'* global allocator to mimalloc. On by default; opt out
+# with `--no-default-features`. The library never installs a global
+# allocator whatever this is set to.
+mimalloc = ["dep:mimalloc"]
 
 [[example]]
 name = "proptest_fuzz"
@@ -48,6 +55,10 @@ required-features = ["proptest"]
 
 [[example]]
 name = "bulk"
+required-features = ["bulk"]
+
+[[example]]
+name = "bulk_bench"
 required-features = ["bulk"]
 
 [[bin]]
