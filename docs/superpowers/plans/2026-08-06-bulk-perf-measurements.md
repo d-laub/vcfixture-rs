@@ -111,15 +111,95 @@ VCFIXTURE_BENCH_WORKERS=1: 26.103s  (3.263e-7 s/cell)
 VCFIXTURE_BENCH_WORKERS=8:  7.502s  (9.377e-8 s/cell)
 ```
 
-Speedup = 3.48x for 8x the workers (43.5% parallel efficiency). Wall clock is **not flat** — it falls substantially, confirming the serial `O(cells)` stage is no longer the dominant cost. But scaling is clearly sub-linear, not the full 8x a purely-parallel fan-out with a cheap serial tail would predict.
+Speedup = 3.48x for 8x the workers — but 8 is the wrong denominator. Per the
+Hardware and allocation section above, this box's Slurm allocation is **4
+physical cores** (`0-3`) plus their SMT siblings (`48-51`), not 8 independent
+cores; `workers` defaults from `nproc`/`available_parallelism()`, both of
+which count logical CPUs and cannot see that distinction. Against the correct
+denominator of 4, 3.48x is **87% parallel efficiency**, not 43.5%. The full
+six-point sweep in Scaling curves (below) gives a cleaner reading of the same
+quantity from one consistent series rather than this single two-point A/B:
+BCF-unpinned reaches `S(4)=3.36` (**84% efficient**) by `workers=4` and keeps
+climbing through the SMT range to `S(8)=3.86` (**96% efficient**) at
+`workers=8`. VCF-unpinned (no bgzf pool) climbs monotonically to `S(4)=3.07`
+(77%) and `S(8)=3.36` (84%); BCF-pinned (`taskset -c 0-3`) does not climb
+monotonically — it dips slightly at `workers=6` before recovering — but
+covers a similar high-70s-to-mid-80s-percent efficiency range from
+`workers=4` onward. Wall clock falls sharply from `workers=1` to `workers=4`
+in all three curves (27.577s→8.205s BCF-unpinned, 23.996s→7.565s BCF-pinned,
+18.529s→6.026s VCF-unpinned), confirming the serial `O(cells)` stage
+Hypothesis 2 targeted is gone as a *dominant* cost. What remains is a
+smaller, genuine sub-linear component, not the near-50%-efficiency shortfall
+first reported.
 
-Verdict: **held, partially.** The serial `O(cells)` encode stage that dominated before is gone — s/cell nearly triples in efficiency from 1→8 workers, it does not stay flat. But claiming full linear scaling would be dishonest: at ~44% parallel efficiency, something is still capping speedup below 8x (implied serial fraction ≈ 18.6% by Amdahl's law on the 3.48x/8-worker numbers).
+One caveat applies to every `S(w)` figure in this document, including the
+84%/96% above: the `workers=1` baseline is not itself single-threaded for the
+BCF and VCF.gz paths. `workers` sizes both the rayon pool
+(`rayon::ThreadPoolBuilder::new().num_threads(self.workers.get())`,
+`src/bulk/mod.rs`) and the bgzf multithreaded writer's compression pool
+(`bgzf::io::multithreaded_writer::Builder::default().set_worker_count(workers)`,
+`src/bulk/writer.rs:149`) from the same value, so `workers=1` still runs a
+second bgzf compression thread overlapping with generation — a two-thread
+run is standing in as the "1" in `S(w) = min_s(1) / min_s(w)`. A genuinely
+single-threaded baseline would be faster, so every BCF/VCF.gz `S(w)` in this
+document *understates* true parallel speedup rather than overstating it.
+Uncompressed VCF is the exception, and the data shows the asymmetry: with no
+bgzf pool to size, its `workers=1` is genuinely single-threaded, and its
+`min_s(1)` of 18.529s is correspondingly much faster than BCF's 27.577s for
+the identical workload — consistent with BCF's `workers=1` baseline carrying
+compression overlap that VCF's does not.
 
-The profile (below) shows glibc allocator-family symbols at ~47% of self time — the largest measured bucket, and large enough to plausibly explain a meaningful chunk of the sub-linear scaling. But the profile supports allocator **overhead**, not allocator **contention**: the `perf` event used is `cycles:u` (user-space cycles only), which cannot see kernel-side lock/futex wait time, so there is no direct evidence of threads blocking on the allocator's arena lock specifically — that would require a 1-worker profile to compare malloc self-time share against (not collected here) or a lock/futex-aware event, neither of which was gathered.
+The two candidates originally named here — allocator arena-lock contention
+and rayon+bgzf thread oversubscription — were both tested by direct
+measurement rather than left as profile-bucket speculation, and a third
+candidate (a residual serial barrier in the per-chunk write loop) was found
+and tested as well:
 
-A second, untested, and at least equally plausible explanation is plain **thread oversubscription**: `workers` sizes both the rayon pool (`rayon::ThreadPoolBuilder::new().num_threads(self.workers.get())`, `src/bulk/mod.rs`) and the bgzf multithreaded writer's compression pool (`bgzf::io::multithreaded_writer::Builder::default().set_worker_count(workers)`, `src/bulk/writer.rs:149`) *independently* from the same `workers` value. At `workers=8` on this 8-core box, that is up to 8 rayon worker threads plus up to 8 bgzf compression threads plus the main thread — as many as 17 threads contending for 8 cores, which alone would depress parallel efficiency well below 100% regardless of any allocator effect.
+- **Allocator.** Task 4 ran two interventions rather than another profile
+  (Allocator interventions, below). Forcing a single arena
+  (`MALLOC_ARENA_MAX=1`) made `workers=8` 9.16x slower, so per-thread arenas
+  are load-bearing — but that is exactly glibc's default behavior, already in
+  effect under every measurement in this document. Swapping to mimalloc made
+  every worker count 1.63x–1.79x faster in absolute wall clock, but
+  mimalloc's own `S(4)`/`S(8)` (3.26/3.52) were flat to slightly *lower* than
+  glibc's (3.36/3.86) — a contention-avoiding allocator did not unlock extra
+  scaling headroom. Verdict: allocator cost is large and real, but it is
+  per-thread overhead, not the cause of the sub-linear curve.
+- **Thread oversubscription.** The VCF ablation settles this directly: VCF
+  has no bgzf pool at all, so at `workers=4` it is 4 rayon threads on 4
+  physical cores with nothing else competing for them — and it still only
+  reaches `S(4)=3.07`, 77% efficient (Scaling curves, below). Oversubscription
+  cannot explain a shortfall that persists with no second thread pool to
+  oversubscribe with. A genuine oversubscription signature *is* visible, but
+  only in the BCF-pinned curve at worker counts above the physical core count
+  (`S(6)=3.10` dipping below `S(4)=3.17` before recovering to `S(8)=3.29`) —
+  real, but too small and too narrowly scoped to account for the residual
+  seen at `workers=4` in any of the three curves.
+- **Per-chunk serial write barrier.** Task 3 instrumented the boundary
+  directly (Serial-fraction measurement, below) instead of reasoning from the
+  Amdahl-implied figure alone: `stream_contigs` collects each chunk's encoded
+  records with `par_iter().collect()`, which drains the rayon pool fully
+  before a serial `write_encoded` loop runs. Measured `serial_frac` is
+  0.029–0.031, well under the 0.063 (BCF)–0.100 (VCF) Amdahl's law implies is
+  needed to explain the measured `S(4)`. The barrier costs about 3%, not the
+  6–10% the curve would require.
 
-Honest statement: **the profile establishes that glibc allocator overhead is the largest measured self-time bucket (~47%), not that it is the cause of the sub-linear scaling.** Both "allocator arena-lock contention" and "rayon+bgzf thread oversubscription" are plausible, untested explanations for the ~44% parallel efficiency ceiling, and this measurement cannot distinguish between them.
+**Verdict: held, but the residual is real and, after this task, genuinely
+unexplained.** All three candidates examined — allocator contention, bgzf
+thread oversubscription, and the chunk-write serial barrier — were tested by
+direct measurement or intervention, not left as speculation, and none of them
+accounts for the gap between the measured curves and ideal linear scaling
+against 4 physical cores. That gap is smaller than the original
+43.5%-efficiency framing suggested (84%–96% efficient at the top of the
+BCF-unpinned curve, 77% at the low end of the VCF-unpinned curve), but it has
+not been explained, and this document should say so plainly rather than
+retire the question behind a plausible-sounding cause that was never tested.
+Closing it is future work, not a conclusion this investigation reached:
+candidates that remain **untested** are memory-bandwidth saturation,
+per-thread allocation overhead that is inherent to the workload rather than
+contended (distinct from the arena-contention question Task 4 already
+answered), the separate `compute_layouts` parallel pass, and SMT siblings on
+this box contributing measurably less than a full physical core each.
 
 ### Allocator interventions
 
