@@ -827,3 +827,177 @@ A separate, unrelated defect surfaced while reading `src/bulk/mod.rs` during thi
 ### Stop condition
 
 The project's rule is "no optimization is kept unless the benchmark shows it wins and the oracle still passes": the benchmark shows a substantial, reproducible win (2.51x–3.08x wall-clock speedup, average ~2.81x, with wall clock falling substantially rather than staying flat as worker count rises), `cargo test --all-features` passes in full (153 tests, 0 failures, verified at this task's final commit), and the next hot spot found by profiling (glibc allocator overhead, ~47% of self time) is new, separate optimization work — not unfinished work from this change — so the change is kept and this measurement task stops here.
+
+## Allocation reduction (#26) and atomic destination writes (#27)
+
+Measured on branch `fix-26-27-alloc-partial-output`, which stacks on this
+document's branch. Two independent changes, measured separately so each can be
+judged on its own:
+
+- **Part A** — a per-thread scratch `RecordBuf` reused across records, taking
+  steady-state allocations from four per sample per record to one.
+- **Part B** — mimalloc as the binaries' global allocator.
+
+Part C (atomic destination writes, #27) is a correctness fix with no
+measurable performance component and is not benchmarked here.
+
+### Protocol
+
+Three binaries, all built `--release`:
+
+```bash
+# baseline: branch point 501ce4d, no source change, glibc
+cargo build --release --features bulk --example bulk_bench
+
+# Part A only: source change, glibc
+cargo build --release --no-default-features --features bulk --example bulk_bench
+
+# Parts A+B: source change, mimalloc
+cargo build --release --features bulk --example bulk_bench
+```
+
+`bulk_bench` now stamps `alloc={mimalloc,system}` into its header line, so a
+sweep cannot be misattributed to the wrong binary after the fact.
+
+Worker counts were **round-robined across passes** — all three binaries at
+`w=1`, then all three at `w=2`, and so on, five times — rather than running
+each cell's reps back to back. Running reps consecutively lets one noise burst
+contaminate all of them identically, which defeats a min-of-N estimator; that
+is the failure that inflated this document's earlier BCF-unpinned anchor by
+8.6%. Round-robining also means the five `workers=1` readings are separated by
+a full sweep of other cells, so the anchor-stability check is built into the
+protocol rather than bolted on afterwards.
+
+Workload: 2000 samples x 20000 records = 80M cells, BCF, `Payload::GtOnly`,
+seed 42, unpinned, one rep per invocation. Machine: `carter-cn-03`,
+`Cpus_allowed_list: 0-3,48-51` — **4 physical cores** plus SMT siblings.
+Efficiency below is `S(w) / min(w, 4)` against those 4 physical cores, not the
+8 logical CPUs `nproc` reports.
+
+### Raw readings
+
+Seconds, in pass order. Spread is `(max - min) / min`.
+
+| binary | w | pass 1 | pass 2 | pass 3 | pass 4 | pass 5 | min | spread |
+|---|---|---|---|---|---|---|---|---|
+| baseline | 1 | 22.152 | 21.478 | 21.221 | 21.378 | 21.225 | 21.221 | 4.4% |
+| baseline | 2 | 11.370 | 11.275 | 11.311 | 11.228 | 11.335 | 11.228 | 1.3% |
+| baseline | 3 | 9.272 | 9.226 | 8.374 | 8.338 | 8.174 | 8.174 | 13.4% |
+| baseline | 4 | 6.617 | 7.072 | 6.654 | 6.605 | 6.785 | 6.605 | 7.1% |
+| baseline | 6 | 6.902 | 6.836 | 6.514 | 6.525 | 6.678 | 6.514 | 6.0% |
+| baseline | 8 | 6.451 | 6.607 | 6.752 | 6.491 | 6.433 | 6.433 | 5.0% |
+| Part A | 1 | 12.490 | 12.470 | 12.594 | 12.530 | 12.514 | 12.470 | 1.0% |
+| Part A | 2 | 6.622 | 6.699 | 6.640 | 6.665 | 6.618 | 6.618 | 1.2% |
+| Part A | 3 | 5.190 | 5.078 | 4.784 | 6.130 | 5.681 | 4.784 | 28.1% |
+| Part A | 4 | 3.829 | 3.813 | 3.823 | 3.910 | 3.846 | 3.813 | 2.5% |
+| Part A | 6 | 3.866 | 3.828 | 3.542 | 3.770 | 3.726 | 3.542 | 9.1% |
+| Part A | 8 | 3.528 | 3.434 | 3.495 | 3.474 | 3.434 | 3.434 | 2.7% |
+| A+B | 1 | 8.063 | 8.045 | 8.125 | 8.067 | 8.113 | 8.045 | 1.0% |
+| A+B | 2 | 4.383 | 4.451 | 4.407 | 4.370 | 4.443 | 4.370 | 1.9% |
+| A+B | 3 | 3.569 | 3.383 | 3.198 | 3.595 | 3.353 | 3.198 | 12.4% |
+| A+B | 4 | 2.610 | 2.633 | 2.718 | 2.567 | 2.835 | 2.567 | 10.4% |
+| A+B | 6 | 2.393 | 2.428 | 2.353 | 2.333 | 2.396 | 2.333 | 4.1% |
+| A+B | 8 | 2.178 | 2.174 | 2.258 | 2.189 | 2.134 | 2.134 | 5.8% |
+
+**Anchor stability.** All three `workers=1` anchors are stable, so none needed
+the re-measurement this document's earlier curve did. Part A and A+B span 1.0%
+across five time-separated passes. The baseline spans 4.4%, but that is driven
+entirely by a high first pass (22.152); the remaining four cluster within 1.2%
+and three of them agree with the adopted minimum to within 0.02%.
+
+**Noise.** `w=3` is the noisiest cell for all three binaries (13.4%, 28.1%,
+12.4%) while every other cell is 1–10%. The same worker count being worst
+across three independently built binaries suggests something systematic rather
+than a stray burst — plausibly an interaction between 3 workers, the
+`2 * workers` chunk size, and 4 physical cores — but this was not investigated
+and is recorded as an observation only. It does not affect the conclusions,
+which rest on `w=1` and `w>=4`.
+
+### Speedup
+
+Absolute wall clock at matched worker counts, from the minima above:
+
+| w | baseline | Part A | vs base | A+B | vs base | B's marginal |
+|---|---|---|---|---|---|---|
+| 1 | 21.221 | 12.470 | **1.70x** | 8.045 | **2.64x** | 1.55x |
+| 2 | 11.228 | 6.618 | **1.70x** | 4.370 | **2.57x** | 1.51x |
+| 3 | 8.174 | 4.784 | **1.71x** | 3.198 | **2.56x** | 1.50x |
+| 4 | 6.605 | 3.813 | **1.73x** | 2.567 | **2.57x** | 1.49x |
+| 6 | 6.514 | 3.542 | **1.84x** | 2.333 | **2.79x** | 1.52x |
+| 8 | 6.433 | 3.434 | **1.87x** | 2.134 | **3.01x** | 1.61x |
+
+**Part A pays for itself independently of the allocator swap**, which is the
+question this document committed to answering separately: 1.70x–1.87x on its
+own, with no dependence on Part B. The two compose to 2.56x–3.01x.
+
+**Part B's marginal contribution is 1.49x–1.61x**, below the 1.63x–1.73x
+measured for mimalloc against *unmodified* code in the "Allocator
+interventions" section above. That direction is expected rather than
+contradictory: Part A removes three of four per-sample allocations, so there is
+less allocator work left for a faster allocator to accelerate. The two
+measurements are consistent, not in tension.
+
+### Scaling
+
+| w | baseline S(w) | eff | Part A S(w) | eff | A+B S(w) | eff |
+|---|---|---|---|---|---|---|
+| 1 | 1.00 | 100% | 1.00 | 100% | 1.00 | 100% |
+| 2 | 1.89 | 94.5% | 1.88 | 94.2% | 1.84 | 92.0% |
+| 3 | 2.60 | 86.5% | 2.61 | 86.9% | 2.52 | 83.9% |
+| 4 | 3.21 | 80.3% | 3.27 | 81.8% | 3.13 | 78.4% |
+| 6 | 3.26 | 81.4% | 3.52 | 88.0% | 3.45 | 86.2% |
+| 8 | 3.30 | 82.5% | 3.63 | 90.8% | 3.77 | 94.2% |
+
+Scaling *shape* is essentially unchanged through `w=4` (80.3% / 81.8% / 78.4%),
+which is the same sub-linear behaviour this document has been unable to
+explain. The apparent improvement at `w>=6` is real but must be read carefully:
+`S(w)` divides by each binary's *own* `min_s(1)`, and Part A speeds up the
+1-worker case by 1.70x while speeding up the 8-worker case by 1.87x, so the
+ratio moves without any claim that contention was relieved.
+
+The `workers=1` caveat from the "Scaling curves" section still applies to all
+three curves: for BCF, `workers` sizes the bgzf compression pool as well as the
+rayon pool, so a 1-worker run is not single-threaded and dividing by it
+**understates** true scaling.
+
+**The residual sub-linear deficit remains unexplained.** This work changes the
+absolute cost of bulk generation; it does not resolve the open scaling
+question. The candidates listed earlier — memory-bandwidth saturation, inherent
+per-thread allocation overhead, the separate `compute_layouts` parallel pass,
+and SMT siblings contributing less than a full core — remain **untested**.
+
+### Peak RSS
+
+MB, maximum over passes:
+
+| w | baseline | Part A | A+B |
+|---|---|---|---|
+| 1 | 13.1 | 13.7 | 28.9 |
+| 2 | 23.3 | 22.1 | 50.8 |
+| 4 | 41.7 | 43.8 | 68.6 |
+| 8 | 77.4 | 77.9 | 108.3 |
+
+**Part A is RSS-neutral** (77.9 vs 77.4 MB at `w=8`), which was not a foregone
+conclusion: holding scratch buffers alive for a worker thread's lifetime rather
+than freeing them per record could have inflated the high-water mark, and does
+not.
+
+**mimalloc costs roughly 40% more peak RSS** (108.3 vs 77.4 MB at `w=8`),
+consistent with per-thread heaps that are not returned to the OS as eagerly.
+That is the price of Part B's 1.5x, and it is why the `mimalloc` feature has an
+opt-out.
+
+### Comparability caveat
+
+The baseline binary here is built from commit `501ce4d` — the same code the
+"Scaling curves" section measured — yet reads 21.221s at `w=1` against that
+section's 25.193s, and 6.433s at `w=8` against 7.153s. Both are ~16% and ~10%
+lower.
+
+Absolute numbers from different measurement sessions on this cluster are
+therefore **not comparable**, and none of the ratios in this section are
+derived by mixing the two. Every figure above comes from binaries measured
+against each other within a single round-robin sweep. It is also possible the
+earlier re-anchored 25.193s was still noise-inflated; that cannot be settled
+retrospectively and does not affect any conclusion here, since the earlier
+section's claims are likewise internally consistent.
