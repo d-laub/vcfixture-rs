@@ -1,6 +1,13 @@
 //! Validate a profile JSON file through the same `Profile::validate` the
 //! embedded profiles pass, so a freshly-fitted profile fails here in CI
 //! rather than later at `include_str!` time.
+
+// See the `#[global_allocator]` comment in `src/bin/vcfixture.rs`. Kept in
+// step with the other binary so the two do not drift apart.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::process::ExitCode;
 use vcfixture::bulk::Profile;
 

@@ -19,6 +19,17 @@
 //! writes uncompressed VCF, which removes the bgzf compression pool entirely —
 //! the ablation that separates rayon scaling from writer-pool contention.
 
+// See the `#[global_allocator]` comment in `src/bin/vcfixture.rs`.
+//
+// This is on by default, so a plain `--features bulk` build of this harness
+// measures *mimalloc*. To measure the glibc baseline, build with
+// `--no-default-features --features bulk`. Reporting a number without
+// stating which of the two produced it is how an allocator comparison
+// becomes meaningless.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::env;
 use std::num::NonZeroUsize;
 use std::time::Instant;
@@ -104,7 +115,16 @@ fn main() {
     let workers = workers();
     let reps = reps();
     let (format, ext) = format();
-    println!("workers={workers} reps={reps} format={ext}");
+    // Stamp the allocator into the output. Sweeps from the two builds are
+    // otherwise indistinguishable once the numbers are pasted into a
+    // document, and an allocator comparison that cannot say which binary
+    // produced which column is not a comparison.
+    let alloc = if cfg!(feature = "mimalloc") {
+        "mimalloc"
+    } else {
+        "system"
+    };
+    println!("workers={workers} reps={reps} format={ext} alloc={alloc}");
     println!(
         "{:>8} {:>9} {:>12} {:>5} {:>9} {:>9} {:>9} {:>12} {:>10}",
         "samples", "records", "cells", "reps", "min_s", "med_s", "max_s", "s/cell", "peakRSS_MB"

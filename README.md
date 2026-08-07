@@ -74,6 +74,24 @@ vcfixture bulk --profile germline-1kgp --samples 3202 \
 See the [Bulk generation guide](https://d-laub.github.io/vcfixture-rs/bulk-generation.html)
 for the fitted-vs-dialed split, the payload presets, and the API.
 
+### Allocator
+
+The `vcfixture` binary uses [mimalloc](https://github.com/microsoft/mimalloc)
+as its global allocator. Bulk generation is allocation-dominated, and the swap
+measured 1.63x–1.73x lower wall clock at every worker count.
+
+This is the `mimalloc` feature, on by default. It pulls a C dependency built
+via `cc`. To build without it:
+
+```bash
+cargo build --no-default-features --features cli
+```
+
+The library itself never installs a global allocator, whatever the feature
+state — that choice belongs to the binary at the top of the dependency graph.
+Depending on `vcfixture` as a library with `default-features = false` keeps
+mimalloc out of your dependency graph entirely.
+
 ## Documentation
 
 - [User guide](https://d-laub.github.io/vcfixture-rs/) (mdBook)
