@@ -178,48 +178,35 @@ measures that stage's cost directly, rather than inferring it.
 immediately after the two runs below, never committed) to accumulate wall time
 spent inside `pool.install(...)` (`t_par`) separately from wall time spent in
 the serial drain loop (`t_ser`), across all contigs and chunks, and to print
-`serial_frac = t_ser / (t_par + t_ser)` once per run. The instrumentation patch,
-applied against `src/bulk/mod.rs` at the commit this document was written
-against:
+`serial_frac = t_ser / (t_par + t_ser)` once per run — a fraction of
+*instrumented* time (`t_par + t_ser`), not of the run's total wall clock
+(`min_s`); see the reconciliation below the results table. The instrumentation
+patch, applied against `src/bulk/mod.rs` at the commit this document was
+written against, was generated with `git diff -U0` (zero context lines): the
+repo's `trailing-whitespace` pre-commit hook runs on all files with no
+exclusions and strips the single leading space that marks a blank *context*
+line in a unified diff, which corrupts an ordinary `-U3` patch quoted in a
+committed file (confirmed: `git apply --check` on the previously quoted `-U3`
+block failed with `error: corrupt patch`). `-U0` has no context lines, so
+there is nothing for the hook to strip. Apply with `git apply --unidiff-zero`:
 
 ```diff
 diff --git a/src/bulk/mod.rs b/src/bulk/mod.rs
 index 40a90f4..bf5c0de 100644
 --- a/src/bulk/mod.rs
 +++ b/src/bulk/mod.rs
-@@ -727,6 +727,8 @@ impl BulkSpec {
-         let ploidy = self.profile.dialed.ploidy;
-         let mut summary = Summary::new(self.n_samples);
-         let chunk_blocks = 2 * self.workers.get();
+@@ -729,0 +730,2 @@ impl BulkSpec {
 +        let mut t_par = std::time::Duration::ZERO;
 +        let mut t_ser = std::time::Duration::ZERO;
-
-         for (ci, (id, layout)) in self.contig_ids.iter().zip(layouts).enumerate() {
-             let offsets = layout.offsets();
-@@ -735,6 +737,7 @@ impl BulkSpec {
-             for start in (0..n_blocks).step_by(chunk_blocks) {
-                 let chunk: Vec<usize> = (start..(start + chunk_blocks).min(n_blocks)).collect();
-
+@@ -737,0 +740 @@ impl BulkSpec {
 +                let t_par0 = std::time::Instant::now();
-                 let encoded: Vec<Result<(Vec<u8>, BlockSummary), BulkError>> = pool.install(|| {
-                     chunk
-                         .par_iter()
-@@ -782,15 +785,25 @@ impl BulkSpec {
-                         )
-                         .collect()
-                 });
+@@ -784,0 +788 @@ impl BulkSpec {
 +                t_par += t_par0.elapsed();
-
+@@ -785,0 +790 @@ impl BulkSpec {
 +                let t_ser0 = std::time::Instant::now();
-                 for item in encoded {
-                     let (bytes, bs) = item?;
-                     writer.write_encoded(&bytes)?;
-                     summary.merge_block(id, &bs);
-                 }
+@@ -790,0 +796 @@ impl BulkSpec {
 +                t_ser += t_ser0.elapsed();
-             }
-         }
-
+@@ -793,0 +800,7 @@ impl BulkSpec {
 +        let p = t_par.as_secs_f64();
 +        let s = t_ser.as_secs_f64();
 +        eprintln!(
@@ -227,8 +214,6 @@ index 40a90f4..bf5c0de 100644
 +            s / (p + s)
 +        );
 +
-         Ok(summary)
-     }
 ```
 
 Run commands (default BCF format — the brief's Step 3 does not set
@@ -255,11 +240,35 @@ drain loop's intrinsic cost (memcpy + bookkeeping), not contention. Going from
 0.18-point rise — which is consistent with no material barrier-contention
 effect at 8 workers beyond the loop's fixed cost.
 
+**Denominator reconciliation.** `serial_frac`'s denominator is
+`t_par + t_ser` (instrumented time only, summed across `stream_contigs`'s
+chunk loop), not the run's reported wall clock `min_s` — `stream_contigs` is
+one step inside `BulkSpec::write`, which also does profile validation,
+`compute_layouts`'s own separate `pool.install` gap-sum pass
+(`src/bulk/mod.rs:647-655`), header construction, writer creation,
+`finish_and_index`, and the summary JSON write, none of which the
+instrumentation times. At `workers=1`: `24.670 + 0.742 = 25.412s` instrumented
+vs `min_s = 25.485s` reported, a residual of `0.073s` (0.29% of `min_s`)
+outside both timers. At `workers=8`: `7.135 + 0.229 = 7.364s` instrumented vs
+`min_s = 7.448s` reported, a residual of `0.084s` (1.13% of `min_s`) outside
+both timers. Worst-casing that entire residual as additional serial time —
+i.e. assuming, pessimistically, that all of it is barrier-adjacent rather than
+setup/teardown work outside `stream_contigs` entirely — gives
+`(0.742 + 0.073) / 25.485 ≈ 0.032` at `workers=1` and
+`(0.229 + 0.084) / 7.448 ≈ 0.042` at `workers=8`. Both worst-case figures are
+still comfortably under the 5% exoneration threshold, so this reconciliation
+strengthens rather than weakens the exoneration reading below.
+
 **Amdahl comparison.** Solving `S = 1 / (s + (1-s)/p)` for `s` at `p = 4` gives
-`s = (p - S) / (S(p - 1))`. The instrumented runs above use the default BCF
-format, so the like-for-like comparison is the **BCF-unpinned** curve from
-Task 2, whose `S(4) = 3.361` (min_s 8.205s vs 27.577s at `workers=1`, from the
-Scaling curves table above):
+`s = (p - S) / (S(p - 1))`. Inverting for `s` is sensitive to the third
+decimal of `S`, so the arithmetic below uses `S(4)` computed directly from the
+underlying `min_s` ratio to 3 decimal places, not the Scaling curves table's
+2-decimal display (`27.577 / 8.205 = 3.361`, `18.529 / 6.026 = 3.075`; the
+table rounds these to `3.36` and `3.07` respectively — same numbers, tighter
+precision here). The instrumented runs above use the default BCF format, so
+the like-for-like comparison is the **BCF-unpinned** curve from Task 2, whose
+`S(4) = 3.361` (min_s 8.205s vs 27.577s at `workers=1`, from the Scaling
+curves table above):
 
 ```
 s = (4 - 3.361) / (3.361 * (4 - 1)) = 0.639 / 10.083 ≈ 0.0634
