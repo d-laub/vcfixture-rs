@@ -35,7 +35,7 @@ use noodles_vcf::{
     },
 };
 
-use generate::{block_rng, gen_record, to_record_buf, Stream};
+use generate::{block_rng, gen_record, payload_keys, RecordScratch, Stream};
 use profile::{ContigStat, Fitted};
 use sample::Samplers;
 use summary::BlockSummary;
@@ -788,12 +788,16 @@ impl BulkSpec {
                         .par_iter()
                         .map_init(
                             || {
-                                BlockEncoder::new(self.format, header).expect(
+                                let enc = BlockEncoder::new(self.format, header).expect(
                                     "encoding a header into a Vec<u8> cannot fail; the same \
                                      construction was validated before the loop",
-                                )
+                                );
+                                // One scratch record per rayon worker,
+                                // reused for every record that worker
+                                // encodes. See `RecordScratch` for why.
+                                (enc, RecordScratch::new(&self.payload))
                             },
-                            |enc, &b| {
+                            |(enc, scratch), &b| {
                                 let block_idx = ci as u64 * Self::CONTIG_BLOCK_STRIDE + b as u64;
                                 let mut pos_rng = block_rng(self.seed, block_idx, Stream::Position);
                                 let mut content_rng =
@@ -820,8 +824,8 @@ impl BulkSpec {
                                     // the block's stream stays a pure
                                     // function of (seed, block_idx).
                                     let phased = content_rng.random::<f64>() < fitted.phased_rate;
-                                    let buf = to_record_buf(&g, &self.payload, phased);
-                                    enc.push(header, &buf)?;
+                                    let buf = scratch.fill(&g, phased);
+                                    enc.push(header, buf)?;
                                     bs.observe(g.pos, g.class, &g.gts);
                                 }
 
@@ -1310,22 +1314,6 @@ fn distribute_by_n_variants(fitted: &Fitted, contig_ids: &[String], total: u64) 
     counts
 }
 
-/// The ordered FORMAT key list for one [`Payload`] preset.
-///
-/// Must stay in sync with `generate::to_record_buf`'s own (private) `key_names`
-/// match — duplicated here rather than shared because `generate.rs` is out of
-/// scope to modify for this task. `payload_presets_all_write_readable_files`
-/// (`tests/bulk.rs`) is the safety net: any drift would surface as a
-/// "missing FORMAT header record" write error, not a silent mismatch.
-fn payload_keys(payload: &Payload) -> &'static [&'static str] {
-    match payload {
-        Payload::GtOnly => &["GT"],
-        Payload::GtVaf => &["GT", "VAF"],
-        Payload::Gatk => &["GT", "AD", "DP", "GQ", "PL"],
-        Payload::Mutect2 => &["GT", "AD", "AF", "DP", "F1R2", "F2R1", "SB"],
-    }
-}
-
 /// The header `##FORMAT` definition for one FORMAT key.
 ///
 /// `noodles-bcf`'s encoder looks up each key's declared `Number`/`Type` in
@@ -1337,7 +1325,7 @@ fn payload_keys(payload: &Payload) -> &'static [&'static str] {
 /// definition for free from `Map::from(key)`. `VAF`/`AF` (as a per-sample
 /// FORMAT field, not the INFO field), `F1R2`, `F2R1`, and `SB` are GATK/
 /// Mutect2 conventions, not VCF-reserved, so they need an explicit
-/// definition matching exactly what `generate::SampleStats::value_for` emits.
+/// definition matching exactly what `generate::SampleStats::refill` emits.
 fn format_map(key: &str) -> Map<HeaderFormatMap> {
     match key {
         "VAF" | "AF" => Map::<HeaderFormatMap>::new(
