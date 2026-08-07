@@ -189,6 +189,14 @@ TMPDIR=$CLAUDE_JOB_DIR/tmp VCFIXTURE_BENCH_SAMPLES=2000 VCFIXTURE_BENCH_RECORDS=
 | 4 | 4.736 | 8.205 | 1.73x |
 | 8 | 4.375 | 7.153 | 1.63x |
 
+The glibc column is Task 2's original series, not a fresh remeasurement in
+this session — per the baseline-discrepancy note under Step 1 above, a
+same-session default-arm rerun read ~18% higher (8.467s vs 7.153s at
+`workers=8`), which is the honest size of the session-to-session noise band
+this comparison is subject to; Task 2's series is used here because the brief
+mandates it as the like-for-like baseline, not because it was reverified this
+session.
+
 mimalloc's own scaling, `S(w) = mimalloc_min_s(1) / mimalloc_min_s(w)`,
 against the same BCF-unpinned series used throughout this document:
 
@@ -212,26 +220,75 @@ for the identical configuration, so this cannot be read as a confirmed
 degradation either, only as "not better." If arena-lock contention were
 capping scaling under the default allocator, swapping to mimalloc's
 fundamentally different, contention-avoiding design (thread-local heaps, no
-shared arena lock) should have *raised* `S(w)`. It did not.
+shared arena lock) would be expected to *raise* `S(w)`; the raw numbers show
+no such rise. That reading needs one caveat before it can stand, addressed
+next.
+
+**Caveat — an Amdahl-mechanical alternative for the lower `S(8)`.** "mimalloc's
+`S(w)` did not rise" does not, by itself, rule out that mimalloc relieved real
+contention. If some cost is roughly fixed in absolute seconds regardless of
+allocator (Task 3's chunk-barrier serial drain, `finish_and_index`, the
+summary JSON write, process startup), then shrinking the parallel portion —
+exactly what a faster allocator does — makes that fixed cost a *larger share*
+of a smaller total, which mechanically depresses `S(w)` with no change in
+contention whatsoever. Sanity-checking the size of this effect against Task
+3's own measured fixed cost (`t_ser = 0.229s` at `workers=8`, glibc; up to
+0.313s worst-case including the untimed residual — see the Serial-fraction
+measurement section's reconciliation): treat that as a fixed cost `F` present
+in both allocators' totals, and solve for the `F` that would make mimalloc's
+fixed-cost-corrected scaling equal glibc's fixed-cost-corrected scaling at the
+same `F`:
+
+```
+(mimalloc_min_s(1) - F) / (mimalloc_min_s(8) - F)
+  = (glibc_min_s(1) - F) / (glibc_min_s(8) - F)
+
+(15.416 - F) / (4.375 - F) = (27.577 - F) / (7.153 - F)
+=> F ≈ 1.106s
+```
+
+Task 3's measured fixed cost (0.229s, or 0.313s worst-case) is only 21%-28%
+of the ~1.106s a fixed cost would need to be to fully account for the gap by
+this mechanism alone — plugging either measured value back in as `F` only
+closes 14%-19% of the raw `S(8)` gap: at `F=0.229s`, glibc's corrected `S(8)`
+rises `3.86 → 3.95` and mimalloc's rises `3.52 → 3.66`, leaving a residual gap
+of 0.29 (down from the raw 0.33); at `F=0.313s`, `3.86 → 3.99` and
+`3.52 → 3.72`, a residual gap of 0.27. Either way most of the gap survives
+the correction. So the Amdahl-compression artifact is real in
+principle, but on the only fixed-cost measurement available, it is too small
+— by a factor of roughly 3.5x-4.8x — to be the primary explanation for
+mimalloc's lower `S(8)`. It plausibly accounts for a minority of the gap
+(order of magnitude ~15%-30%, per the sanity-check above), not most of it.
+The evidence therefore does not support a strong claim that mimalloc
+*definitely* relieved no contention — only that, after accounting for the
+fixed-cost artifact as best this document can measure it, most of the gap
+remains unexplained by that mechanism, and "mimalloc did not measurably
+unlock additional scaling headroom" is the better-supported reading than a
+flat "it did not."
 
 **Verdict.** Combining both interventions: allocator cost is large and real
 — Step 2 confirms this causally, not just as a profile bucket, since a
 different allocator saves 1.6x-1.8x of wall time at every worker count — but
-it is **not the cause of the sub-linear scaling curves** in the Scaling
-curves section below. Step 1 shows glibc's per-thread arenas are load-bearing
-scaffolding that, if removed, produces catastrophic (9.16x) contention; but
-that scaffolding is exactly what the default configuration under which every
-scaling curve in this document was measured already has, and Step 2 shows a
-qualitatively different, more contention-resistant allocator does not unlock
-additional scaling headroom on top of it. At this thread count, allocator
-behavior reads as **pure per-thread overhead, not a scaling limiter** — the
-concern belongs to issue #26 (allocation count/size), not to this
-investigation's search for what caps `S(w)` below linear. The gap between
-measured `S(4)`/`S(8)` and the ideal 4x/8x — Amdahl-implied serial fractions
-of 6.3% (BCF) to 10.0% (VCF) against a measured chunk-barrier serial fraction
-of only ~3% (Task 3) — **remains open** after this task, with both
-originally-proposed candidates (chunk-barrier serial drain, allocator
-contention) now tested and exonerated.
+it is **not the primary cause of the sub-linear scaling curves** in the
+Scaling curves section below. Step 1 shows glibc's per-thread arenas are
+load-bearing scaffolding that, if removed, produces catastrophic (9.16x)
+contention; but that scaffolding is exactly what the default configuration
+under which every scaling curve in this document was measured already has,
+and Step 2 shows a qualitatively different, more contention-resistant
+allocator does not measurably unlock additional scaling headroom on top of
+it — the Amdahl-compression caveat above bounds how much of that null result
+could be masking relieved contention at roughly 15%-30% of the observed gap,
+not most of it, so the reading is not fully dispositive but is the
+best-supported one on the evidence gathered. At this thread count, allocator
+behavior reads as **mostly pure per-thread overhead, not primarily a scaling
+limiter** — the concern belongs to issue #26 (allocation count/size), not to
+this investigation's search for what caps `S(w)` below linear. The gap
+between measured `S(4)`/`S(8)` and the ideal 4x/8x — Amdahl-implied serial
+fractions of 6.3% (BCF) to 10.0% (VCF) against a measured chunk-barrier
+serial fraction of only ~3% (Task 3) — **remains open** after this task, with
+both originally-proposed candidates (chunk-barrier serial drain, allocator
+contention) now tested and substantially, though not with 100% certainty on
+the allocator side, exonerated.
 
 ### Scaling curves
 
