@@ -30,13 +30,7 @@ repos:
         pass_filenames: false
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy --all-features -- -D warnings
-        language: system
-        types: [rust]
-        pass_filenames: false
-      - id: cargo-check
-        name: cargo check
-        entry: cargo check --all-features
+        entry: cargo clippy --all-features --all-targets -- -D warnings
         language: system
         types: [rust]
         pass_filenames: false
