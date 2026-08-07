@@ -22,6 +22,8 @@ use std::path::Path;
 use rand::Rng;
 use rayon::prelude::*;
 
+use noodles_bgzf as bgzf;
+
 use noodles_vcf::{
     self as vcf,
     header::record::value::{
@@ -55,7 +57,38 @@ pub use writer::Format;
 /// getting a variant each: a caller cannot act differently on "histogram
 /// edges must be increasing" than on "histogram weights must sum > 0", so
 /// the extra variants would only ever reach `Display`.
+///
+/// # Non-exhaustive
+///
+/// This enum is `#[non_exhaustive]`: a downstream `match` must carry a
+/// wildcard arm. The error classes here are still being discovered -- every
+/// new validation check has so far meant a new variant, and each of those
+/// would otherwise be a breaking change. Callers that want to branch should
+/// do so on the variants they handle and fall through on the rest, which is
+/// what a growing error type asks for anyway.
+///
+/// Branch on what you handle, and fall through on the rest:
+///
+/// ```
+/// use vcfixture::bulk::BulkError;
+///
+/// fn exit_code(e: &BulkError) -> i32 {
+///     match e {
+///         BulkError::NoContigs => 2,
+///         BulkError::NoSamples => 3,
+///         _ => 1,
+///     }
+/// }
+/// ```
+///
+/// Dropping that final arm does not compile, which
+/// [`crate::compile_fail_guards`] pins.
+///
+/// **Adding a variant?** Add its arm to the guard block there too. Until you
+/// do, that block fails to compile for the ordinary "forgot a variant"
+/// reason and silently stops testing this attribute.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum BulkError {
     #[error("unknown builtin profile: {0}")]
     UnknownProfile(String),
@@ -108,8 +141,24 @@ pub enum BulkError {
     /// a number" -- both mean *this token is malformed, here is how*.
     #[error("{0}")]
     BadRecordsFor(String),
-    #[error("invalid compression level: {0}")]
-    CompressionLevel(String),
+    /// An out-of-range bgzf compression level, carrying the level the caller
+    /// passed rather than a rendering of noodles' `TryFromU8Error` (which
+    /// displays as `invalid input: 99`, giving the doubled and half-useful
+    /// `invalid compression level: invalid input: 99`). The offending value
+    /// is right there at the call site and a caller can branch on it, so it
+    /// is kept structured.
+    ///
+    /// The accepted range is read off `noodles_bgzf`'s own public constants
+    /// rather than written out as `0-9`: noodles gates its maximum on its
+    /// `libdeflate` feature (9 without it, 12 with), and that feature can be
+    /// switched on by *any* crate in a downstream build's graph through
+    /// feature unification. Hard-coding the bound here would reintroduce, in
+    /// a quieter form, the exact problem of asserting something about
+    /// noodles that noodles can change.
+    #[error("invalid compression level: {0} (expected {min}-{max})",
+        min = bgzf::io::writer::CompressionLevel::NONE.get(),
+        max = bgzf::io::writer::CompressionLevel::BEST.get())]
+    CompressionLevel(u8),
 
     // --- profile loading --------------------------------------------------
     #[error("profile {path:?} is not a builtin name and could not be read as a file: {source}")]
@@ -1175,7 +1224,7 @@ mod tests {
             BulkError::NoSamples,
             BulkError::DuplicateContig("chr1".into()),
             BulkError::BadSize("banana".into()),
-            BulkError::CompressionLevel("level 99 out of range".into()),
+            BulkError::CompressionLevel(99),
             BulkError::TargetNotReached {
                 target_bytes: 1024,
                 corrections: 4,

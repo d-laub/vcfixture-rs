@@ -51,6 +51,10 @@ pub mod bulk;
 
 pub mod allele;
 pub mod build;
+/// Compile-fail tests for the public error enums' `#[non_exhaustive]`
+/// promise. Hidden: a test, not part of the API.
+#[doc(hidden)]
+pub mod compile_fail_guards;
 pub mod error;
 pub mod genotype;
 pub mod model;
