@@ -24,7 +24,7 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all -- --check
       - name: clippy
-        run: cargo clippy --all-features -- -D warnings
+        run: cargo clippy --all-features --all-targets --locked -- -D warnings
 
   commit-check:
     if: github.event_name == 'pull_request'
