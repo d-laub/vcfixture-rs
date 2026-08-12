@@ -23,8 +23,14 @@ use vcfixture::bulk::{
     parse_records_for, parse_size, BulkError, BulkSpec, Format, Payload, Profile, Size,
 };
 
+// `version` is load-bearing, not decoration. Bulk output is only reproducible
+// WITHIN a version -- v0.5.0 changed the bytes a given seed produces -- so a
+// downstream harness that caches or pools generated corpora has to be able to
+// record which build made them. Without this attribute `--version` exits 2 with
+// "unexpected argument", and the only remaining provenance is the binary's own
+// content hash.
 #[derive(Parser)]
-#[command(name = "vcfixture", about = "Generate VCF/BCF test data")]
+#[command(name = "vcfixture", version, about = "Generate VCF/BCF test data")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
